@@ -1,0 +1,4 @@
+/target
+.DS_Store
+*.memento
+*.memento.meta.json

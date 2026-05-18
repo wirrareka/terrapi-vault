@@ -1,0 +1,46 @@
+[package]
+name = "memento-vault"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.79"
+description = "Encrypted-at-rest SQLCipher vault foundation for the Memento notes app: Argon2id KDF, key rotation, and a documented on-disk format."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/terrapi/memento-vault"
+homepage = "https://github.com/terrapi/memento-vault"
+documentation = "https://docs.rs/memento-vault"
+readme = "README.md"
+keywords = ["sqlcipher", "encryption", "argon2", "vault", "sqlite"]
+categories = ["cryptography", "database"]
+
+[dependencies]
+rusqlite = { version = "0.32.1", features = ["bundled-sqlcipher"] }
+argon2 = "0.5.3"
+rand = "0.8.5"
+zeroize = { version = "1.8.1", features = ["zeroize_derive"] }
+secrecy = "0.10.3"
+thiserror = "1.0.69"
+serde = { version = "1.0.215", features = ["derive"] }
+serde_json = "1.0.133"
+
+[dev-dependencies]
+tempfile = "3.14.0"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Intentional public API naming (Vault*, Kdf*, VaultMeta) — the repetition
+# is the documented surface the downstream crate is built against.
+module_name_repetitions = "allow"
+# Prose lint: fires on domain terms like SQLCipher / WAL / SQLite that are
+# not code items; backticking them would read worse in rustdoc.
+doc_markdown = "allow"
+# Distinct, intentional names (m/t/p cost, salt vars in tests).
+many_single_char_names = "allow"
+similar_names = "allow"

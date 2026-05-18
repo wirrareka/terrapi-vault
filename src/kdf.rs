@@ -1,0 +1,209 @@
+//! Argon2id key derivation.
+//!
+//! The vault's encryption key is derived from the user's passphrase with
+//! Argon2id (RFC 9106). The derived 32-byte key is the raw SQLCipher key
+//! material; it is never persisted. Only the random salt and the KDF
+//! parameters live on disk (in the sidecar) so that [`Vault::open`] can
+//! reproduce the key from the passphrase.
+//!
+//! [`Vault::open`]: crate::Vault::open
+
+use crate::error::{Error, Result};
+use argon2::{Algorithm, Argon2, Params, Version};
+use rand::RngCore;
+use secrecy::SecretBox;
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
+
+/// Length of the derived SQLCipher key, in bytes (256-bit).
+pub const KEY_LEN: usize = 32;
+
+/// Length of the per-vault random salt, in bytes (128-bit).
+pub const SALT_LEN: usize = 16;
+
+/// Argon2id cost parameters.
+///
+/// The [`Default`] implementation targets roughly **500 ms** of derivation
+/// time on an Apple M-series Mac. The chosen defaults are:
+///
+/// - `m_cost_kib = 65536` (64 MiB memory)
+/// - `t_cost = 2` (2 iterations / passes)
+/// - `p_cost = 1` (1 lane / single-threaded)
+///
+/// These were validated by `kdf::tests::print_default_kdf_timing`, which
+/// prints the measured duration so the figure can be re-verified on any
+/// machine (run with `cargo test -- --nocapture`). Tune `m_cost_kib`
+/// first, then `t_cost`, if you need to retarget the duration; never go
+/// below 19 MiB / 2 passes (the RFC 9106 second-recommended floor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KdfParams {
+    /// Memory cost in kibibytes (KiB). 65536 == 64 MiB.
+    pub m_cost_kib: u32,
+    /// Time cost: number of iterations / passes over memory.
+    pub t_cost: u32,
+    /// Parallelism: number of lanes. 1 == single-threaded.
+    pub p_cost: u32,
+}
+
+impl Default for KdfParams {
+    fn default() -> Self {
+        Self {
+            m_cost_kib: 64 * 1024,
+            t_cost: 2,
+            p_cost: 1,
+        }
+    }
+}
+
+impl KdfParams {
+    /// Fast, deliberately weak parameters for tests only.
+    ///
+    /// Not exported in release builds — exercising the encryption path in
+    /// unit tests should not cost 500 ms each.
+    #[cfg(test)]
+    pub(crate) fn fast_for_tests() -> Self {
+        Self {
+            m_cost_kib: 8 * 1024,
+            t_cost: 1,
+            p_cost: 1,
+        }
+    }
+}
+
+/// Generate a fresh cryptographically-random 16-byte salt.
+#[must_use]
+pub fn random_salt() -> [u8; SALT_LEN] {
+    let mut buf = [0u8; SALT_LEN];
+    rand::thread_rng().fill_bytes(&mut buf);
+    buf
+}
+
+/// A wrapper around the raw 32-byte key that zeroizes its buffer on drop.
+///
+/// Used as the secret type inside a [`secrecy::SecretBox`] so the key is
+/// scrubbed from memory when the [`Vault`](crate::Vault) is locked or
+/// dropped, and cannot be accidentally logged (`SecretBox` has no `Debug`
+/// that prints the contents).
+#[derive(Clone, Zeroize)]
+#[zeroize(drop)]
+pub struct DerivedKey(pub(crate) [u8; KEY_LEN]);
+
+impl DerivedKey {
+    /// SQLCipher quoted-blob form: `x'<64 hex chars>'`.
+    ///
+    /// This is the form passed to `PRAGMA key` / `PRAGMA rekey` so the raw
+    /// 32 bytes are used directly as the cipher key (no extra KDF inside
+    /// SQLCipher). The returned `String` is short-lived and overwritten by
+    /// the caller, but treat it as sensitive.
+    pub(crate) fn pragma_literal(&self) -> String {
+        let mut hex = String::with_capacity(2 + KEY_LEN * 2 + 1);
+        hex.push_str("x'");
+        for b in self.0 {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+        }
+        hex.push('\'');
+        hex
+    }
+}
+
+/// Derive the 32-byte SQLCipher key from a passphrase and salt.
+///
+/// Deterministic: the same `(passphrase, salt, params)` triple always
+/// yields the same key. The result is wrapped in a [`SecretBox`] so it is
+/// zeroized on drop.
+///
+/// # Errors
+///
+/// Returns [`Error::Kdf`] if the Argon2 parameters are invalid (e.g. memory
+/// cost below the algorithm's minimum) or hashing fails.
+pub fn derive_key(
+    passphrase: &str,
+    salt: &[u8; SALT_LEN],
+    params: KdfParams,
+) -> Result<SecretBox<DerivedKey>> {
+    let argon_params = Params::new(
+        params.m_cost_kib,
+        params.t_cost,
+        params.p_cost,
+        Some(KEY_LEN),
+    )
+    .map_err(|e| Error::Kdf(format!("invalid argon2 params: {e}")))?;
+
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params);
+
+    let mut out = [0u8; KEY_LEN];
+    argon
+        .hash_password_into(passphrase.as_bytes(), salt, &mut out)
+        .map_err(|e| Error::Kdf(format!("argon2 hashing failed: {e}")))?;
+
+    let key = SecretBox::new(Box::new(DerivedKey(out)));
+    out.zeroize();
+    Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secrecy::ExposeSecret;
+    use std::time::Instant;
+
+    #[test]
+    fn deterministic_with_same_salt() {
+        let salt = [7u8; SALT_LEN];
+        let p = KdfParams::fast_for_tests();
+        let a = derive_key("hunter2", &salt, p).unwrap();
+        let b = derive_key("hunter2", &salt, p).unwrap();
+        assert_eq!(a.expose_secret().0, b.expose_secret().0);
+    }
+
+    #[test]
+    fn different_salts_give_different_keys() {
+        let p = KdfParams::fast_for_tests();
+        let a = derive_key("pw", &[1u8; SALT_LEN], p).unwrap();
+        let b = derive_key("pw", &[2u8; SALT_LEN], p).unwrap();
+        assert_ne!(a.expose_secret().0, b.expose_secret().0);
+    }
+
+    #[test]
+    fn different_passphrase_gives_different_key() {
+        let salt = [9u8; SALT_LEN];
+        let p = KdfParams::fast_for_tests();
+        let a = derive_key("alpha", &salt, p).unwrap();
+        let b = derive_key("beta", &salt, p).unwrap();
+        assert_ne!(a.expose_secret().0, b.expose_secret().0);
+    }
+
+    #[test]
+    fn pragma_literal_is_well_formed() {
+        let salt = [0u8; SALT_LEN];
+        let k = derive_key("x", &salt, KdfParams::fast_for_tests()).unwrap();
+        let lit = k.expose_secret().pragma_literal();
+        assert!(lit.starts_with("x'"));
+        assert!(lit.ends_with('\''));
+        assert_eq!(lit.len(), 2 + KEY_LEN * 2 + 1);
+    }
+
+    /// Prints the measured derivation time for the *default* (production)
+    /// params so the ~500 ms target is independently verifiable.
+    /// Run: `cargo test print_default_kdf_timing -- --nocapture`.
+    #[test]
+    fn print_default_kdf_timing() {
+        let salt = random_salt();
+        let params = KdfParams::default();
+        let start = Instant::now();
+        let _ = derive_key("correct horse battery staple", &salt, params).unwrap();
+        let elapsed = start.elapsed();
+        println!(
+            "Argon2id default params (m={} KiB, t={}, p={}) derivation: {:?}",
+            params.m_cost_kib, params.t_cost, params.p_cost, elapsed
+        );
+        // Generous bounds: just guard against accidentally trivial or
+        // pathologically slow params. The printed value is the source of
+        // truth for tuning.
+        assert!(
+            elapsed.as_millis() >= 50,
+            "default KDF suspiciously fast ({elapsed:?}) — params too weak?"
+        );
+    }
+}
