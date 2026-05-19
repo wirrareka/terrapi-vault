@@ -89,6 +89,29 @@ pub fn random_salt() -> [u8; SALT_LEN] {
 pub struct DerivedKey(pub(crate) [u8; KEY_LEN]);
 
 impl DerivedKey {
+    /// Wrap raw 32 bytes as a [`DerivedKey`].
+    ///
+    /// Used by [`Vault::open_with_key`](crate::Vault::open_with_key) to open
+    /// a vault from a key obtained out-of-band (e.g. a biometric-gated
+    /// Keychain item) instead of re-deriving from a passphrase. The input
+    /// `bytes` array is the caller's responsibility to zeroize; the copy
+    /// taken here is scrubbed when this `DerivedKey` drops.
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the raw key bytes.
+    ///
+    /// This is sensitive material. Callers persisting it (e.g. into a
+    /// biometric-gated OS keystore) MUST keep it in a zeroizing buffer and
+    /// MUST NOT log it. The slice borrows the internal buffer, which is
+    /// zeroized when this `DerivedKey` drops.
+    #[must_use]
+    pub fn expose_bytes(&self) -> &[u8; KEY_LEN] {
+        &self.0
+    }
+
     /// SQLCipher quoted-blob form: `x'<64 hex chars>'`.
     ///
     /// This is the form passed to `PRAGMA key` / `PRAGMA rekey` so the raw
