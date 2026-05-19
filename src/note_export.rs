@@ -255,23 +255,55 @@ fn read_container(path: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
 
 /// Minimal owned temp directory (no extra dependency in the library).
 ///
-/// Created under [`std::env::temp_dir`] with a process-/nanos-unique
-/// name; removed recursively on drop (best-effort — the only thing inside
-/// is an already-encrypted SQLCipher DB).
+/// Created under [`std::env::temp_dir`] with a name that is unique even
+/// across **concurrent calls inside one process** — `export_note` /
+/// `import_note` can run on several threads at once (a host app, or
+/// `cargo test`'s default parallelism, runs them in a single process),
+/// so a process-id + wall-clock name is *not* sufficient: two callers in
+/// the same nanosecond (or on a coarse-resolution clock) would otherwise
+/// share one directory and cross-contaminate each other's transient
+/// SQLCipher database, surfacing as a spurious
+/// [`Error::WrongPassphrase`]. Uniqueness here is therefore the
+/// composition of pid + a monotonic per-process counter + an OS random
+/// nonce, and the directory is created **exclusively**
+/// ([`std::fs::create_dir`], which errors if the path already exists) so
+/// a name clash can never silently alias an in-use directory. Removed
+/// recursively on drop (best-effort — the only thing inside is an
+/// already-encrypted SQLCipher DB).
 struct TempDir {
     path: std::path::PathBuf,
 }
 
+/// Monotonic, process-wide counter making each [`TempDir`] name distinct
+/// regardless of clock resolution or thread scheduling.
+static TEMPDIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl TempDir {
     fn new() -> Result<Self> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default();
-        let dir = std::env::temp_dir().join(format!("memento-note-{}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
-        Ok(Self { path: dir })
+        use rand::RngCore;
+        use std::sync::atomic::Ordering;
+
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        // A handful of exclusive-create attempts: the seq counter alone
+        // already guarantees per-process uniqueness; the random nonce
+        // guards against a stale directory left by a previously killed
+        // process colliding with our (counter, pid) pair.
+        for _ in 0..16 {
+            let seq = TEMPDIR_SEQ.fetch_add(1, Ordering::Relaxed);
+            let nonce = rand::thread_rng().next_u64();
+            let dir = base.join(format!("memento-note-{pid}-{seq}-{nonce:016x}"));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return Ok(Self { path: dir }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not create a unique memento-note temp directory",
+        )
+        .into())
     }
 
     fn path(&self) -> &Path {
