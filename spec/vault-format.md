@@ -13,6 +13,11 @@ precisely enough that an independent implementation can write a compatible
 reader/writer. It describes **exactly what the code produces**; if the code
 and this document disagree, that is a bug to be reconciled.
 
+> **Single-note export:** the encrypted `.memento-note` single-file
+> container (produced by `export_note` / read by `import_note`) reuses
+> this exact crypto path and is specified separately in
+> [`note-export-format.md`](./note-export-format.md).
+
 A vault is **two files** that travel together:
 
 | File | Required | Contents |
