@@ -154,8 +154,9 @@ fn now_rfc3339() -> String {
     let dur = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    // Seconds since 1970 fit in i64 until year ~292 billion; the wrap the
-    // lint warns about cannot occur for any real system clock.
+    // safe: `as_secs()` is `u64`; the u64->i64 cast only wraps above
+    // i64::MAX (~9.2e18 s ≈ year 292_277_026_596). No real system clock
+    // reaches that, so `cast_possible_wrap` cannot actually fire here.
     #[allow(clippy::cast_possible_wrap)]
     let secs = dur.as_secs() as i64;
     let days = secs.div_euclid(86_400);
