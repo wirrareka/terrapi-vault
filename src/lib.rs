@@ -58,7 +58,7 @@ mod note_export;
 mod vault;
 
 pub use error::{Error, Result};
-pub use kdf::{random_salt, KdfParams, KEY_LEN, SALT_LEN};
+pub use kdf::{random_salt, DerivedKey, KdfParams, KEY_LEN, SALT_LEN};
 pub use meta::{meta_path_for, VaultMeta, FORMAT_VERSION, META_SUFFIX};
 pub use note_export::{export_note, import_note, ExportedNote, CONTAINER_VERSION, NOTE_MAGIC};
 pub use vault::Vault;

@@ -110,6 +110,60 @@ impl Vault {
         })
     }
 
+    /// Open an existing vault at `path` with a raw 32-byte key.
+    ///
+    /// Unlike [`Vault::open`], this skips Argon2id derivation and uses
+    /// `key` directly as the SQLCipher key. It exists for opt-in
+    /// alternative-unlock paths (e.g. a biometric-gated OS keystore that
+    /// holds the previously derived key); the sidecar is still read so the
+    /// vault remembers its salt/params for a later [`Vault::rotate_key`].
+    ///
+    /// # Security
+    ///
+    /// `key` must be the exact key a passphrase would have derived for this
+    /// vault. A wrong key is rejected the same way a wrong passphrase is
+    /// ([`Error::WrongPassphrase`]). The caller is responsible for keeping
+    /// `key` in zeroizing memory; the copy taken here lives in a
+    /// [`SecretBox`] and is scrubbed on lock/drop.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongPassphrase`] if the key is incorrect,
+    /// [`Error::MetaMissing`] / [`Error::MetaInvalid`] for sidecar problems,
+    /// otherwise [`Error::Db`] / [`Error::Io`].
+    pub fn open_with_key<P: AsRef<Path>>(path: P, key: &[u8; crate::KEY_LEN]) -> Result<Self> {
+        let vault_path = path.as_ref().to_path_buf();
+        let meta_path = meta_path_for(&vault_path);
+
+        // Read the sidecar so the salt/params are available for a later
+        // rotate_key, and to fail early with the same MetaMissing error
+        // shape as the passphrase path.
+        let _meta = VaultMeta::read(&meta_path)?;
+        let key = SecretBox::new(Box::new(DerivedKey::from_bytes(*key)));
+
+        let conn = open_keyed(&vault_path, &key)?;
+        verify_key(&conn)?;
+
+        Ok(Self {
+            conn,
+            key,
+            vault_path,
+            meta_path,
+        })
+    }
+
+    /// A clone of the current derived key, in a zeroizing handle.
+    ///
+    /// Returned so an opt-in alternative-unlock feature can stash the key
+    /// in a biometric-gated OS keystore *after* a successful passphrase
+    /// unlock, then later reopen via [`Vault::open_with_key`] without the
+    /// passphrase. The returned [`SecretBox`] zeroizes on drop; treat the
+    /// bytes as sensitive and never log or persist them in the clear.
+    #[must_use]
+    pub fn derived_key(&self) -> SecretBox<DerivedKey> {
+        SecretBox::new(Box::new(self.key.expose_secret().clone()))
+    }
+
     /// Re-key the vault: change the passphrase in place.
     ///
     /// Verifies `old_passphrase` against the current key, runs SQLCipher
@@ -400,6 +454,63 @@ mod tests {
         fs::write(meta_path_for(&path), b"{}").unwrap();
         Vault::create(&path, "pw", p()).unwrap().lock();
         assert!(Vault::open(&path, "pw").is_ok());
+    }
+
+    #[test]
+    fn open_with_key_roundtrips_derived_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        let key_bytes;
+        {
+            let v = Vault::create(&path, "pw", p()).unwrap();
+            v.with_connection(|c| c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (99);"))
+                .unwrap();
+            key_bytes = *v.derived_key().expose_secret().expose_bytes();
+            v.lock();
+        }
+        let v = Vault::open_with_key(&path, &key_bytes).unwrap();
+        let x: i64 = v
+            .with_connection(|c| c.query_row("SELECT x FROM t", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(x, 99);
+    }
+
+    #[test]
+    fn open_with_wrong_key_is_wrong_passphrase() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        Vault::create(&path, "pw", p()).unwrap().lock();
+        let err = Vault::open_with_key(&path, &[0u8; crate::KEY_LEN]).unwrap_err();
+        assert!(matches!(err, Error::WrongPassphrase), "got {err:?}");
+    }
+
+    #[test]
+    fn open_with_key_missing_meta_errors() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nope.memento");
+        assert!(matches!(
+            Vault::open_with_key(&path, &[0u8; crate::KEY_LEN]).unwrap_err(),
+            Error::MetaMissing(_)
+        ));
+    }
+
+    #[test]
+    fn rotate_key_invalidates_old_derived_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        let old_key;
+        {
+            let mut v = Vault::create(&path, "old", p()).unwrap();
+            old_key = *v.derived_key().expose_secret().expose_bytes();
+            v.rotate_key("old", "new").unwrap();
+            v.lock();
+        }
+        // The pre-rotation key must no longer open the vault — this is the
+        // crypto guarantee the biometric-clear-on-rotate UX relies on.
+        assert!(matches!(
+            Vault::open_with_key(&path, &old_key).unwrap_err(),
+            Error::WrongPassphrase
+        ));
     }
 
     #[test]

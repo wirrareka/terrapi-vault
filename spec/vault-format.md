@@ -197,3 +197,17 @@ The sidecar `version` field governs format evolution. A v1 reader MUST:
 
 Future versions may change KDF defaults or add fields; the salt/params
 stored per-vault always take precedence over any defaults.
+
+## 7. Raw-key open (alternative unlock)
+
+`Vault::open_with_key(path, key)` opens the database with a caller-supplied
+raw 32-byte key, skipping Argon2id. It is the *same* key material a
+passphrase would derive (the SQLCipher key); the sidecar is still read so
+the salt/params survive for a later `rotate_key`. A wrong key is reported
+as a wrong passphrase (`SQLITE_NOTADB`, §5). The on-disk format is
+unchanged: no key is ever written to disk by this crate. This API exists
+so an application can implement an opt-in OS-keystore / biometric unlock
+that stashes the derived key out-of-band; the threat model for that is the
+application's responsibility (see the app's `SECURITY.md`). Because
+`rotate_key` derives a new key over a fresh salt, any previously stashed
+key stops working after rotation — the crypto enforces re-enrollment.
