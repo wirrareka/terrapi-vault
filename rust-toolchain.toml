@@ -1,3 +1,9 @@
+# 1.83 is the DELIBERATE MSRV floor for `vault` as a standalone library
+# (do not bump). The `memento` workspace, which consumes `vault` as a
+# path dependency, builds the whole tree on 1.91.1 (its own
+# rust-toolchain.toml) — `vault` compiling cleanly on the older 1.83
+# guarantees the MSRV is real and not accidentally raised by newer
+# language features.
 [toolchain]
 channel = "1.83"
 components = ["rustfmt", "clippy"]
