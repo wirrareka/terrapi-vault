@@ -6,19 +6,20 @@ You may share and adapt it, including for commercial purposes, provided you
 give appropriate credit to the Terrapi terrapi-vault project.
 -->
 
-# Memento Vault On-Disk Format — v1 (doc rev 1.1)
+# Memento Vault On-Disk Format — v1 (doc rev 1.2)
 
 This document specifies the on-disk format produced by `terrapi-vault`
 precisely enough that an independent implementation can write a compatible
 reader/writer. It describes **exactly what the code produces**; if the code
 and this document disagree, that is a bug to be reconciled.
 
-> **Document revision:** 1.1 (2026-05-21). The sidecar integer `version`
+> **Document revision:** 1.2 (2026-05-21). The sidecar integer `version`
 > field (§2) stays at **1** — this revision only documents additional
-> application-level tables introduced in M5 (see §8) and changes nothing
-> about the cryptographic envelope, the sidecar JSON schema, or the keying
-> procedure. A v1 reader written against doc rev 1.0 continues to open
-> vaults produced by doc rev 1.1 with no changes.
+> application-level tables introduced in M5 (see §8) and M6 (see §9) and
+> changes nothing about the cryptographic envelope, the sidecar JSON
+> schema, or the keying procedure. A v1 reader written against doc rev
+> 1.0 continues to open vaults produced by doc rev 1.2 with no changes —
+> additional tables it does not know about are simply ignored.
 
 > **Single-note export:** the encrypted `.memento-note` single-file
 > container (produced by `export_note` / read by `import_note`) reuses
@@ -310,6 +311,119 @@ only and is unaffected. A vault produced by an app version pre-dating M5
 migrates forward by a single application-level `PRAGMA user_version`
 bump (M5 = previous + 1); no SQLCipher-level re-encryption occurs.
 
+## 9. Per-note version history (application-level, M6)
+
+Migration **M6** introduces a single additional table that stores
+historical snapshots of note text. The cryptographic envelope, the
+sidecar, the keying procedure, and the FTS5 full-text index are
+unaffected: M6 is a purely-additive schema change, exactly like M5.
+
+### Schema (M6)
+
+```sql
+CREATE TABLE note_versions (
+    id            INTEGER PRIMARY KEY,
+    note_id       INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    version       INTEGER NOT NULL,
+    title         TEXT    NOT NULL,
+    body_markdown TEXT    NOT NULL,
+    icon          TEXT,
+    folder_id     INTEGER,
+    created_at    TEXT    NOT NULL
+);
+CREATE INDEX idx_note_versions_note ON note_versions(note_id, created_at DESC);
+```
+
+Each row is a snapshot of `(title, body_markdown, icon, folder_id,
+version)` *as it stood immediately before* a successful
+`NoteRepo::update` overwrote the live `notes` row. The current `notes`
+row therefore always carries the latest content + the latest `version`;
+`note_versions` rows are monotonically-older versions of the same note.
+
+### Write-hook contract
+
+The writer (Memento's `NoteRepo::update`) MUST, inside a single SQL
+transaction:
+
+1. Read the current `(title, body_markdown, icon, folder_id, version)`
+   from `notes` for the target id.
+2. If the new content is **byte-identical** to the current
+   `(title, body_markdown, icon, folder_id)`, return the unchanged
+   version without inserting a snapshot and without bumping `version`.
+   This prevents stray autosaves-with-no-edits from polluting history.
+3. Otherwise INSERT one row into `note_versions` capturing the OLD
+   state, then DELETE the oldest rows beyond the per-note cap
+   (`v1` = **20** rows), then run the existing
+   `UPDATE notes … version = version + 1 … RETURNING version`.
+4. COMMIT.
+
+A failing UPDATE rolls the snapshot back too — history can never grow
+ahead of, or behind, the live row.
+
+### Cap policy
+
+v1 hardcodes a per-note cap of **20** versions. After each insert the
+writer prunes rows for that `note_id` beyond the most recent 20 (by
+`created_at DESC, id DESC`). The cap is intentionally configurable
+later but not for v1.
+
+### Cascade + folder semantics
+
+`note_versions.note_id` is `ON DELETE CASCADE`: deleting a note also
+drops its version rows. (Restoring a deleted note is out of scope for
+v1; it would require a separate tombstone table.)
+
+`note_versions.folder_id` is **deliberately not** a foreign key: the
+folder may itself be deleted later, and the recorded id stays as an
+informational breadcrumb. A reader rendering a snapshot whose
+`folder_id` no longer resolves SHOULD fall back to a sentinel label
+(Memento renders "(deleted folder)").
+
+### Text-only history (v1 limitation)
+
+v1 stores the snapshot of the note's TEXT (title + body markdown) plus
+the `icon` and `folder_id`. It deliberately does **not** snapshot:
+
+* **`note_tags`** — tag attachments change independently of note
+  content; capturing them on every text edit would be noise.
+* **`attachments`** (M5) — image references are tracked in a separate
+  table. Restoring an old version shows the old text against the
+  CURRENT attachment set. Memento's UI surfaces this as "text-only
+  history" so the user is not surprised by stale image references.
+
+### Restore is reversible
+
+A restore is implemented as `NoteRepo::update` with the snapshot's
+content. Because the write hook itself snapshots the live state first,
+the just-overwritten "live" content becomes the newest history entry,
+and the restore is undoable by restoring that entry in turn.
+
+### Open format — third-party readers
+
+Because the table lives in the same SQLCipher container as the rest of
+the vault, **any** stock SQLite tool with the correct key can extract a
+note's history:
+
+```bash
+sqlite3 my.vault \
+  "SELECT version, body_markdown FROM note_versions \
+   WHERE note_id = ? ORDER BY created_at DESC"
+```
+
+This is the open-format promise: history is data, not a proprietary
+sidecar. A reader unaware of `note_versions` simply ignores the table.
+
+### M6 forward-compat
+
+M6 only **adds** one table and one index; it touches no pre-existing
+table, column, trigger, or FTS index. `notes_fts` indexes
+`notes(title, body_markdown)` only — snapshot rows are NOT full-text
+indexed (search results always reflect the live note, not its history),
+which is the intended behaviour. A vault produced by an app version
+pre-dating M6 migrates forward by a single application-level
+`PRAGMA user_version` bump (M6 = previous + 1); no SQLCipher-level
+re-encryption occurs.
+
 ## 7. Raw-key open (alternative unlock)
 
 `Vault::open_with_key(path, key)` opens the database with a caller-supplied
@@ -326,6 +440,17 @@ key stops working after rotation — the crypto enforces re-enrollment.
 
 ## Changelog
 
+- **doc rev 1.2 (2026-05-21)** — Per-note version history (M6). New §9
+  "Per-note version history" documenting the `note_versions` table, the
+  write-hook contract (read-old → insert-snapshot → prune-to-cap →
+  update-current, all in one transaction; no-op skip on byte-identical
+  edits), the 20-version-per-note cap, the cascade rule, and the
+  "text-only history" v1 limitation (tags and attachments are
+  intentionally not snapshotted). Forward-compat addition: existing
+  vaults migrate forward by a single `PRAGMA user_version` bump; no
+  sidecar/version bump and no cryptographic changes. A reader at any
+  earlier doc rev still opens vaults at doc rev 1.2 unchanged — the
+  table it does not know about is simply ignored.
 - **doc rev 1.1 (2026-05-21)** — Image attachments (M5). New §8 "Blobs
   and attachments" documenting the `blobs` and `attachments` tables,
   content addressing, the `attachment:<id>` markdown URL scheme, and the
