@@ -6,12 +6,19 @@ You may share and adapt it, including for commercial purposes, provided you
 give appropriate credit to the Terrapi terrapi-vault project.
 -->
 
-# Memento Vault On-Disk Format — v1
+# Memento Vault On-Disk Format — v1 (doc rev 1.1)
 
 This document specifies the on-disk format produced by `terrapi-vault`
 precisely enough that an independent implementation can write a compatible
 reader/writer. It describes **exactly what the code produces**; if the code
 and this document disagree, that is a bug to be reconciled.
+
+> **Document revision:** 1.1 (2026-05-21). The sidecar integer `version`
+> field (§2) stays at **1** — this revision only documents additional
+> application-level tables introduced in M5 (see §8) and changes nothing
+> about the cryptographic envelope, the sidecar JSON schema, or the keying
+> procedure. A v1 reader written against doc rev 1.0 continues to open
+> vaults produced by doc rev 1.1 with no changes.
 
 > **Single-note export:** the encrypted `.memento-note` single-file
 > container (produced by `export_note` / read by `import_note`) reuses
@@ -198,6 +205,111 @@ The sidecar `version` field governs format evolution. A v1 reader MUST:
 Future versions may change KDF defaults or add fields; the salt/params
 stored per-vault always take precedence over any defaults.
 
+## 8. Blobs and attachments (application-level, M5)
+
+> This section documents tables created by downstream application
+> migrations (Memento's M5). They are **not** part of the cryptographic
+> envelope — they live inside the SQLCipher-encrypted database alongside
+> every other application table. A third-party reader that has the
+> passphrase can extract every blob with stock `sqlite3`:
+>
+> ```
+> sqlite3 my.memento "SELECT writefile('out.png', bytes) FROM blobs WHERE id = 1;"
+> ```
+>
+> (after first issuing `PRAGMA key = "x'<hex>'"` — see §3.)
+
+Memento stores image attachments **inline as SQLCipher BLOBs**, not as
+external files. This keeps the vault self-contained: a single encrypted
+file holds every byte of user content, including embedded images.
+SQLCipher encrypts at the page level, so blob bytes are subject to the
+same AES-256-CBC + HMAC-SHA512 envelope as the rest of the database —
+there is no second crypto layer. The in-memory blob bytes never escape
+unencrypted to disk: no temp files, no debug logs, no swap-friendly
+unencrypted SQLite mirror.
+
+### Schema (M5)
+
+```sql
+CREATE TABLE blobs (
+    id           INTEGER PRIMARY KEY,
+    sha256       TEXT NOT NULL UNIQUE,    -- lowercase hex SHA-256 of `bytes`
+    mime         TEXT NOT NULL,           -- "image/png", "image/jpeg", …
+    bytes        BLOB NOT NULL,           -- raw payload, content-addressed
+    byte_len     INTEGER NOT NULL,        -- denormalised len(bytes)
+    created_at   TEXT NOT NULL            -- RFC 3339 / ISO 8601 UTC
+);
+CREATE INDEX idx_blobs_sha ON blobs(sha256);
+
+CREATE TABLE attachments (
+    id           INTEGER PRIMARY KEY,
+    note_id      INTEGER NOT NULL REFERENCES notes(id)  ON DELETE CASCADE,
+    blob_id      INTEGER NOT NULL REFERENCES blobs(id),
+    -- NB: blobs are content-addressed; the blob row is NOT cascade-deleted
+    -- when its last attachment is removed. A separate "vacuum orphan blobs"
+    -- maintenance op handles that — see "Orphan-blob policy" below.
+    position     INTEGER NOT NULL,        -- in-note order (currently unused
+                                          -- by render, reserved for future
+                                          -- gallery / re-ordering UI)
+    alt_text     TEXT,                    -- per-attachment, NOT per-blob
+    created_at   TEXT NOT NULL            -- RFC 3339 / ISO 8601 UTC
+);
+CREATE INDEX idx_attachments_note ON attachments(note_id);
+CREATE INDEX idx_attachments_blob ON attachments(blob_id);
+```
+
+### Content addressing
+
+`blobs.sha256` is `UNIQUE`. Insertion is upsert-by-hash: if the user pastes
+the same image into two notes, **one** row exists in `blobs` and **two**
+rows exist in `attachments` pointing at it. This matters for vault size
+(a duplicated image costs one blob row, not two) and for a future "find
+notes containing this image" query.
+
+`alt_text` lives on `attachments`, not on `blobs`, because the same image
+can carry different alt text in different notes ("logo" vs "company
+mark" vs ""). The blob is a byte payload; alt is a per-reference label.
+
+`byte_len` is denormalised so `SELECT SUM(byte_len) FROM blobs` is a
+single index read — vault-size readouts in the UI status bar do not have
+to load any blob bytes.
+
+### Orphan-blob policy
+
+When the last `attachments` row referencing a `blobs.id` is deleted, the
+`blobs` row stays. This is deliberate: deleting a note then immediately
+undoing the deletion must restore its images, which cannot work if the
+delete cascaded into the blob row. A separate maintenance entry point
+(`BlobRepo::delete_orphans`) sweeps unreferenced blobs and is invoked
+explicitly by the application (e.g. a "Vacuum vault" menu item or a
+scheduled compaction). The cost of an orphan is its `byte_len` — surface
+this to the user via the same `SUM(byte_len)` readout.
+
+### Markdown reference syntax
+
+In `notes.body_markdown`, an attachment is referenced with **standard
+CommonMark image syntax** plus a custom URL scheme:
+
+```
+![alt text here](attachment:42)
+```
+
+where `42` is `attachments.id` (NOT `blobs.id` — alt text varies per
+attachment). A reader that does not understand `attachment:` URLs renders
+the line as a plain CommonMark image with a broken link, which is the
+correct fallback (no crash, no data loss). A third-party Memento-format
+reader extracts the bytes by joining: `attachments.id → attachments.blob_id
+→ blobs.bytes`.
+
+### M5 forward-compat
+
+M5 only **adds** the two tables and three indexes; it touches no
+pre-existing table, column, trigger, or FTS index. The FTS5
+external-content table `notes_fts` indexes `notes(title, body_markdown)`
+only and is unaffected. A vault produced by an app version pre-dating M5
+migrates forward by a single application-level `PRAGMA user_version`
+bump (M5 = previous + 1); no SQLCipher-level re-encryption occurs.
+
 ## 7. Raw-key open (alternative unlock)
 
 `Vault::open_with_key(path, key)` opens the database with a caller-supplied
@@ -211,3 +323,15 @@ that stashes the derived key out-of-band; the threat model for that is the
 application's responsibility (see the app's `SECURITY.md`). Because
 `rotate_key` derives a new key over a fresh salt, any previously stashed
 key stops working after rotation — the crypto enforces re-enrollment.
+
+## Changelog
+
+- **doc rev 1.1 (2026-05-21)** — Image attachments (M5). New §8 "Blobs
+  and attachments" documenting the `blobs` and `attachments` tables,
+  content addressing, the `attachment:<id>` markdown URL scheme, and the
+  orphan-blob policy. Forward-compat addition: existing vaults migrate
+  forward by a single `PRAGMA user_version` bump; no sidecar/version
+  bump and no cryptographic changes. A v1 reader at doc rev 1.0 still
+  opens vaults at doc rev 1.1; tables it does not know about are simply
+  ignored by SQLite.
+- **doc rev 1.0** — initial specification of the vault format v1.

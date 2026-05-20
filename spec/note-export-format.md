@@ -67,6 +67,33 @@ CREATE TABLE exported_note (
 (The vault's own `vault_schema` bookkeeping table from `vault-format.md`
 is also present, unchanged.)
 
+## 3a. Attachments (M5) — currently NOT bundled (v1 limitation)
+
+> **Known v1 gap, tracked for the next container_ver bump.**
+
+When the source vault carries M5 image attachments (see
+[`vault-format.md`](./vault-format.md) §8), the body of a `.memento-note`
+file may contain `![alt](attachment:<id>)` markdown references. The v1
+container as specified above bundles **only** the single `exported_note`
+row; it does NOT carry the referenced `blobs.bytes` or `attachments`
+rows. On import to a vault that does not have those blob ids, the
+references become broken-image placeholders and the prose content
+remains intact (no panic, no data loss).
+
+The next container version (`container_ver == 2`) is reserved to bundle
+the embedded blob bytes inside the same encrypted envelope (one extra
+`exported_blobs (sha256, mime, bytes, alt_text)` table inside `db_bytes`)
+so the importer can re-resolve attachment ids by SHA-256 content lookup
+in the target vault (insert-if-new, reuse-if-existing). This is a
+backward-compatible *extension* — a v1 reader sees the magic + version
+mismatch and refuses to open, exactly as documented in §7. The framing
+itself does not change.
+
+Until then, users sharing notes that contain images SHOULD share the
+source `.memento` vault (or a duplicate restricted to the relevant
+folder) rather than a single-note file. The UI surfaces this limitation
+at export time when the selected note has attachments.
+
 ## 4. Scope: secrets are NOT exported
 
 A `.memento-note` carries note *content only*: `title`, `body_markdown`,
