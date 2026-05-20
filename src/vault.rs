@@ -16,10 +16,10 @@ use std::path::{Path, PathBuf};
 /// # Example
 ///
 /// ```no_run
-/// use memento_vault::{Vault, KdfParams};
+/// use terrapi_vault::{Vault, KdfParams};
 ///
-/// # fn main() -> memento_vault::Result<()> {
-/// let v = Vault::create("notes.memento", "correct horse", KdfParams::default())?;
+/// # fn main() -> terrapi_vault::Result<()> {
+/// let v = Vault::create("notes.terrapi", "correct horse", KdfParams::default())?;
 /// v.with_connection(|c| {
 ///     c.execute_batch("CREATE TABLE note(id INTEGER PRIMARY KEY, body TEXT);")
 /// })?;
@@ -230,7 +230,7 @@ impl Vault {
 
     /// The schema version recorded in the `vault_schema` table.
     ///
-    /// `memento-vault` owns row 0 (format bookkeeping). Downstream
+    /// `terrapi-vault` owns row 0 (format bookkeeping). Downstream
     /// migrations should use `rusqlite_migration`'s own `user_version`.
     ///
     /// # Errors

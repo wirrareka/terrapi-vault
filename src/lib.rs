@@ -1,8 +1,10 @@
-//! # memento-vault
+//! # terrapi-vault
 //!
-//! Encrypted-at-rest storage foundation for the **Memento** notes app.
+//! Terrapi shared encrypted-at-rest storage. Adopted by **memento**
+//! (notes app) and **probe** (API client); vault files are
+//! binary-compatible across apps.
 //!
-//! `memento-vault` wraps a single [SQLCipher](https://www.zetetic.net/sqlcipher/)
+//! `terrapi-vault` wraps a single [SQLCipher](https://www.zetetic.net/sqlcipher/)
 //! database behind a small, safe lifecycle API. The database key is derived
 //! from a user passphrase with **Argon2id** (RFC 9106) over a random
 //! per-vault salt; the derived key never touches disk and lives in a
@@ -19,11 +21,11 @@
 //! ## Quick start
 //!
 //! ```no_run
-//! use memento_vault::{Vault, KdfParams};
+//! use terrapi_vault::{Vault, KdfParams};
 //!
-//! # fn main() -> memento_vault::Result<()> {
+//! # fn main() -> terrapi_vault::Result<()> {
 //! // First run: create the vault.
-//! let vault = Vault::create("notes.memento", "correct horse battery staple",
+//! let vault = Vault::create("notes.terrapi", "correct horse battery staple",
 //!                           KdfParams::default())?;
 //! vault.with_connection(|conn| {
 //!     conn.execute_batch("CREATE TABLE note(id INTEGER PRIMARY KEY, body TEXT)")
@@ -31,15 +33,15 @@
 //! vault.lock();
 //!
 //! // Later run: unlock.
-//! let vault = Vault::open("notes.memento", "correct horse battery staple")?;
+//! let vault = Vault::open("notes.terrapi", "correct horse battery staple")?;
 //! # Ok(())
 //! # }
 //! ```
 //!
 //! ## Running migrations downstream
 //!
-//! Downstream crates (e.g. `memento-core`) run `rusqlite_migration`
-//! migrations and FTS5 setup through [`Vault::with_connection`] /
+//! Downstream crates (e.g. `memento-core`, `probe-core`) run their own
+//! migrations through [`Vault::with_connection`] /
 //! [`Vault::with_connection_mut`]; the encrypted [`rusqlite::Connection`]
 //! is never exposed unguarded.
 //!

@@ -1,4 +1,4 @@
-//! Error types for the `memento-vault` crate.
+//! Error types for the `terrapi-vault` crate.
 
 use std::path::PathBuf;
 

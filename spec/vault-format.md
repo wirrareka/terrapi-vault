@@ -3,12 +3,12 @@ SPDX-License-Identifier: CC-BY-4.0
 This specification is licensed under the Creative Commons Attribution 4.0
 International License (CC-BY-4.0). https://creativecommons.org/licenses/by/4.0/
 You may share and adapt it, including for commercial purposes, provided you
-give appropriate credit to the Terrapi memento-vault project.
+give appropriate credit to the Terrapi terrapi-vault project.
 -->
 
 # Memento Vault On-Disk Format — v1
 
-This document specifies the on-disk format produced by `memento-vault`
+This document specifies the on-disk format produced by `terrapi-vault`
 precisely enough that an independent implementation can write a compatible
 reader/writer. It describes **exactly what the code produces**; if the code
 and this document disagree, that is a bug to be reconciled.
@@ -97,7 +97,7 @@ compatibility. Writers of v1 emit exactly the fields above.
 
 ## 3. Encrypted database
 
-The vault file is a standard **SQLCipher 4** database. `memento-vault`
+The vault file is a standard **SQLCipher 4** database. `terrapi-vault`
 links SQLCipher statically via `rusqlite`'s `bundled-sqlcipher` feature and
 uses the **SQLCipher 4 defaults**, which are:
 
@@ -158,7 +158,7 @@ rotation the old passphrase no longer derives a working key.
 
 ## 4. Schema version table
 
-Immediately after creating the encrypted database, `memento-vault`
+Immediately after creating the encrypted database, `terrapi-vault`
 initializes a bookkeeping table:
 
 ```sql

@@ -1,13 +1,13 @@
 [package]
-name = "memento-vault"
+name = "terrapi-vault"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.79"
-description = "Encrypted-at-rest SQLCipher vault foundation for the Memento notes app: Argon2id KDF, key rotation, and a documented on-disk format."
+description = "Terrapi shared encrypted-at-rest SQLCipher vault: Argon2id KDF, key rotation, documented on-disk format. Adopted by memento (notes) and probe (API client); vault files are binary-compatible across apps."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/terrapi/memento-vault"
-homepage = "https://github.com/terrapi/memento-vault"
-documentation = "https://docs.rs/memento-vault"
+repository = "https://github.com/terrapi/terrapi-vault"
+homepage = "https://github.com/terrapi/terrapi-vault"
+documentation = "https://docs.rs/terrapi-vault"
 readme = "README.md"
 keywords = ["sqlcipher", "encryption", "argon2", "vault", "sqlite"]
 categories = ["cryptography", "database"]

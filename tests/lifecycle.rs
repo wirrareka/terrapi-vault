@@ -1,9 +1,10 @@
 //! End-to-end integration tests for the public `Vault` API.
 //!
-//! These exercise the crate exactly as `memento-core` will, using the
-//! production default KDF params only where the cost is acceptable.
+//! These exercise the crate exactly as `memento-core` and `probe-core`
+//! will, using the production default KDF params only where the cost
+//! is acceptable.
 
-use memento_vault::{Error, KdfParams, Vault};
+use terrapi_vault::{Error, KdfParams, Vault};
 use std::io::Read;
 use tempfile::TempDir;
 

@@ -1,11 +1,11 @@
-# memento-vault
+# terrapi-vault
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 Encrypted-at-rest storage foundation for the **Memento** notes app, part of
 the [Terrapi](https://github.com/terrapi) brand of developer tools.
 
-`memento-vault` wraps a single [SQLCipher](https://www.zetetic.net/sqlcipher/)
+`terrapi-vault` wraps a single [SQLCipher](https://www.zetetic.net/sqlcipher/)
 database behind a small, safe lifecycle API:
 
 - **Argon2id** (RFC 9106) key derivation from a user passphrase over a
@@ -26,13 +26,13 @@ independent compatible reader.
 
 ```toml
 [dependencies]
-memento-vault = "0.1"
+terrapi-vault = "0.1"
 ```
 
 ```rust
-use memento_vault::{Vault, KdfParams};
+use terrapi_vault::{Vault, KdfParams};
 
-# fn main() -> memento_vault::Result<()> {
+# fn main() -> terrapi_vault::Result<()> {
 // First run — create the vault.
 let vault = Vault::create("notes.memento", "correct horse battery staple",
                           KdfParams::default())?;
@@ -58,15 +58,15 @@ setup through the guarded accessors — the encrypted connection is never
 exposed unguarded:
 
 ```rust,no_run
-# use memento_vault::Vault;
-# fn f(vault: &Vault) -> memento_vault::Result<()> {
+# use terrapi_vault::Vault;
+# fn f(vault: &Vault) -> terrapi_vault::Result<()> {
 vault.with_connection(|conn| {
     conn.execute_batch("CREATE VIRTUAL TABLE note_fts USING fts5(title, body)")
 })?;
 # Ok(()) }
 ```
 
-`memento_vault::rusqlite` re-exports the exact `rusqlite` build this crate
+`terrapi_vault::rusqlite` re-exports the exact `rusqlite` build this crate
 links, so downstream code shares one SQLCipher.
 
 ## KDF parameters

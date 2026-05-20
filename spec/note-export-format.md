@@ -3,14 +3,14 @@ SPDX-License-Identifier: CC-BY-4.0
 This specification is licensed under the Creative Commons Attribution 4.0
 International License (CC-BY-4.0). https://creativecommons.org/licenses/by/4.0/
 You may share and adapt it, including for commercial purposes, provided you
-give appropriate credit to the Terrapi memento-vault project.
+give appropriate credit to the Terrapi terrapi-vault project.
 -->
 
 # Memento `.memento-note` Single-Note Export Format — v1
 
 Companion to [`vault-format.md`](./vault-format.md). This document
-specifies the on-disk format produced by `memento_vault::export_note` and
-consumed by `memento_vault::import_note`, precisely enough that an
+specifies the on-disk format produced by `terrapi_vault::export_note` and
+consumed by `terrapi_vault::import_note`, precisely enough that an
 independent implementation can write a compatible reader/writer. It
 describes **exactly what the code produces**; if the code and this
 document disagree, that is a bug to be reconciled.
