@@ -6,19 +6,22 @@ You may share and adapt it, including for commercial purposes, provided you
 give appropriate credit to the Terrapi terrapi-vault project.
 -->
 
-# Memento Vault On-Disk Format — v1 (doc rev 1.2)
+# Memento Vault On-Disk Format — v1 (doc rev 1.3)
 
 This document specifies the on-disk format produced by `terrapi-vault`
 precisely enough that an independent implementation can write a compatible
 reader/writer. It describes **exactly what the code produces**; if the code
 and this document disagree, that is a bug to be reconciled.
 
-> **Document revision:** 1.2 (2026-05-21). The sidecar integer `version`
-> field (§2) stays at **1** — this revision only documents additional
-> application-level tables introduced in M5 (see §8) and M6 (see §9) and
-> changes nothing about the cryptographic envelope, the sidecar JSON
+> **Document revision:** 1.3 (2026-05-23). The sidecar integer `version`
+> field (§2) stays at **1**. This revision adds **no schema change**: it
+> documents the application-level migration-safety contract (§6a:
+> open-time format/app-schema guards, backup-before-migrate, forward-only
+> rollback stance) and the spec-doc process checklist (§6b) every future
+> migration must follow. Doc rev 1.2 added the M6 tables (§9); doc rev 1.1
+> added M5 (§8); none changed the cryptographic envelope, the sidecar JSON
 > schema, or the keying procedure. A v1 reader written against doc rev
-> 1.0 continues to open vaults produced by doc rev 1.2 with no changes —
+> 1.0 continues to open vaults produced by doc rev 1.3 with no changes —
 > additional tables it does not know about are simply ignored.
 
 > **Single-note export:** the encrypted `.memento-note` single-file
@@ -205,6 +208,84 @@ The sidecar `version` field governs format evolution. A v1 reader MUST:
 
 Future versions may change KDF defaults or add fields; the salt/params
 stored per-vault always take precedence over any defaults.
+
+## 6a. Migration safety and recovery (application-level)
+
+This section documents how the **application layer** (Memento) evolves the
+app-level schema tracked by `PRAGMA user_version` (§4) — distinct from the
+format-level `vault_schema` row 0. Third-party readers are unaffected: all
+application migrations are additive (§8/§9 precedent).
+
+### Open-time guards
+
+On every open, before and after applying pending migrations, Memento
+enforces two guards and refuses to open on either:
+
+- **Future format.** If `vault_schema` row 0 (the format-level version) is
+  **greater** than the value the running binary understands
+  (`SUPPORTED_FORMAT_VERSION`, currently `1`), the open is refused. This is
+  the application-side enforcement of the §6 reader rule: never read a
+  format from the future.
+- **Newer app schema.** If `PRAGMA user_version` is **greater** than the
+  highest migration the binary knows (`current_version`), a newer Memento
+  already upgraded this vault. The open is refused rather than silently
+  proceeding, since an older binary cannot reason about newer schema.
+
+### Backup-before-migrate
+
+Before applying **any** pending migration (i.e. when
+`user_version < current_version`), Memento copies the database file **and
+its `.meta.json` sidecar** to recovery backups next to the vault:
+
+```
+<name>.pre-migrate-v{from}-to-v{to}.bak
+<name>.meta.json.pre-migrate-v{from}-to-v{to}.bak
+```
+
+where `{from}` is the pre-migration `user_version` and `{to}` is
+`current_version`. Properties:
+
+- **Skipped when nothing is pending** — the common open path performs no
+  filesystem writes (zero cost).
+- **Skipped for a freshly created vault** (`from == 0`): a brand-new vault
+  has no pre-existing user data to protect.
+- The `.bak` files are **left in place** after a successful migration as a
+  recovery artifact. Pruning stale backups is future work; a recovery
+  artifact is never deleted automatically.
+
+### Rollback stance — forward-only
+
+Production is **forward-only**. Migrations are applied with `to_latest` and
+the application **never auto-downgrades user data** with a programmatic
+`to_version`. `down` scripts exist in the codebase **for tests only** (to
+construct an older schema and assert the forward migration) and are not
+wired into any open path.
+
+If a migration must be undone on real data, the supported recovery path is
+to **restore the pre-migration `.bak`** described above — not a
+programmatic downgrade.
+
+## 6b. Spec-doc process for a new application migration (Mn)
+
+Every new application-level migration `Mn` MUST update this spec in
+lockstep. Checklist (codifies the M5/M6 precedent):
+
+1. **Additive only.** No destructive change to v1 reader compatibility — a
+   reader unaware of the new table/column ignores it (SQLite skips unknown
+   tables; new columns are nullable or carry a default).
+2. **Bump `user_version` by exactly 1** (append one entry to the migration
+   registry; advance `current_version` by 1).
+3. **Sidecar `version` stays `1`.** It changes **only** if the cryptographic
+   envelope or sidecar JSON schema changes — which is a true format v2, a
+   separate and much heavier process (and would bump
+   `SUPPORTED_FORMAT_VERSION`).
+4. **Add a spec section §N** documenting the new table/column, its
+   semantics, and a forward-compat note.
+5. **Add a "legacy open → migrate → assert" test** mirroring the existing
+   migration tests: build a vault at the previous schema, run the full
+   migration, assert `user_version` advanced and the new schema works.
+6. **Note third-party-reader impact** (normally: none — additive table the
+   reader ignores).
 
 ## 8. Blobs and attachments (application-level, M5)
 
@@ -440,6 +521,19 @@ key stops working after rotation — the crypto enforces re-enrollment.
 
 ## Changelog
 
+- **doc rev 1.3 (2026-05-23)** — Migration-framework hardening. No schema
+  change. New §6a "Migration safety and recovery" (open-time guards
+  rejecting a future format-level version or a newer app-level
+  `user_version`; backup-before-migrate writing
+  `<name>.pre-migrate-v{from}-to-v{to}.bak` plus the sidecar `.bak` before
+  any pending migration, skipped when nothing is pending and for a
+  freshly created vault; forward-only rollback stance — recovery is
+  restore-from-`.bak`, never an auto-downgrade, `down` scripts are
+  test-only). New §6b "Spec-doc process for a new application migration"
+  codifying the additive-only / single-`user_version`-bump / sidecar-stays-1
+  / add-spec-§N / add-legacy-open-migrate-assert-test / note-reader-impact
+  checklist. A reader at any earlier doc rev still opens vaults at doc rev
+  1.3 unchanged.
 - **doc rev 1.2 (2026-05-21)** — Per-note version history (M6). New §9
   "Per-note version history" documenting the `note_versions` table, the
   write-hook contract (read-old → insert-snapshot → prune-to-cap →
