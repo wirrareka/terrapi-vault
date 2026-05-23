@@ -6,23 +6,23 @@ You may share and adapt it, including for commercial purposes, provided you
 give appropriate credit to the Terrapi terrapi-vault project.
 -->
 
-# Memento Vault On-Disk Format — v1 (doc rev 1.3)
+# Memento Vault On-Disk Format — v1 (doc rev 1.4)
 
 This document specifies the on-disk format produced by `terrapi-vault`
 precisely enough that an independent implementation can write a compatible
 reader/writer. It describes **exactly what the code produces**; if the code
 and this document disagree, that is a bug to be reconciled.
 
-> **Document revision:** 1.3 (2026-05-23). The sidecar integer `version`
-> field (§2) stays at **1**. This revision adds **no schema change**: it
-> documents the application-level migration-safety contract (§6a:
-> open-time format/app-schema guards, backup-before-migrate, forward-only
-> rollback stance) and the spec-doc process checklist (§6b) every future
-> migration must follow. Doc rev 1.2 added the M6 tables (§9); doc rev 1.1
-> added M5 (§8); none changed the cryptographic envelope, the sidecar JSON
-> schema, or the keying procedure. A v1 reader written against doc rev
-> 1.0 continues to open vaults produced by doc rev 1.3 with no changes —
-> additional tables it does not know about are simply ignored.
+> **Document revision:** 1.4 (2026-05-23). The sidecar integer `version`
+> field (§2) stays at **1**. This revision adds the **M7 `audit_log`
+> table** (§10) — a single additive application-level migration
+> (`user_version` 6 → 7), following the §6b checklist. Doc rev 1.3 added
+> the §6a/§6b migration-safety contract (no schema change); doc rev 1.2
+> added the M6 tables (§9); doc rev 1.1 added M5 (§8); none changed the
+> cryptographic envelope, the sidecar JSON schema, or the keying
+> procedure. A v1 reader written against doc rev 1.0 continues to open
+> vaults produced by doc rev 1.4 with no changes — additional tables it
+> does not know about (including `audit_log`) are simply ignored.
 
 > **Single-note export:** the encrypted `.memento-note` single-file
 > container (produced by `export_note` / read by `import_note`) reuses
@@ -519,8 +519,101 @@ application's responsibility (see the app's `SECURITY.md`). Because
 `rotate_key` derives a new key over a fresh salt, any previously stashed
 key stops working after rotation — the crypto enforces re-enrollment.
 
+## 10. Audit log (application-level, M7)
+
+An **append-only** record of *what happened and when* across the vault.
+Distinct from the per-note **version history** (§9, `note_versions`):
+version history answers "restore this note to how it was" (restorable
+content snapshots, capped at 20/note); the audit log answers "what
+happened and when" (one short row per mutating action, every entity type,
+never restored). Diff text for a `note.edit` is **derived on demand** from
+`note_versions` via the optional `version_id` link — it is never stored
+in the audit log.
+
+### Schema (M7)
+
+```sql
+CREATE TABLE audit_log (
+    id          INTEGER PRIMARY KEY,
+    ts          TEXT    NOT NULL,           -- RFC3339 UTC
+    actor       TEXT    NOT NULL DEFAULT 'local',  -- 'local' | 'sync'
+    action      TEXT    NOT NULL,           -- e.g. note.create / secret.update
+    entity_type TEXT    NOT NULL,           -- 'note' | 'folder' | 'secret' | 'tag' | …
+    entity_id   INTEGER,                    -- affected row; NOT a foreign key
+    summary     TEXT    NOT NULL,           -- human string; NO secret values
+    version_id  INTEGER                     -- optional link to note_versions.id
+);
+CREATE INDEX idx_audit_ts ON audit_log(ts DESC);
+```
+
+### Action verbs
+
+`note.create` / `note.edit` / `note.delete`;
+`folder.create` / `folder.rename` / `folder.move` / `folder.delete`;
+`secret.create` / `secret.update` / `secret.delete`;
+`tag.create` / `tag.delete`; and (reserved for later callers)
+`key.rotate`, `sync.pull` / `sync.push`, `export.plaintext`.
+
+### Write contract
+
+Each row is written by the repository layer **inside the same SQL
+transaction** as the mutation it records, so a failed mutation rolls the
+audit row back too — the log can never contain an action that did not
+commit, nor miss one that did. `note.edit` rows carry the `version_id` of
+the `note_versions` snapshot captured by the §9 write-hook, so the UI can
+derive a line diff between that snapshot and the next.
+
+### No secret values — hard rule
+
+For `secret.*` actions, `summary` records the **key name and the action
+only** (e.g. `secret AWS_KEY updated`), **never the value**. The audit
+table is inside the SQLCipher-encrypted container, but it is the most
+likely artifact a user screenshots or exports, so values must never reach
+it. The application enforces this at every `secret.*` call site (the value
+is bound only to the mutation's own parameter, never interpolated into the
+summary) and covers it with a test asserting the value string is absent.
+
+### Retention
+
+The log is bounded: after each insert the application keeps at most
+**N = 10 000** rows and prunes any row older than **365 days** (mirrors
+the §9 cap-trim). v1 hardcodes these; an enable/disable toggle and a
+user-tunable cap are deferred to application configuration.
+
+### `entity_id` / `version_id` are not foreign keys
+
+Like `note_versions.folder_id` (§9), neither column is a foreign key: the
+referenced row may already be deleted (the recorded action may itself be a
+delete), and the audit row must outlive it. `version_id` additionally
+points at a `note_versions` row that cascades away with its note, while
+the audit entry persists.
+
+### M7 forward-compat
+
+M7 only **adds** one table and one index; it touches no pre-existing
+table, column, trigger, or FTS index (`notes_fts` indexes
+`notes(title, body_markdown)` only — audit rows are not full-text
+indexed). A vault produced by an app version pre-dating M7 migrates
+forward by a single application-level `PRAGMA user_version` bump
+(M7 = previous + 1); the sidecar `version` stays `1` and no
+SQLCipher-level re-encryption occurs. A third-party reader unaware of
+`audit_log` simply ignores the table.
+
 ## Changelog
 
+- **doc rev 1.4 (2026-05-23)** — Audit log (M7). New §10 "Audit log"
+  documenting the `audit_log` table (append-only record of mutating
+  actions across every entity type), the action-verb set, the
+  same-transaction write contract, the `version_id` link to
+  `note_versions` for on-demand `note.edit` diffs, the retention bound
+  (≤ 10 000 rows / ≤ 365 days), and the **hard rule that `summary` never
+  contains a secret value** (only the key name + action). `entity_id`
+  and `version_id` are deliberately not foreign keys. Forward-compat
+  addition: existing vaults migrate forward by a single application-level
+  `PRAGMA user_version` bump (M7 = previous + 1); the sidecar `version`
+  stays 1 and no cryptographic changes occur. A reader at any earlier doc
+  rev still opens vaults at doc rev 1.4 unchanged — the `audit_log` table
+  it does not know about is simply ignored.
 - **doc rev 1.3 (2026-05-23)** — Migration-framework hardening. No schema
   change. New §6a "Migration safety and recovery" (open-time guards
   rejecting a future format-level version or a newer app-level
