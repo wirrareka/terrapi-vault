@@ -6,25 +6,27 @@ You may share and adapt it, including for commercial purposes, provided you
 give appropriate credit to the Terrapi terrapi-vault project.
 -->
 
-# Memento Vault On-Disk Format — v1 (doc rev 1.5)
+# Memento Vault On-Disk Format — v1 (doc rev 1.6)
 
 This document specifies the on-disk format produced by `terrapi-vault`
 precisely enough that an independent implementation can write a compatible
 reader/writer. It describes **exactly what the code produces**; if the code
 and this document disagree, that is a bug to be reconciled.
 
-> **Document revision:** 1.5 (2026-05-24). The sidecar integer `version`
-> field (§2) stays at **1**. This revision adds the **M8
-> `secrets.updated_at` column** (§11) — a single additive,
-> nullable-column application-level migration (`user_version` 7 → 8),
-> following the §6b checklist. Doc rev 1.4 added the M7 `audit_log` table
-> (§10); doc rev 1.3 added the §6a/§6b migration-safety contract (no schema
-> change); doc rev 1.2 added the M6 tables (§9); doc rev 1.1 added M5 (§8);
-> none changed the cryptographic envelope, the sidecar JSON schema, or the
-> keying procedure. A v1 reader written against doc rev 1.0 continues to
-> open vaults produced by doc rev 1.5 with no changes — additional tables
-> and columns it does not know about (including `audit_log` and
-> `secrets.updated_at`) are simply ignored.
+> **Document revision:** 1.6 (2026-05-24). The sidecar integer `version`
+> field (§2) stays at **1**. This revision adds the **M9 `succession_plans`
+> table** (§12) — a single additive, new-table application-level migration
+> (`user_version` 8 → 9), following the §6b checklist; the table stores only
+> a recipient label, a folder id, a timestamp, and optional notes — never a
+> passphrase, key, or PII. Doc rev 1.5 added the M8 `secrets.updated_at`
+> column (§11); doc rev 1.4 added the M7 `audit_log` table (§10); doc rev 1.3
+> added the §6a/§6b migration-safety contract (no schema change); doc rev 1.2
+> added the M6 tables (§9); doc rev 1.1 added M5 (§8); none changed the
+> cryptographic envelope, the sidecar JSON schema, or the keying procedure. A
+> v1 reader written against doc rev 1.0 continues to open vaults produced by
+> doc rev 1.6 with no changes — additional tables and columns it does not
+> know about (including `audit_log`, `secrets.updated_at`, and
+> `succession_plans`) are simply ignored.
 
 > **Single-note export:** the encrypted `.memento-note` single-file
 > container (produced by `export_note` / read by `import_note`) reuses
@@ -638,7 +640,74 @@ re-encryption occurs. A third-party reader unaware of `updated_at` simply
 ignores the column (or reads it as an optional text field) — `SELECT *` and
 named-column reads both remain valid.
 
+## 12. Succession-plan bookkeeping (application-level, M9)
+
+M9 adds one table recording **which folder subtrees have had succession
+bundles produced, for which recipient labels, and when** — the deferred
+§4c of the succession feature (see `docs/proposals/G-major-features.md` §4).
+It lets the owner-side UI show "Last exported to <recipient> on <date>"
+instead of relying on memory.
+
+```sql
+CREATE TABLE succession_plans (
+    id            INTEGER PRIMARY KEY,
+    folder_id     INTEGER,              -- subtree root, NOT a foreign key
+    recipient     TEXT NOT NULL,        -- owner-chosen LABEL only, no PII
+    last_exported TEXT,                 -- RFC3339 UTC, when last produced
+    notes         TEXT                  -- optional owner freeform text
+);
+CREATE INDEX        idx_succession_plans_folder           ON succession_plans(folder_id);
+CREATE UNIQUE INDEX idx_succession_plans_folder_recipient ON succession_plans(folder_id, recipient);
+```
+
+### Critical security rule — no secrets, no keys, no PII
+
+This table stores **NO** generated bundle passphrases, **NO** key material,
+and **NO** recipient contact PII. The only recipient-derived datum is the
+freeform `recipient` LABEL the owner types ("Lawyer", "Alice"). The generated
+bundle passphrase is returned to the owner **once** in memory
+(`GeneratedBundle`, zeroizing) and is never written to any vault. `notes` is
+optional owner-facing freeform text and must likewise never carry a secret
+value. This mirrors the audit-log rule (§10): the most likely artifact a user
+screenshots or exports must never contain a secret.
+
+### Keying and the upsert contract
+
+A plan is keyed on `(folder_id, recipient)` (enforced by the UNIQUE index).
+Producing a bundle for the same folder and the same recipient label again
+**updates** the existing row's `last_exported` rather than inserting a
+duplicate. The write is performed by `SuccessionPlanRepo::upsert` in the same
+master-vault flow that records the `succession.export` audit row, so a
+recorded plan always corresponds to a produced bundle.
+
+`folder_id` is intentionally **NOT a foreign key**: the subtree root may be
+moved or deleted after a bundle was produced; the recorded id is
+informational (same rationale as `note_versions.folder_id`, §9, and
+`audit_log.entity_id`, §10). It is left `NULL`able for the same reason.
+
+### M9 forward-compat
+
+M9 only **adds** one table and two indexes; it touches no existing table, no
+trigger, and no FTS index (`notes_fts` indexes `notes(title, body_markdown)`
+only). A vault produced by an app version pre-dating M9 migrates forward by a
+single application-level `PRAGMA user_version` bump (M9 = previous + 1, i.e.
+`user_version` 8 → 9); the sidecar `version` stays `1` and no SQLCipher-level
+re-encryption occurs. A third-party reader unaware of `succession_plans`
+simply ignores the table — `SELECT *` and named-column reads on other tables
+remain valid.
+
 ## Changelog
+
+- **doc rev 1.6 (2026-05-24)** — Succession-plan bookkeeping (M9). New §12
+  documenting the `succession_plans` table (which folder subtrees had bundles
+  produced, for which recipient labels, and when), the `(folder_id,
+  recipient)` upsert keying, and the **hard rule that the table stores no
+  passphrases, no keys, and no PII — only a label, a folder id, an RFC3339
+  timestamp, and optional owner notes**. `folder_id` is deliberately not a
+  foreign key. Application-level `PRAGMA user_version` bump 8 → 9 following
+  the §6b checklist; the sidecar `version` stays `1` and no cryptographic
+  changes. A reader at any earlier doc rev still opens vaults at doc rev 1.6
+  unchanged — the new table is ignored.
 
 - **doc rev 1.5 (2026-05-24)** — Secret last-modified (M8). New §11
   documenting the additive, **nullable** `secrets.updated_at` column
