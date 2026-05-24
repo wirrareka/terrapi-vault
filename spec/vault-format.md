@@ -6,23 +6,25 @@ You may share and adapt it, including for commercial purposes, provided you
 give appropriate credit to the Terrapi terrapi-vault project.
 -->
 
-# Memento Vault On-Disk Format — v1 (doc rev 1.4)
+# Memento Vault On-Disk Format — v1 (doc rev 1.5)
 
 This document specifies the on-disk format produced by `terrapi-vault`
 precisely enough that an independent implementation can write a compatible
 reader/writer. It describes **exactly what the code produces**; if the code
 and this document disagree, that is a bug to be reconciled.
 
-> **Document revision:** 1.4 (2026-05-23). The sidecar integer `version`
-> field (§2) stays at **1**. This revision adds the **M7 `audit_log`
-> table** (§10) — a single additive application-level migration
-> (`user_version` 6 → 7), following the §6b checklist. Doc rev 1.3 added
-> the §6a/§6b migration-safety contract (no schema change); doc rev 1.2
-> added the M6 tables (§9); doc rev 1.1 added M5 (§8); none changed the
-> cryptographic envelope, the sidecar JSON schema, or the keying
-> procedure. A v1 reader written against doc rev 1.0 continues to open
-> vaults produced by doc rev 1.4 with no changes — additional tables it
-> does not know about (including `audit_log`) are simply ignored.
+> **Document revision:** 1.5 (2026-05-24). The sidecar integer `version`
+> field (§2) stays at **1**. This revision adds the **M8
+> `secrets.updated_at` column** (§11) — a single additive,
+> nullable-column application-level migration (`user_version` 7 → 8),
+> following the §6b checklist. Doc rev 1.4 added the M7 `audit_log` table
+> (§10); doc rev 1.3 added the §6a/§6b migration-safety contract (no schema
+> change); doc rev 1.2 added the M6 tables (§9); doc rev 1.1 added M5 (§8);
+> none changed the cryptographic envelope, the sidecar JSON schema, or the
+> keying procedure. A v1 reader written against doc rev 1.0 continues to
+> open vaults produced by doc rev 1.5 with no changes — additional tables
+> and columns it does not know about (including `audit_log` and
+> `secrets.updated_at`) are simply ignored.
 
 > **Single-note export:** the encrypted `.memento-note` single-file
 > container (produced by `export_note` / read by `import_note`) reuses
@@ -599,7 +601,54 @@ forward by a single application-level `PRAGMA user_version` bump
 SQLCipher-level re-encryption occurs. A third-party reader unaware of
 `audit_log` simply ignores the table.
 
+## 11. Secret last-modified timestamp (application-level, M8)
+
+M8 adds a single nullable column to the existing `secrets` table:
+
+```sql
+ALTER TABLE secrets ADD COLUMN updated_at TEXT;  -- RFC3339 UTC, nullable
+```
+
+`secrets.updated_at` records the RFC3339-UTC time a secret row was last
+created or updated, surfaced unobtrusively in the secrets panel
+("Edited 2m ago").
+
+### Nullable, no default — why
+
+SQLite `ALTER TABLE … ADD COLUMN` cannot add a `NOT NULL` column without a
+**constant** default and cannot use a **non-constant** default (a clock
+expression). The column is therefore added **NULLABLE**:
+
+- **Pre-M8 rows keep `NULL`**, meaning "last-modified time unknown". The app
+  renders `NULL` as *nothing* — never a literal "unknown" or a fabricated
+  time.
+- **Every new write sets it.** Memento's `SecretRepo::create` and
+  `SecretRepo::update` write `Utc::now().to_rfc3339()`, the same convention
+  `notes.created_at` / `notes.updated_at` use.
+
+### M8 forward-compat
+
+M8 only **adds** one nullable column to `secrets`; it touches no other
+table, no trigger, and no FTS index (`notes_fts` indexes
+`notes(title, body_markdown)` only — secrets are never full-text indexed).
+A vault produced by an app version pre-dating M8 migrates forward by a
+single application-level `PRAGMA user_version` bump (M8 = previous + 1, i.e.
+`user_version` 7 → 8); the sidecar `version` stays `1` and no SQLCipher-level
+re-encryption occurs. A third-party reader unaware of `updated_at` simply
+ignores the column (or reads it as an optional text field) — `SELECT *` and
+named-column reads both remain valid.
+
 ## Changelog
+
+- **doc rev 1.5 (2026-05-24)** — Secret last-modified (M8). New §11
+  documenting the additive, **nullable** `secrets.updated_at` column
+  (RFC3339 UTC), why it is nullable (SQLite `ADD COLUMN` cannot take a
+  non-constant default), the NULL = "unknown" semantics for pre-M8 rows, and
+  that every `create`/`update` stamps it. Application-level `PRAGMA
+  user_version` bump 7 → 8 following the §6b checklist; the sidecar
+  `version` stays `1` and no cryptographic changes. A reader at any earlier
+  doc rev still opens vaults at doc rev 1.5 unchanged — the new column is
+  ignored or read as an optional field.
 
 - **doc rev 1.4 (2026-05-23)** — Audit log (M7). New §10 "Audit log"
   documenting the `audit_log` table (append-only record of mutating
