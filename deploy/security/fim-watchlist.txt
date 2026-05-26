@@ -9,7 +9,8 @@
 /var/db/terrapi-vault/unseal.pass
 
 # --- Backend secrets sourced into the env at boot. ---
-/var/db/terrapi-vault/secrets/os-admin.pass
+/var/db/terrapi-vault/secrets/os-credmgr.pass
+/var/db/terrapi-vault/secrets/audit-writer.pass
 
 # --- At-rest store sidecar (salt + KDF params; needed to open the store). ---
 /var/db/terrapi-vault/store.sqlcipher.meta.json

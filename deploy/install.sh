@@ -46,8 +46,13 @@ if [ ! -f "${DATA}/unseal.pass" ]; then
     exit 1
 fi
 install -d -o vault -g vault -m 700 "${DATA}/secrets"
-[ -f "${DATA}/secrets/os-admin.pass" ] || \
-    echo "    NOTE: drop the OpenSearch admin secret at ${DATA}/secrets/os-admin.pass (mode 600)."
+# Two OpenSearch creds (least privilege):
+#   os-credmgr.pass  — creds-engine (mint/delete ephemeral users); privileged security-API.
+#   audit-writer.pass — write-only, for the broker's own source:"vault" B3 audit ship.
+[ -f "${DATA}/secrets/os-credmgr.pass" ] || \
+    echo "    NOTE: drop the OpenSearch creds-engine secret at ${DATA}/secrets/os-credmgr.pass (mode 600)."
+[ -f "${DATA}/secrets/audit-writer.pass" ] || \
+    echo "    NOTE: drop the write-only audit-writer secret at ${DATA}/secrets/audit-writer.pass (mode 600)."
 chown vault:vault "${DATA}/unseal.pass"; chmod 600 "${DATA}/unseal.pass"
 
 # --- step 4: config + roles + tls -------------------------------------------
