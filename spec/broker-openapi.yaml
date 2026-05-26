@@ -98,10 +98,18 @@ components:
     RoleName:
       type: string
       description: |
-        v1 backend roles (demon-confirmed 2026-05-26). The set is extensible via broker
-        config; clients must treat unknown roles as a `404`. RethinkDB is the stack's
-        primary datastore (proximiio-sync); Postgres only if a service later introduces it.
-      examples: [os-audit-writer, os-metrics-reader, rethinkdb-admin]
+        v1 backend roles (demon-confirmed 2026-05-26, infra-corrected role names). The set
+        is extensible via broker config; clients must treat unknown roles as a `404`.
+
+        - `audit-writer` — OpenSearch RBAC, **write-only** on `audit-events-*`; the leased
+          ephemeral user is granted `opendistro_security_roles: ["audit-writer"]`
+          (`opensearch-infra/audit/security/audit-writer.role.json`).
+        - `rethinkdb-admin` — RethinkDB admin (proximiio-sync; the stack's primary
+          datastore — Postgres only if a service later introduces it).
+
+        No metrics-reader role: metrics live in Prometheus (PromQL, WG-only), not
+        OpenSearch, so demon queries Prometheus directly with no brokered cred.
+      examples: [audit-writer, rethinkdb-admin]
 
     Lease:
       type: object

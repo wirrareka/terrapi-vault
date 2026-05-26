@@ -145,8 +145,10 @@ API is versioned `/v1/...`. JSON. All mutating ops emit a B3 audit event (§4.5)
 > **Demon-confirmed parameters (2026-05-26), lock into v1 OpenAPI:**
 > - Host-cert SSH CA = **group scope** (not per-tenant); tenant scoping only for leased
 >   service-admin creds under `<group>/<tenant_id>/<role>`.
-> - First roles: `os-audit-writer` (demon writes its own `source:"control-plane"`
->   events — distinct from vault's `source:"vault"`), `os-metrics-reader`, RethinkDB admin.
+> - First roles (infra-corrected 2026-05-26): `audit-writer` (OpenSearch RBAC, write-only
+>   on `audit-events-*`; demon writes its own `source:"control-plane"` events — distinct
+>   from vault's `source:"vault"`) + `rethinkdb-admin`. No `os-metrics-reader`: metrics
+>   are Prometheus/PromQL, not OpenSearch.
 > - **TTLs:** SSH cert 900 s interactive / 300 s automated + touch-per-op (fresh cert per
 >   destructive/secret/CA op). Operator session: **8 h hard cap, 30 min idle**. Every
 >   cert/lease is a child of the session lease → cascade-revoke = revoke-on-session-end.
@@ -290,7 +292,7 @@ the wrong group correctly 404. Make `group` a validated extractor to order-indep
 
 **Next sub-phase (Phase 1b/2):** rustls mTLS-over-WG termination (real SAN from peer
 cert) · SSH cert signing (CA key in the at-rest store, `ssh-key` crate) · dynamic-cred
-engines (OpenSearch RBAC roles `os-audit-writer`/`os-metrics-reader`, RethinkDB admin) ·
+engines (OpenSearch RBAC role `audit-writer` write-only, RethinkDB admin) ·
 ship B3 to group-local OpenSearch · hash-chained durable audit store · CSPRNG lease ids.
 Then notify `inbox/demon/` that v1 OpenAPI is published (coordination repo handled by
 its owning agent).
