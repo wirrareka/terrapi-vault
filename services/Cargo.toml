@@ -23,6 +23,9 @@ serde_json = { version = "1.0.133", features = ["raw_value"] }
 thiserror = "1.0.69"
 # Tamper-evident audit hash chain (SHA-256 over prev-hash ++ seq ++ event bytes).
 sha2 = "0.10"
+# KMS DEK wrap/unwrap (envelope encryption of aether fleet-backup keys): AES-256-GCM.
+aes-gcm = "0.10"
+base64 = "0.22"
 # Master-key handling for the broker unseal: the same zeroizing secret wrapper the lib
 # pins, so the SecretBox<DerivedKey> returned by terrapi-vault::derive_key is one type.
 secrecy = "0.10.3"

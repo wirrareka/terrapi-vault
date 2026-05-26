@@ -1,5 +1,5 @@
 {
-  "_comment": "Example VAULT_ROLES_CONFIG for the EU broker. Maps each client cert's first SAN dNSName to a role + its granted capabilities (least privilege). Capabilities: ssh-ca, ssh-sign, creds, session, leases. An unmapped/trusted SAN gets 403; a cap the role lacks gets 403.",
+  "_comment": "Example VAULT_ROLES_CONFIG for the EU broker. Maps each client cert's first SAN dNSName to a role + its granted capabilities (least privilege). Capabilities: ssh-ca, ssh-sign, creds, session, leases, kms. An unmapped/trusted SAN gets 403; a cap the role lacks gets 403.",
   "roles": {
     "demon-operator.eu.proximi.internal": {
       "role": "demon-operator",
@@ -11,7 +11,7 @@
     },
     "aether-backup.eu.proximi.internal": {
       "role": "aether-backup",
-      "caps": ["session", "leases"]
+      "caps": ["kms"]
     }
   }
 }

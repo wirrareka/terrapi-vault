@@ -3,3 +3,8 @@
 .DS_Store
 *.memento
 *.memento.meta.json
+# transient test artifacts (SQLCipher temp stores + WAL/SHM/meta sidecars)
+*.sqlcipher
+*.sqlcipher-wal
+*.sqlcipher-shm
+*.sqlcipher.meta.json

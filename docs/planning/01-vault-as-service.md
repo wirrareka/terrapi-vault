@@ -356,7 +356,13 @@ session|leases`); each handler calls `require_cap` → `403` if not granted. Pro
 config (empty = deny-all `403`); dev keeps the header path + all-caps `dev` principal.
 Sample `docs/dev/roles.example.json` (demon-operator, demon-system, aether-backup).
 
-**Next:** the core broker engines are complete (SSH-CA, OpenSearch creds, expiry, audit
-chain + shipping, mTLS + role authz). Future, when prioritized: the **KMS wrap/unwrap**
-engine for aether fleet-backup keys (design ack'd, not built); additional `CredEngine`
-adapters for any *modern* datastore that needs brokered creds (RethinkDB is out).
+**KMS wrap/unwrap — DONE:** `kms.rs` — per-target KEK (`<group>/<tenant_id>/<key_id>`)
+generated + held in the at-rest store, never exported, **stable** (not leased), NOT
+session-bound. `POST …/kms/{key_id}/wrap` `{dek}` → `{wrapped,kek_id}` and `…/unwrap`
+`{wrapped}` → `{dek}` (AES-256-GCM envelope; cap `kms`, aether-backup principal). For
+aether fleet-mode backup keys; preserves their zero-knowledge model (KEK never leaves).
+
+**Next:** the broker is feature-complete for the planned scope (SSH-CA, OpenSearch creds,
+KMS wrap/unwrap, expiry, audit chain + shipping, mTLS + role authz). Future, when
+prioritized: additional `CredEngine` adapters for any *modern* datastore that needs
+brokered creds (RethinkDB is out); broker-master-key KMS-wrap for unattended unseal.

@@ -5,9 +5,11 @@
 
 use crate::auth::{Capability, Principal};
 use crate::dto::{
-    Ack, CredsRequest, ErrorBody, LeaseRenewRequest, LeaseRenewResponse, LeaseRevokeRequest,
-    SealStatus, SessionEndResponse, SessionOpenRequest, SessionOpenResponse, SshSignRequest,
+    Ack, CredsRequest, ErrorBody, KmsUnwrapRequest, KmsUnwrapResponse, KmsWrapRequest,
+    KmsWrapResponse, LeaseRenewRequest, LeaseRenewResponse, LeaseRevokeRequest, SealStatus,
+    SessionEndResponse, SessionOpenRequest, SessionOpenResponse, SshSignRequest,
 };
+use base64::Engine as _;
 use crate::state::{
     now_unix, AppState, CREDS_DEFAULT_TTL_SECS, DEFAULT_SESSION_IDLE_SECS,
     DEFAULT_SESSION_TTL_SECS, SSH_CERT_TTL_INTERACTIVE_SECS,
@@ -92,6 +94,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/{group}/ssh/ca", get(ssh_ca))
         .route("/v1/{group}/ssh/sign", post(ssh_sign))
         .route("/v1/{group}/{tenant_id}/creds/{role}", post(creds))
+        .route("/v1/{group}/{tenant_id}/kms/{key_id}/wrap", post(kms_wrap))
+        .route("/v1/{group}/{tenant_id}/kms/{key_id}/unwrap", post(kms_unwrap))
         .route("/v1/sys/session", post(session_open))
         .route("/v1/sys/session/{id}", delete(session_end))
         .route("/v1/sys/leases/renew", post(lease_renew))
@@ -368,6 +372,127 @@ async fn creds(
         ttl_secs: ttl,
         renewable: true,
         max_ttl_secs: issued.max_ttl_secs,
+    }))
+}
+
+/// Backup-target key id: a short, filesystem/DB-safe token (the aether `target_id`).
+fn is_valid_key_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Common validation for the KMS ops: capability, group, unsealed, tenant UUIDv4, key_id.
+/// Returns the unsealed store on success.
+fn kms_preflight(
+    state: &AppState,
+    principal: &Principal,
+    group: &str,
+    tenant_id: &str,
+    key_id: &str,
+) -> Result<std::sync::Arc<std::sync::Mutex<terrapi_vault::Vault>>, (StatusCode, Json<ErrorBody>)> {
+    require_cap(principal, Capability::Kms)?;
+    check_group(state, group)?;
+    require_unsealed(state)?;
+    if !is_uuid_v4_lower(tenant_id) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "bad_tenant_id",
+            "tenant_id must be a lowercase UUIDv4 (Vulture organization_id)",
+        ));
+    }
+    if !is_valid_key_id(key_id) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "bad_key_id",
+            "key_id must be 1-128 chars of [A-Za-z0-9._-]",
+        ));
+    }
+    state.store.clone().ok_or_else(|| {
+        err(StatusCode::SERVICE_UNAVAILABLE, "sealed", "broker is sealed")
+    })
+}
+
+fn map_kms_err(e: crate::kms::KmsError) -> (StatusCode, Json<ErrorBody>) {
+    use crate::kms::KmsError;
+    match e {
+        KmsError::BadInput(m) => err(StatusCode::BAD_REQUEST, "bad_request", &m),
+        KmsError::Crypto => err(
+            StatusCode::BAD_REQUEST,
+            "unwrap_failed",
+            "blob did not authenticate under this target's key (wrong target or tampered)",
+        ),
+        KmsError::Store(m) => err(StatusCode::INTERNAL_SERVER_ERROR, "store_error", &m),
+    }
+}
+
+async fn kms_wrap(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path((group, tenant_id, key_id)): Path<(String, String, String)>,
+    Json(req): Json<KmsWrapRequest>,
+) -> ApiResult<KmsWrapResponse> {
+    let store = kms_preflight(&state, &principal, &group, &tenant_id, &key_id)?;
+    let dek = base64::engine::general_purpose::STANDARD
+        .decode(req.dek.as_bytes())
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad_dek", "dek must be valid base64"))?;
+    let wrapped = {
+        let v = store.lock().expect("store lock");
+        crate::kms::wrap(&v, &group, &tenant_id, &key_id, &dek)
+    }
+    .map_err(map_kms_err)?;
+
+    state.emit(&AuditEvent::vault(
+        AppState::now_ts(),
+        state.cfg.node.clone(),
+        Some(state.cfg.residency_group.as_str().to_owned()),
+        system_actor(&principal),
+        "kms.wrap",
+        Target {
+            kind: "kms-kek".into(),
+            id: Some(format!("{group}/{tenant_id}/{key_id}")),
+        },
+        Outcome::Success,
+        None,
+    ));
+    Ok(Json(KmsWrapResponse {
+        wrapped: base64::engine::general_purpose::STANDARD.encode(wrapped),
+        kek_id: format!("{group}/{tenant_id}/{key_id}"),
+    }))
+}
+
+async fn kms_unwrap(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path((group, tenant_id, key_id)): Path<(String, String, String)>,
+    Json(req): Json<KmsUnwrapRequest>,
+) -> ApiResult<KmsUnwrapResponse> {
+    let store = kms_preflight(&state, &principal, &group, &tenant_id, &key_id)?;
+    let wrapped = base64::engine::general_purpose::STANDARD
+        .decode(req.wrapped.as_bytes())
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad_wrapped", "wrapped must be valid base64"))?;
+    let dek = {
+        let v = store.lock().expect("store lock");
+        crate::kms::unwrap(&v, &group, &tenant_id, &key_id, &wrapped)
+    }
+    .map_err(map_kms_err)?;
+
+    state.emit(&AuditEvent::vault(
+        AppState::now_ts(),
+        state.cfg.node.clone(),
+        Some(state.cfg.residency_group.as_str().to_owned()),
+        system_actor(&principal),
+        "kms.unwrap",
+        Target {
+            kind: "kms-kek".into(),
+            id: Some(format!("{group}/{tenant_id}/{key_id}")),
+        },
+        Outcome::Success,
+        None,
+    ));
+    Ok(Json(KmsUnwrapResponse {
+        dek: base64::engine::general_purpose::STANDARD.encode(dek),
     }))
 }
 

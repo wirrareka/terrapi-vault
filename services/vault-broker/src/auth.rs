@@ -31,6 +31,8 @@ pub enum Capability {
     Session,
     /// `POST /v1/sys/leases/{renew,revoke}`
     Leases,
+    /// `POST /v1/{group}/{tenant_id}/kms/{key_id}/{wrap,unwrap}`
+    Kms,
 }
 
 impl Capability {
@@ -43,6 +45,7 @@ impl Capability {
             Capability::Creds,
             Capability::Session,
             Capability::Leases,
+            Capability::Kms,
         ]
         .into_iter()
         .collect()
@@ -170,13 +173,14 @@ mod tests {
     #[test]
     fn dev_principal_holds_all_caps() {
         let all = Capability::all();
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 6);
         for c in [
             Capability::SshCa,
             Capability::SshSign,
             Capability::Creds,
             Capability::Session,
             Capability::Leases,
+            Capability::Kms,
         ] {
             assert!(all.contains(&c));
         }

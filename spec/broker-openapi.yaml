@@ -56,6 +56,7 @@ tags:
   - { name: system, description: Liveness, seal state, sessions, and lease lifecycle. }
   - { name: ssh, description: SSH signed-certificate CA (group-scoped). }
   - { name: creds, description: Leased, ephemeral service-admin credentials (tenant-scoped). }
+  - { name: kms, description: Per-target KEK wrap/unwrap (envelope encryption; KEK never leaves the broker). }
 
 security:
   - mtlsWireGuard: []
@@ -187,6 +188,28 @@ components:
           properties:
             username: { type: string, description: ephemeral backend user, created on issue, deleted on revoke/expiry }
             password: { type: string, description: generated secret — NEVER logged or audited }
+
+    KmsWrapRequest:
+      type: object
+      required: [dek]
+      properties:
+        dek: { type: string, description: base64 plaintext data-encryption key to wrap }
+    KmsWrapResponse:
+      type: object
+      required: [wrapped, kek_id]
+      properties:
+        wrapped: { type: string, description: "base64 nonce(12) || AES-256-GCM ciphertext+tag" }
+        kek_id: { type: string, description: "<group>/<tenant_id>/<key_id> — which KEK wrapped it" }
+    KmsUnwrapRequest:
+      type: object
+      required: [wrapped]
+      properties:
+        wrapped: { type: string, description: base64 wrapped blob from a prior wrap }
+    KmsUnwrapResponse:
+      type: object
+      required: [dek]
+      properties:
+        dek: { type: string, description: base64 plaintext DEK — NEVER logged or audited }
 
     SessionOpenRequest:
       type: object
@@ -340,6 +363,50 @@ paths:
         "404": { description: group mismatch, tenant not provisioned in this group, or unknown/unconfigured role, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "409": { description: no active session for this principal, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "502": { description: backend rejected the create (target system error), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/Sealed" }
+
+  /v1/{group}/{tenant_id}/kms/{key_id}/wrap:
+    post:
+      tags: [kms]
+      operationId: kmsWrap
+      summary: Wrap a DEK under the per-target KEK (envelope encryption).
+      description: |
+        The per-target KEK (`<group>/<tenant_id>/<key_id>`) is generated on first use and
+        held in the broker's at-rest store, **never exported**. Stable (not leased) so old
+        snapshots stay decryptable. NOT session-bound. For aether fleet-mode backups.
+      x-implementation-status: implemented
+      x-audit-action: kms.wrap
+      parameters:
+        - { $ref: "#/components/parameters/GroupParam" }
+        - { $ref: "#/components/parameters/TenantIdParam" }
+        - { name: key_id, in: path, required: true, schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,128}$" }, description: backup target id }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/KmsWrapRequest" } } } }
+      responses:
+        "200": { description: wrapped DEK, content: { application/json: { schema: { $ref: "#/components/schemas/KmsWrapResponse" } } } }
+        "400": { description: bad tenant_id / key_id / base64 dek, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/GroupMismatch" }
+        "503": { $ref: "#/components/responses/Sealed" }
+
+  /v1/{group}/{tenant_id}/kms/{key_id}/unwrap:
+    post:
+      tags: [kms]
+      operationId: kmsUnwrap
+      summary: Unwrap a previously-wrapped DEK under the per-target KEK.
+      x-implementation-status: implemented
+      x-audit-action: kms.unwrap
+      parameters:
+        - { $ref: "#/components/parameters/GroupParam" }
+        - { $ref: "#/components/parameters/TenantIdParam" }
+        - { name: key_id, in: path, required: true, schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,128}$" }, description: backup target id }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/KmsUnwrapRequest" } } } }
+      responses:
+        "200": { description: plaintext DEK, content: { application/json: { schema: { $ref: "#/components/schemas/KmsUnwrapResponse" } } } }
+        "400": { description: bad input, or blob did not authenticate (wrong target / tampered), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/GroupMismatch" }
         "503": { $ref: "#/components/responses/Sealed" }
 
   /v1/sys/session:

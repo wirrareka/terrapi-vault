@@ -16,6 +16,7 @@ mod config;
 mod creds;
 mod dto;
 mod http;
+mod kms;
 mod opensearch;
 mod seal;
 mod ssh_ca;

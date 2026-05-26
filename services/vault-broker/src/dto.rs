@@ -112,6 +112,35 @@ pub struct Ack {
     pub ok: bool,
 }
 
+// --- KMS DEK wrap/unwrap --------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct KmsWrapRequest {
+    /// Base64 plaintext data-encryption key to wrap.
+    pub dek: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KmsWrapResponse {
+    /// Base64 `nonce || ciphertext+tag`.
+    pub wrapped: String,
+    /// `<group>/<tenant_id>/<key_id>` — which KEK wrapped it (audit/traceability).
+    pub kek_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KmsUnwrapRequest {
+    /// Base64 wrapped blob from a prior `wrap`.
+    pub wrapped: String,
+}
+
+/// Carries the plaintext DEK — intentionally NOT `Debug`, so it can't be logged.
+#[derive(Serialize)]
+pub struct KmsUnwrapResponse {
+    /// Base64 plaintext data-encryption key.
+    pub dek: String,
+}
+
 // --- System: seal state ---------------------------------------------------------
 
 #[derive(Debug, Serialize)]

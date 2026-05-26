@@ -41,8 +41,7 @@ pub struct AppState {
     /// unseals; while sealed, mutating ops return `503` (`http::require_unsealed`).
     pub sealed: Arc<AtomicBool>,
     /// The unsealed at-rest store (SQLCipher). `None` while sealed. Holds the SSH CA key
-    /// and (Phase 3) the lease ledger / dynamic-cred state.
-    #[allow(dead_code)]
+    /// and the per-target KMS KEKs.
     pub store: Option<Arc<Mutex<Vault>>>,
     /// The SSH CA loaded for this instance's group. `None` while sealed.
     pub ssh_ca: Option<Arc<SshCa>>,
