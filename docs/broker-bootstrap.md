@@ -14,14 +14,13 @@ contract summary lives in `coordination/conventions/secrets-broker.md`.
 The broker stores its CA keys + lease state in an at-rest encrypted store (the
 `terrapi-vault` SQLCipher library). Its master key is derived at start:
 
-- **v1 — manual unseal (implemented, `seal.rs`):** the operator supplies an unseal
-  passphrase at start (`VAULT_UNSEAL_PASSPHRASE`); the master key is derived with the
-  lib's Argon2id (`terrapi_vault::derive_key`) into a zeroizing `SecretBox`. Until then
-  the broker is **sealed** and every mutating op returns `503` (poll
-  `GET /v1/sys/seal-status`). A wrong passphrase is rejected by an independent verifier
-  (a second KDF output over a fixed salt, constant-time compared) — the master-key bytes
-  are never compared. The sidecar (`VAULT_SEAL_PATH`, `mode 600`) holds **only** salts +
-  KDF params + the verifier; it contains **no secret**.
+- **v1 — manual unseal (implemented, `seal.rs`):** unsealing = opening the broker's
+  at-rest store (`terrapi_vault::Vault`, SQLCipher at `VAULT_STORE_PATH`) with the
+  operator passphrase (`VAULT_UNSEAL_PASSPHRASE`). The store's SQLCipher key is derived
+  with the lib's Argon2id; a wrong passphrase surfaces as the lib's `WrongPassphrase`.
+  Until opened, the broker is **sealed** and every mutating op returns `503` (poll
+  `GET /v1/sys/seal-status`). The store holds the SSH CA key (and, later, the lease
+  ledger); its plaintext `.meta.json` sidecar holds only the salt + KDF params (no secret).
 - **Unattended restart fallback:** the passphrase comes from an `rc.conf`-managed secret
   / env file on a **ZFS-encrypted dataset** (host root can read it — documented
   trade-off; acceptable because the dataset is encrypted and the host is WG-isolated).
@@ -34,7 +33,8 @@ ZFS dataset encryption, and WG isolation.
 - `VAULT_RESIDENCY_GROUP` — `eu` | `uae` (per-instance constant; default `eu`).
 - `VAULT_BROKER_BIND` — listen addr (prod: the WG address only; default `127.0.0.1:8200`).
 - `VAULT_UNSEAL_PASSPHRASE` — operator unseal passphrase (prod). Absent/invalid → sealed.
-- `VAULT_SEAL_PATH` — seal sidecar path (salts + verifier; no secret). `mode 600`.
+- `VAULT_STORE_PATH` — at-rest SQLCipher store (SSH CA key, later the lease ledger);
+  created on first unseal, opened with the passphrase thereafter.
 - `VAULT_TLS_CERT` / `VAULT_TLS_KEY` — broker server cert chain + key (PEM).
 - `VAULT_TLS_CLIENT_CA` — fleet Root CA bundle (PEM); client certs are required + verified
   against it, and the peer DNS-SAN maps to a broker role. All three TLS vars are

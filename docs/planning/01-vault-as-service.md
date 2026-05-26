@@ -297,8 +297,15 @@ master-key unseal (`seal.rs`: Argon2id via the lib, zeroizing `SecretBox`, const
 passphrase verifier, `mode 600` sidecar) gating all mutating ops behind `503` until
 unsealed (`GET /v1/sys/seal-status`). v1 OpenAPI published + demon ack'd.
 
-**Next sub-phase (Phase 2/3):** SSH cert signing (CA key in the at-rest store, `ssh-key`
-crate) — unstubs `ssh/{ca,sign}` · dynamic-cred engines (OpenSearch RBAC role
-`audit-writer` write-only, RethinkDB admin) — unstubs `creds` · ship B3 to group-local
-OpenSearch · hash-chained durable audit store. The unsealed master key (`AppState`) is
-the wrapping key for the at-rest CA/ledger store these consume.
+**Phase 2 — DONE (SSH CA):** the unseal is now **store-backed** (`seal.rs` opens/creates
+a `terrapi_vault::Vault` SQLCipher store with the operator passphrase — `WrongPassphrase`
+→ sealed). `ssh_ca.rs`: an ed25519 CA per group, generated + persisted in that store on
+first run, never exported; signs OpenSSH certs. `GET /v1/{group}/ssh/ca` returns the CA
+public key; `POST /v1/{group}/ssh/sign` issues a short-TTL cert as a **session-bound
+lease** (keyed by mTLS principal SAN; `409` if no open session; host certs reject a
+tenant). Both unstubbed in the spec.
+
+**Next sub-phase (Phase 3):** dynamic-cred engines (OpenSearch RBAC role `audit-writer`
+write-only, RethinkDB admin) — unstubs `creds`; ephemeral backend user created on issue,
+deleted on revoke/expiry · ship B3 to group-local OpenSearch · hash-chained durable audit
+store. These reuse the same at-rest store + session-bound lease model.

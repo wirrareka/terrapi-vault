@@ -40,6 +40,9 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 tower = { version = "0.5", features = ["util"] }
 # Test-only certificate generation (dev/unit certs for the mTLS path).
 rcgen = "0.13"
+# SSH signed-certificate CA (Phase 2): ed25519 CA key + OpenSSH certificate signing.
+ssh-key = { version = "0.6", features = ["ed25519", "std"] }
+rand = "0.8"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

@@ -27,7 +27,9 @@ info:
     **Leases & sessions.** Every issued credential is a lease with a parent. Opening a
     session (`POST /v1/sys/session`) makes subsequently-issued leases its children; ending
     the session (or its TTL/idle timeout) cascade-revokes every child — this is
-    "creds die when the operator session ends".
+    "creds die when the operator session ends". Issuance is bound to the caller's active
+    session, keyed by the mTLS principal SAN (one active session per principal); issuing
+    without an open session returns `409`.
 
     **Audit (vault owns it).** Every mutating operation emits a canonical B3 audit event
     with `source:"vault"` to group-local OpenSearch (`audit-events-{group}-YYYY.MM`),
@@ -275,21 +277,25 @@ paths:
       tags: [ssh]
       operationId: getSshCa
       summary: SSH CA public key (trust anchor) — group-scoped host CA.
-      x-implementation-status: stub
+      x-implementation-status: implemented
       parameters: [{ $ref: "#/components/parameters/GroupParam" }]
       responses:
         "200": { description: CA public key, content: { application/json: { schema: { $ref: "#/components/schemas/SshCaResponse" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/GroupMismatch" }
-        "501": { $ref: "#/components/responses/NotImplemented" }
+        "503": { $ref: "#/components/responses/Sealed" }
 
   /v1/{group}/ssh/sign:
     post:
       tags: [ssh]
       operationId: signSshCert
       summary: Sign a short-TTL SSH certificate.
-      description: CA private key lives in the broker's at-rest encrypted store and is never exported.
-      x-implementation-status: stub
+      description: |
+        CA private key lives in the broker's at-rest encrypted store and is never
+        exported. The issued cert is a lease bound to the caller's **active session**
+        (keyed by the mTLS principal SAN) — open a session first (`POST /v1/sys/session`)
+        or the request `409`s. The lease cascade-revokes when that session ends.
+      x-implementation-status: implemented
       x-audit-action: ssh.sign
       parameters: [{ $ref: "#/components/parameters/GroupParam" }]
       requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SshSignRequest" } } } }
@@ -299,7 +305,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/GroupMismatch" }
-        "501": { $ref: "#/components/responses/NotImplemented" }
+        "409": { description: no active session for this principal, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "503": { $ref: "#/components/responses/Sealed" }
 
   /v1/{group}/{tenant_id}/creds/{role}:

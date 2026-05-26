@@ -1,22 +1,28 @@
 //! Shared broker state: config, the lease/session engine, and the audit sink.
 
 use crate::config::BrokerConfig;
-use crate::seal::Unsealed;
-use secrecy::SecretBox;
+use crate::ssh_ca::SshCa;
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use terrapi_vault::DerivedKey;
+use terrapi_vault::Vault;
 use vault_transport::audit::{AuditEvent, AuditSink, JsonlSink};
 use vault_transport::lease::LeaseEngine;
+
+/// The result of a successful boot-time unseal: the opened at-rest store and the SSH CA
+/// loaded from it. `Vault` owns a rusqlite connection (`!Sync`), hence the `Mutex`.
+pub struct Unsealed {
+    pub store: Vault,
+    pub ssh_ca: SshCa,
+}
 
 /// Demon-confirmed defaults (coordination/conventions/secrets-broker.md):
 /// operator session 8 h hard cap, 30 min idle.
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 8 * 60 * 60;
 pub const DEFAULT_SESSION_IDLE_SECS: u64 = 30 * 60;
-/// SSH cert defaults: 900 s interactive / 300 s automated. Consumed when `ssh/sign`
-/// is implemented (next sub-phase); fixed now so the contract value is committed.
-#[allow(dead_code)]
+/// SSH cert defaults (demon-confirmed): 900 s interactive / 300 s automated.
 pub const SSH_CERT_TTL_INTERACTIVE_SECS: u64 = 900;
+/// Automated/touch-per-op default; selected by the caller via `ttl_secs` for now.
 #[allow(dead_code)]
 pub const SSH_CERT_TTL_AUTOMATED_SECS: u64 = 300;
 
@@ -27,14 +33,19 @@ pub struct AppState {
     pub cfg: Arc<BrokerConfig>,
     pub leases: Arc<Mutex<LeaseEngine<BoxedGen>>>,
     pub audit: Arc<dyn AuditSink>,
-    /// Master-key seal state, reported by `GET /v1/sys/seal-status`. `true` until an
-    /// operator unseals; while sealed, mutating ops return `503` (`http::require_unsealed`).
+    /// Seal state, reported by `GET /v1/sys/seal-status`. `true` until an operator
+    /// unseals; while sealed, mutating ops return `503` (`http::require_unsealed`).
     pub sealed: Arc<AtomicBool>,
-    /// The unsealed master key (held in a zeroizing `SecretBox`). `None` while sealed.
-    /// The wrapping key the at-rest store (SSH CA key, lease ledger) will use — consumed
-    /// once those engines land (Phase 2/3).
+    /// The unsealed at-rest store (SQLCipher). `None` while sealed. Holds the SSH CA key
+    /// and (Phase 3) the lease ledger / dynamic-cred state.
     #[allow(dead_code)]
-    master_key: Option<Arc<SecretBox<DerivedKey>>>,
+    pub store: Option<Arc<Mutex<Vault>>>,
+    /// The SSH CA loaded for this instance's group. `None` while sealed.
+    pub ssh_ca: Option<Arc<SshCa>>,
+    /// Active operator session per authenticated principal (SAN → session id). Issued
+    /// leases (SSH certs, creds) become children of the caller's active session, so they
+    /// cascade-revoke when it ends. One active session per principal (a new open replaces).
+    sessions: Arc<Mutex<HashMap<String, String>>>,
 }
 
 /// CSPRNG-backed opaque id: 256 bits of OS randomness, hex. Used for session and lease
@@ -59,13 +70,21 @@ impl AppState {
         let sink = JsonlSink::new(cfg.audit_path.clone());
         let gen: BoxedGen = Box::new(random_id);
         let sealed = seal.is_none();
-        let master_key = seal.map(|u| Arc::new(u.master_key));
+        let (store, ssh_ca) = match seal {
+            Some(u) => (
+                Some(Arc::new(Mutex::new(u.store))),
+                Some(Arc::new(u.ssh_ca)),
+            ),
+            None => (None, None),
+        };
         Self {
             cfg: Arc::new(cfg),
             leases: Arc::new(Mutex::new(LeaseEngine::new(gen))),
             audit: Arc::new(sink),
             sealed: Arc::new(AtomicBool::new(sealed)),
-            master_key,
+            store,
+            ssh_ca,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -73,6 +92,32 @@ impl AppState {
     #[must_use]
     pub fn is_sealed(&self) -> bool {
         self.sealed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record `session_id` as the active session for `principal_san`.
+    pub fn bind_session(&self, principal_san: &str, session_id: &str) {
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .insert(principal_san.to_owned(), session_id.to_owned());
+    }
+
+    /// The active session for `principal_san`, if one is open.
+    #[must_use]
+    pub fn active_session(&self, principal_san: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .get(principal_san)
+            .cloned()
+    }
+
+    /// Drop any principal bindings pointing at `session_id` (called on session end).
+    pub fn unbind_session(&self, session_id: &str) {
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .retain(|_, v| v != session_id);
     }
 
     /// RFC3339 UTC timestamp for audit events.

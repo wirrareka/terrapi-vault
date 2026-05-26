@@ -8,11 +8,14 @@ use crate::dto::{
     Ack, CredsRequest, ErrorBody, LeaseRenewRequest, LeaseRenewResponse, LeaseRevokeRequest,
     SealStatus, SessionEndResponse, SessionOpenRequest, SessionOpenResponse, SshSignRequest,
 };
-use crate::state::{AppState, DEFAULT_SESSION_IDLE_SECS, DEFAULT_SESSION_TTL_SECS};
+use crate::state::{
+    AppState, DEFAULT_SESSION_IDLE_SECS, DEFAULT_SESSION_TTL_SECS, SSH_CERT_TTL_INTERACTIVE_SECS,
+};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use ssh_key::certificate::CertType;
 use vault_transport::audit::{Actor, ActorKind, AuditEvent, Outcome, Target};
 use vault_transport::ResidencyGroup;
 
@@ -136,18 +139,135 @@ async fn ssh_ca(
     Path(group): Path<String>,
 ) -> ApiResult<crate::dto::SshCaResponse> {
     check_group(&state, &group)?;
-    Err(not_implemented("ssh-ca"))
+    let Some(ca) = state.ssh_ca.clone() else {
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sealed",
+            "broker is sealed; the SSH CA is unavailable until it is unsealed",
+        ));
+    };
+    Ok(Json(crate::dto::SshCaResponse {
+        ca_public_key: ca.public_openssh(),
+    }))
 }
 
 async fn ssh_sign(
     State(state): State<AppState>,
-    _principal: Principal,
+    principal: Principal,
     Path(group): Path<String>,
-    Json(_req): Json<SshSignRequest>,
+    Json(req): Json<SshSignRequest>,
 ) -> ApiResult<crate::dto::SshSignResponse> {
     check_group(&state, &group)?;
     require_unsealed(&state)?;
-    Err(not_implemented("ssh-sign"))
+    let Some(ca) = state.ssh_ca.clone() else {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "sealed", "broker is sealed"));
+    };
+
+    // Host certs are group-scoped: they must not carry a tenant. User certs may.
+    let cert_type = match req.cert_type {
+        crate::dto::CertType::User => CertType::User,
+        crate::dto::CertType::Host => CertType::Host,
+    };
+    if matches!(req.cert_type, crate::dto::CertType::Host) && req.tenant_id.is_some() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "host_cert_tenant",
+            "cert_type=host is group-scoped and must have a null tenant_id",
+        ));
+    }
+    if let Some(t) = &req.tenant_id {
+        if !is_uuid_v4_lower(t) {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "bad_tenant_id",
+                "tenant_id must be a lowercase UUIDv4 (Vulture organization_id)",
+            ));
+        }
+    }
+
+    // Every issued cred is a child of the caller's active session.
+    let Some(session_id) = state.active_session(&principal.san) else {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "no_active_session",
+            "open a session (POST /v1/sys/session) before issuing certificates",
+        ));
+    };
+
+    let ttl = req.ttl_secs.unwrap_or(SSH_CERT_TTL_INTERACTIVE_SECS);
+    let now = now_unix();
+    let valid_before = now.saturating_add(ttl);
+
+    // Reserve the lease first (binds to the session / 409 if it ended), then sign; if
+    // signing fails, revoke the orphan so no dangling lease remains.
+    let lease_id = {
+        let mut eng = state.leases.lock().expect("lease lock");
+        eng.issue_lease(&session_id, ttl, ttl, false)
+    }
+    .map_err(|_| {
+        err(
+            StatusCode::CONFLICT,
+            "no_active_session",
+            "the operator session has ended",
+        )
+    })?;
+
+    let key_id = format!(
+        "{}|tenant={}",
+        principal.san,
+        req.tenant_id.as_deref().unwrap_or("-")
+    );
+    let signed = match ca.sign(&req.public_key, cert_type, &req.principals, &key_id, now, valid_before)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            let mut eng = state.leases.lock().expect("lease lock");
+            let _ = eng.revoke(&lease_id);
+            return Err(match e {
+                crate::ssh_ca::CaError::BadRequest(m) => err(StatusCode::BAD_REQUEST, "bad_request", &m),
+                other => err(StatusCode::INTERNAL_SERVER_ERROR, "sign_failed", &other.to_string()),
+            });
+        }
+    };
+
+    state.emit(&AuditEvent::vault(
+        AppState::now_ts(),
+        state.cfg.node.clone(),
+        Some(state.cfg.residency_group.as_str().to_owned()),
+        system_actor(&principal),
+        "ssh.sign",
+        Target {
+            kind: "ssh-cert".into(),
+            id: Some(format!("serial={}", signed.serial)),
+        },
+        Outcome::Success,
+        None,
+    ));
+
+    Ok(Json(crate::dto::SshSignResponse {
+        signed_certificate: signed.openssh,
+        serial: signed.serial,
+        valid_before: rfc3339(signed.valid_before),
+        lease_id,
+    }))
+}
+
+/// Current unix time in seconds (cert validity window).
+fn now_unix() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// RFC3339 UTC rendering of a unix-seconds timestamp (for `valid_before` in the response).
+fn rfc3339(unix_secs: u64) -> String {
+    use time::format_description::well_known::Rfc3339;
+    i64::try_from(unix_secs)
+        .ok()
+        .and_then(|s| time::OffsetDateTime::from_unix_timestamp(s).ok())
+        .and_then(|t| t.format(&Rfc3339).ok())
+        .unwrap_or_default()
 }
 
 async fn creds(
@@ -191,6 +311,7 @@ async fn session_open(
         let mut eng = state.leases.lock().expect("lease lock");
         eng.open_session(ttl, idle)
     };
+    state.bind_session(&principal.san, &id);
     state.emit(&AuditEvent::vault(
         AppState::now_ts(),
         state.cfg.node.clone(),
@@ -222,6 +343,7 @@ async fn session_end(
         eng.end_session(&id)
             .map_err(|e| err(StatusCode::NOT_FOUND, "no_such_session", &e.to_string()))?
     };
+    state.unbind_session(&id);
     state.emit(&AuditEvent::vault(
         AppState::now_ts(),
         state.cfg.node.clone(),

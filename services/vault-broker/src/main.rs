@@ -14,34 +14,50 @@ mod config;
 mod dto;
 mod http;
 mod seal;
+mod ssh_ca;
 mod state;
 mod tls;
 
 use config::BrokerConfig;
-use state::AppState;
-use terrapi_vault::KdfParams;
+use ssh_ca::SshCa;
+use state::{AppState, Unsealed};
+use terrapi_vault::{KdfParams, Vault};
 
-/// Attempt a boot-time unseal. Dev mode auto-unseals (ephemeral key); production requires
-/// `VAULT_UNSEAL_PASSPHRASE` and verifies it against the seal sidecar. A failed/absent
-/// unseal is non-fatal: the broker starts SEALED and mutating ops `503` until it is
-/// restarted with a valid passphrase.
-fn boot_unseal(cfg: &BrokerConfig) -> Option<seal::Unsealed> {
-    if cfg.allow_insecure_dev {
-        return Some(seal::unseal_dev());
-    }
-    match std::env::var("VAULT_UNSEAL_PASSPHRASE") {
-        Ok(p) if !p.is_empty() => match seal::unseal(&cfg.seal_path, &p, KdfParams::default()) {
-            Ok(u) => {
-                eprintln!("vault-broker: unsealed (seal meta {})", cfg.seal_path.display());
-                Some(u)
+/// Attempt a boot-time unseal: open the at-rest store and load the group's SSH CA. Dev
+/// mode auto-unseals (ephemeral store); production requires `VAULT_UNSEAL_PASSPHRASE`. A
+/// failed/absent unseal is non-fatal: the broker starts SEALED and mutating ops `503`
+/// until it is restarted with a valid passphrase.
+fn boot_unseal(cfg: &BrokerConfig) -> Option<Unsealed> {
+    let store = if cfg.allow_insecure_dev {
+        seal::unseal_dev()
+    } else {
+        match std::env::var("VAULT_UNSEAL_PASSPHRASE") {
+            Ok(p) if !p.is_empty() => seal::unseal(&cfg.store_path, &p, KdfParams::default()),
+            _ => {
+                eprintln!("vault-broker: no VAULT_UNSEAL_PASSPHRASE; starting SEALED");
+                return None;
             }
-            Err(e) => {
-                eprintln!("vault-broker: unseal FAILED ({e}); starting SEALED");
-                None
-            }
-        },
-        _ => {
-            eprintln!("vault-broker: no VAULT_UNSEAL_PASSPHRASE; starting SEALED");
+        }
+    };
+    let store = match store {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("vault-broker: unseal FAILED ({e}); starting SEALED");
+            return None;
+        }
+    };
+    load_ca(store, cfg.residency_group.as_str())
+}
+
+/// Load (or generate on first run) the SSH CA from the just-opened store.
+fn load_ca(store: Vault, group: &str) -> Option<Unsealed> {
+    match SshCa::load_or_generate(&store, group) {
+        Ok(ssh_ca) => {
+            eprintln!("vault-broker: unsealed; SSH CA ready for group {group}");
+            Some(Unsealed { store, ssh_ca })
+        }
+        Err(e) => {
+            eprintln!("vault-broker: SSH CA load FAILED ({e}); starting SEALED");
             None
         }
     }

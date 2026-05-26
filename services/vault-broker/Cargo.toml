@@ -28,6 +28,8 @@ x509-parser.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 tower.workspace = true
+ssh-key.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
