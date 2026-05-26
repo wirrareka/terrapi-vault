@@ -9,6 +9,7 @@
 //! are typed `501` stubs with their contract shapes fixed. See
 //! ../../docs/planning/01-vault-as-service.md §4 and ../../spec/broker-openapi.yaml.
 
+mod audit_ship;
 mod auth;
 mod config;
 mod creds;
@@ -93,7 +94,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind = cfg.bind;
     let allow_insecure_dev = cfg.allow_insecure_dev;
     let tls = cfg.tls.clone();
-    let state = AppState::new(cfg, seal);
+
+    // Durable-local audit + optional best-effort OpenSearch shipping.
+    let (audit, ship_task) = audit_ship::build(&cfg);
+    let state = AppState::new(cfg, seal, audit);
+    if let Some(task) = ship_task {
+        tokio::spawn(audit_ship::run(task));
+    }
 
     // Drive lease/session expiry on a timer so short-TTL creds auto-expire.
     tokio::spawn(sweeper::run(

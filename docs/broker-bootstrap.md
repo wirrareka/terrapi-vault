@@ -39,7 +39,11 @@ ZFS dataset encryption, and WG isolation.
 - `VAULT_TLS_CLIENT_CA` — fleet Root CA bundle (PEM); client certs are required + verified
   against it, and the peer DNS-SAN maps to a broker role. All three TLS vars are
   **mandatory in production** — the broker refuses to start without them.
-- `VAULT_AUDIT_PATH` — B3 audit JSONL sink path.
+- `VAULT_AUDIT_PATH` — durable local B3 audit JSONL sink path (source of truth).
+- `VAULT_AUDIT_OS_URL` / `VAULT_AUDIT_OS_USER` / `VAULT_AUDIT_OS_PASSWORD` — optional
+  best-effort shipping of B3 events to group-local OpenSearch (`audit-events-{group}-YYYY.MM`,
+  bulk-indexed by a background task; a ship failure never blocks issuance). Set
+  `VAULT_AUDIT_OS_URL` to enable. `VAULT_AUDIT_OS_INSECURE_TLS=1` for dev/self-signed.
 - `VAULT_OS_URL` / `VAULT_OS_ADMIN_USER` / `VAULT_OS_ADMIN_PASSWORD` — OpenSearch
   dynamic-cred engine: the cluster + the admin credential the broker uses to mint/delete
   ephemeral users. Set `VAULT_OS_URL` to enable the engine. `VAULT_OS_ROLE` (default

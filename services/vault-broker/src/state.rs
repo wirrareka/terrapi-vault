@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use terrapi_vault::Vault;
-use vault_transport::audit::{AuditEvent, AuditSink, JsonlSink};
+use vault_transport::audit::{AuditEvent, AuditSink};
 use vault_transport::lease::LeaseEngine;
 
 /// Default TTL for a leased service-admin cred when the request omits `ttl_secs`.
@@ -110,8 +110,7 @@ impl AppState {
     /// is `None` when the broker could not unseal (no/invalid passphrase) — it then runs
     /// sealed and mutating ops `503` until restarted with a valid passphrase.
     #[must_use]
-    pub fn new(cfg: BrokerConfig, seal: Option<Unsealed>) -> Self {
-        let sink = JsonlSink::new(cfg.audit_path.clone());
+    pub fn new(cfg: BrokerConfig, seal: Option<Unsealed>, audit: Arc<dyn AuditSink>) -> Self {
         let gen: BoxedGen = Box::new(random_id);
         let sealed = seal.is_none();
         let (store, ssh_ca) = match seal {
@@ -123,7 +122,7 @@ impl AppState {
         };
         Self {
             leases: Arc::new(Mutex::new(LeaseEngine::new(gen))),
-            audit: Arc::new(sink),
+            audit,
             sealed: Arc::new(AtomicBool::new(sealed)),
             store,
             ssh_ca,

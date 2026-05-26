@@ -330,5 +330,12 @@ of expired cred leases, emits B3 `session.expire` / `lease.expire` / `creds.revo
 enforces "short-TTL creds auto-expire" — previously leases only died on explicit revoke /
 session end.
 
-**Next:** legacy RethinkDB adapter (same trait) · ship B3 to group-local OpenSearch ·
-hash-chained durable audit store.
+**B3 shipping — DONE:** `audit_ship.rs` — a composite sink writes the durable local JSONL
+(source of truth) synchronously, then enqueues for a background task that **bulk-indexes**
+to group-local OpenSearch `audit-events-{group}-YYYY.MM` (`_bulk` NDJSON). Best-effort +
+non-blocking: `emit` only enqueues, a ship failure never blocks issuance (event stays in
+JSONL). Enabled by `VAULT_AUDIT_OS_*`. Integration-tested against a live cluster.
+
+**Next:** legacy RethinkDB adapter (same trait) · **hash-chained tamper-evident durable
+audit store** (the local JSONL → append-only hash chain) · replay of locally-durable
+events that failed to ship.

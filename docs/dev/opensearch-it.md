@@ -33,6 +33,22 @@ cargo test opensearch::tests::issue_creates_and_revoke_deletes_a_real_user -- --
 the role mapping without extra setup; in production the role is `audit-writer`
 (`opensearch-infra/audit/security/audit-writer.role.json`).
 
+### Audit shipping integration test
+
+The B3 audit shipper (`audit_ship.rs`) has its own integration test against the same
+cluster, gated on `VAULT_AUDIT_OS_TEST_URL`:
+
+```sh
+cd services
+VAULT_AUDIT_OS_TEST_URL='https://localhost:9200' \
+VAULT_AUDIT_OS_TEST_USER='admin' \
+VAULT_AUDIT_OS_TEST_PASSWORD='Vault-IT-Passw0rd!' \
+cargo test audit_ship::tests::ships_events_into_an_index -- --nocapture
+```
+
+It bulk-indexes two events into a throwaway index, refreshes, asserts the count, and
+deletes the index.
+
 ## Tear down
 
 ```sh

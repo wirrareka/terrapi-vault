@@ -100,8 +100,9 @@ pub trait AuditSink: Send + Sync {
     fn emit(&self, event: &AuditEvent);
 }
 
-/// Durable local sink: append one JSON line per event (the hash-chained store + the
-/// OpenSearch shipper come in Phase 2). Errors are swallowed (best-effort) by design.
+/// Durable local sink: append one JSON line per event. The source of truth; the broker's
+/// `audit_ship::ShippingSink` wraps this and best-effort ships to OpenSearch on top. (The
+/// hash-chained tamper-evident store is still to come.) Errors are swallowed (best-effort).
 pub struct JsonlSink {
     path: PathBuf,
 }
