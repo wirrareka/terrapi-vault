@@ -58,6 +58,15 @@ pub struct AppState {
     pub cred_handles: Arc<Mutex<HashMap<String, CredHandle>>>,
 }
 
+/// Current unix time in seconds — the clock the lease/session engine is driven by.
+#[must_use]
+pub fn now_unix() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// CSPRNG-backed opaque id: 256 bits of OS randomness, hex. Used for session and lease
 /// ids so they are unguessable. Reuses the lib's CSPRNG (`random_salt`) rather than
 /// pulling a second RNG into the service tree.

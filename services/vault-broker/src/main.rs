@@ -18,12 +18,17 @@ mod opensearch;
 mod seal;
 mod ssh_ca;
 mod state;
+mod sweeper;
 mod tls;
 
 use config::BrokerConfig;
 use ssh_ca::SshCa;
 use state::{AppState, Unsealed};
 use terrapi_vault::{KdfParams, Vault};
+
+/// How often the expiry sweeper runs. Sub-minute so short automated cert/cred TTLs
+/// (300 s) and idle timeouts are enforced promptly.
+const SWEEP_INTERVAL_SECS: u64 = 30;
 
 /// Attempt a boot-time unseal: open the at-rest store and load the group's SSH CA. Dev
 /// mode auto-unseals (ephemeral store); production requires `VAULT_UNSEAL_PASSPHRASE`. A
@@ -88,7 +93,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind = cfg.bind;
     let allow_insecure_dev = cfg.allow_insecure_dev;
     let tls = cfg.tls.clone();
-    let app = http::router(AppState::new(cfg, seal));
+    let state = AppState::new(cfg, seal);
+
+    // Drive lease/session expiry on a timer so short-TTL creds auto-expire.
+    tokio::spawn(sweeper::run(
+        state.clone(),
+        std::time::Duration::from_secs(SWEEP_INTERVAL_SECS),
+    ));
+
+    let app = http::router(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!("vault-broker listening on {bind}");
 

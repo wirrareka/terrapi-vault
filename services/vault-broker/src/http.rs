@@ -9,8 +9,8 @@ use crate::dto::{
     SealStatus, SessionEndResponse, SessionOpenRequest, SessionOpenResponse, SshSignRequest,
 };
 use crate::state::{
-    AppState, CREDS_DEFAULT_TTL_SECS, DEFAULT_SESSION_IDLE_SECS, DEFAULT_SESSION_TTL_SECS,
-    SSH_CERT_TTL_INTERACTIVE_SECS,
+    now_unix, AppState, CREDS_DEFAULT_TTL_SECS, DEFAULT_SESSION_IDLE_SECS,
+    DEFAULT_SESSION_TTL_SECS, SSH_CERT_TTL_INTERACTIVE_SECS,
 };
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -195,7 +195,7 @@ async fn ssh_sign(
     // signing fails, revoke the orphan so no dangling lease remains.
     let lease_id = {
         let mut eng = state.leases.lock().expect("lease lock");
-        eng.issue_lease(&session_id, ttl, ttl, false)
+        eng.issue_lease(now, &session_id, ttl, ttl, false)
     }
     .map_err(|_| {
         err(
@@ -243,14 +243,6 @@ async fn ssh_sign(
         valid_before: rfc3339(signed.valid_before),
         lease_id,
     }))
-}
-
-/// Current unix time in seconds (cert validity window).
-fn now_unix() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }
 
 /// RFC3339 UTC rendering of a unix-seconds timestamp (for `valid_before` in the response).
@@ -311,7 +303,7 @@ async fn creds(
 
     let issued_lease = {
         let mut eng = state.leases.lock().expect("lease lock");
-        eng.issue_lease(&session_id, ttl, issued.max_ttl_secs, true)
+        eng.issue_lease(now_unix(), &session_id, ttl, issued.max_ttl_secs, true)
     };
     let Ok(lease_id) = issued_lease else {
         // session ended between the active-session check and issue → undo the user
@@ -400,7 +392,7 @@ async fn session_open(
     let idle = req.idle_timeout_secs.unwrap_or(DEFAULT_SESSION_IDLE_SECS);
     let id = {
         let mut eng = state.leases.lock().expect("lease lock");
-        eng.open_session(ttl, idle)
+        eng.open_session(now_unix(), ttl, idle)
     };
     state.bind_session(&principal.san, &id);
     state.emit(&AuditEvent::vault(
@@ -465,7 +457,7 @@ async fn lease_renew(
     require_unsealed(&state)?;
     let ttl = {
         let mut eng = state.leases.lock().expect("lease lock");
-        eng.renew(&req.lease_id, req.increment_secs)
+        eng.renew(now_unix(), &req.lease_id, req.increment_secs)
             .map_err(|e| err(StatusCode::CONFLICT, "renew_failed", &e.to_string()))?
     };
     Ok(Json(LeaseRenewResponse {

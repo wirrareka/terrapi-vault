@@ -322,6 +322,13 @@ deletes it on revoke/expiry. Registered when `VAULT_OS_*` is configured. Integra
 against a live single-node OpenSearch (full create→exists→delete cycle; `docs/dev/opensearch-it.md`).
 The `CredEngine` trait is now async (`async_trait`) and `teardown` awaits deletes lock-free.
 
+**Expiry sweeper — DONE:** the lease engine is now time-aware (absolute deadlines, caller
+injects `now`; idle deadline advanced by activity). `LeaseEngine::sweep(now)` expires
+sessions (hard TTL or idle timeout, cascading children) and individual leases (own TTL).
+`sweeper.rs` runs it on a 30 s timer: unbinds expired sessions, deletes the backend users
+of expired cred leases, emits B3 `session.expire` / `lease.expire` / `creds.revoke`. This
+enforces "short-TTL creds auto-expire" — previously leases only died on explicit revoke /
+session end.
+
 **Next:** legacy RethinkDB adapter (same trait) · ship B3 to group-local OpenSearch ·
-hash-chained durable audit store · **lease/session TTL+idle expiry sweeper** (today leases
-only revoke on explicit end / session cascade, not on TTL timeout).
+hash-chained durable audit store.
