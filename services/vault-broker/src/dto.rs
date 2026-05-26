@@ -25,7 +25,10 @@ pub struct SshSignRequest {
     pub public_key: String,
     pub cert_type: CertType,
     pub principals: Vec<String>,
-    pub ttl_secs: u64,
+    /// `None` → server default for the request context (900 interactive / 300 automated);
+    /// always clamped to the remaining session. Matches the nullable field in the spec.
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
     #[serde(default)]
     pub extensions: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
@@ -108,4 +111,14 @@ pub struct LeaseRevokeRequest {
 #[derive(Debug, Serialize)]
 pub struct Ack {
     pub ok: bool,
+}
+
+// --- System: seal state ---------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct SealStatus {
+    /// `true` until an operator unseals the master key. Mutating ops MAY 503 while sealed.
+    /// (The real unseal path lands with broker bootstrap; this build reports its state.)
+    pub sealed: bool,
+    pub version: Option<String>,
 }

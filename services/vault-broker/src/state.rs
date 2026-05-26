@@ -1,6 +1,7 @@
 //! Shared broker state: config, the lease/session engine, and the audit sink.
 
 use crate::config::BrokerConfig;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use vault_transport::audit::{AuditEvent, AuditSink, JsonlSink};
 use vault_transport::lease::LeaseEngine;
@@ -23,6 +24,10 @@ pub struct AppState {
     pub cfg: Arc<BrokerConfig>,
     pub leases: Arc<Mutex<LeaseEngine<BoxedGen>>>,
     pub audit: Arc<dyn AuditSink>,
+    /// Master-key seal state, reported by `GET /v1/sys/seal-status`. This build has no
+    /// master-key gating yet (manual unseal lands with broker bootstrap, Phase 1b), so it
+    /// boots unsealed; the flag is wired now so the contract endpoint reports truthfully.
+    pub sealed: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -44,7 +49,14 @@ impl AppState {
             cfg: Arc::new(cfg),
             leases: Arc::new(Mutex::new(LeaseEngine::new(gen))),
             audit: Arc::new(sink),
+            sealed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Current seal state (`GET /v1/sys/seal-status`).
+    #[must_use]
+    pub fn is_sealed(&self) -> bool {
+        self.sealed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// RFC3339 UTC timestamp for audit events.

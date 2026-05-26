@@ -6,7 +6,7 @@
 use crate::auth::Principal;
 use crate::dto::{
     Ack, CredsRequest, ErrorBody, LeaseRenewRequest, LeaseRenewResponse, LeaseRevokeRequest,
-    SessionEndResponse, SessionOpenRequest, SessionOpenResponse, SshSignRequest,
+    SealStatus, SessionEndResponse, SessionOpenRequest, SessionOpenResponse, SshSignRequest,
 };
 use crate::state::{AppState, DEFAULT_SESSION_IDLE_SECS, DEFAULT_SESSION_TTL_SECS};
 use axum::extract::{Path, State};
@@ -84,6 +84,7 @@ fn is_uuid_v4_lower(s: &str) -> bool {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/v1/sys/seal-status", get(seal_status))
         .route("/v1/{group}/ssh/ca", get(ssh_ca))
         .route("/v1/{group}/ssh/sign", post(ssh_sign))
         .route("/v1/{group}/{tenant_id}/creds/{role}", post(creds))
@@ -96,6 +97,15 @@ pub fn router(state: AppState) -> Router {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// Readiness probe (unauthenticated): is the master key unsealed yet? Demon polls this
+/// before issuing; mutating ops MAY 503 while sealed.
+async fn seal_status(State(state): State<AppState>) -> Json<SealStatus> {
+    Json(SealStatus {
+        sealed: state.is_sealed(),
+        version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+    })
 }
 
 fn not_implemented(what: &str) -> (StatusCode, Json<ErrorBody>) {
