@@ -3,7 +3,7 @@
 //! the OpenSearch engine). Issuance is session-bound + sealed-gated; every state-changing
 //! op emits a B3 audit event (`source:"vault"`).
 
-use crate::auth::Principal;
+use crate::auth::{Capability, Principal};
 use crate::dto::{
     Ack, CredsRequest, ErrorBody, LeaseRenewRequest, LeaseRenewResponse, LeaseRevokeRequest,
     SealStatus, SessionEndResponse, SessionOpenRequest, SessionOpenResponse, SshSignRequest,
@@ -112,6 +112,22 @@ async fn seal_status(State(state): State<AppState>) -> Json<SealStatus> {
     })
 }
 
+/// Least-privilege gate: the principal's role must hold `cap`, else `403`.
+fn require_cap(
+    principal: &Principal,
+    cap: Capability,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    if principal.allows(cap) {
+        Ok(())
+    } else {
+        Err(err(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "this principal's role is not granted this operation",
+        ))
+    }
+}
+
 /// Gate every mutating op on the broker being unsealed. A sealed broker has no master
 /// key and is not operational → `503` (the consumer polls `/v1/sys/seal-status`).
 fn require_unsealed(state: &AppState) -> Result<(), (StatusCode, Json<ErrorBody>)> {
@@ -128,9 +144,10 @@ fn require_unsealed(state: &AppState) -> Result<(), (StatusCode, Json<ErrorBody>
 
 async fn ssh_ca(
     State(state): State<AppState>,
-    _principal: Principal,
+    principal: Principal,
     Path(group): Path<String>,
 ) -> ApiResult<crate::dto::SshCaResponse> {
+    require_cap(&principal, Capability::SshCa)?;
     check_group(&state, &group)?;
     let Some(ca) = state.ssh_ca.clone() else {
         return Err(err(
@@ -150,6 +167,7 @@ async fn ssh_sign(
     Path(group): Path<String>,
     Json(req): Json<SshSignRequest>,
 ) -> ApiResult<crate::dto::SshSignResponse> {
+    require_cap(&principal, Capability::SshSign)?;
     check_group(&state, &group)?;
     require_unsealed(&state)?;
     let Some(ca) = state.ssh_ca.clone() else {
@@ -261,6 +279,7 @@ async fn creds(
     Path((group, tenant_id, role)): Path<(String, String, String)>,
     Json(req): Json<CredsRequest>,
 ) -> ApiResult<crate::dto::CredsResponse> {
+    require_cap(&principal, Capability::Creds)?;
     check_group(&state, &group)?;
     require_unsealed(&state)?;
     if !is_uuid_v4_lower(&tenant_id) {
@@ -387,6 +406,7 @@ async fn session_open(
     principal: Principal,
     Json(req): Json<SessionOpenRequest>,
 ) -> ApiResult<SessionOpenResponse> {
+    require_cap(&principal, Capability::Session)?;
     require_unsealed(&state)?;
     let ttl = req.ttl_secs.unwrap_or(DEFAULT_SESSION_TTL_SECS);
     let idle = req.idle_timeout_secs.unwrap_or(DEFAULT_SESSION_IDLE_SECS);
@@ -420,6 +440,7 @@ async fn session_end(
     principal: Principal,
     Path(id): Path<String>,
 ) -> ApiResult<SessionEndResponse> {
+    require_cap(&principal, Capability::Session)?;
     require_unsealed(&state)?;
     let revoked = {
         let mut eng = state.leases.lock().expect("lease lock");
@@ -451,9 +472,10 @@ async fn session_end(
 
 async fn lease_renew(
     State(state): State<AppState>,
-    _principal: Principal,
+    principal: Principal,
     Json(req): Json<LeaseRenewRequest>,
 ) -> ApiResult<LeaseRenewResponse> {
+    require_cap(&principal, Capability::Leases)?;
     require_unsealed(&state)?;
     let ttl = {
         let mut eng = state.leases.lock().expect("lease lock");
@@ -471,6 +493,7 @@ async fn lease_revoke(
     principal: Principal,
     Json(req): Json<LeaseRevokeRequest>,
 ) -> ApiResult<Ack> {
+    require_cap(&principal, Capability::Leases)?;
     require_unsealed(&state)?;
     let lease_id = req.lease_id;
     {

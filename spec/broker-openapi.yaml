@@ -17,8 +17,10 @@ info:
     another group's path returns `404` (residency air-gap — there is no cross-group route).
 
     **Auth.** mutual TLS over WireGuard, client cert signed by the fleet Root CA; the
-    cert SAN maps to a registered service role (no bearer tokens / AppRole). The listener
-    is reachable only on the WG mesh.
+    cert's first SAN `dNSName` maps to a registered service role (no bearer tokens /
+    AppRole). The listener is reachable only on the WG mesh. Each role is granted a set of
+    **capabilities** (ssh-ca, ssh-sign, creds, session, leases); calling an op the role
+    isn't granted returns `403` (least privilege).
 
     **Namespace.** Leased service-admin creds live under `<group>/<tenant_id>/<role>`,
     where `tenant_id` is the Vulture `organization_id` (lowercase UUIDv4). Host/operator
@@ -286,6 +288,7 @@ paths:
       responses:
         "200": { description: CA public key, content: { application/json: { schema: { $ref: "#/components/schemas/SshCaResponse" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/GroupMismatch" }
         "503": { $ref: "#/components/responses/Sealed" }
 
@@ -350,6 +353,7 @@ paths:
       responses:
         "200": { description: session opened, content: { application/json: { schema: { $ref: "#/components/schemas/SessionOpenResponse" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "503": { $ref: "#/components/responses/Sealed" }
 
   /v1/sys/session/{id}:
@@ -363,6 +367,7 @@ paths:
       responses:
         "200": { description: ended + revoked list, content: { application/json: { schema: { $ref: "#/components/schemas/SessionEndResponse" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404": { description: no such session, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "503": { $ref: "#/components/responses/Sealed" }
 
@@ -377,6 +382,7 @@ paths:
       responses:
         "200": { description: new ttl, content: { application/json: { schema: { $ref: "#/components/schemas/LeaseRenewResponse" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "409": { $ref: "#/components/responses/Conflict" }
         "503": { $ref: "#/components/responses/Sealed" }
 
@@ -391,5 +397,6 @@ paths:
       responses:
         "200": { description: revoked, content: { application/json: { schema: { $ref: "#/components/schemas/Ack" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "409": { $ref: "#/components/responses/Conflict" }
         "503": { $ref: "#/components/responses/Sealed" }

@@ -39,6 +39,11 @@ ZFS dataset encryption, and WG isolation.
 - `VAULT_TLS_CLIENT_CA` — fleet Root CA bundle (PEM); client certs are required + verified
   against it, and the peer DNS-SAN maps to a broker role. All three TLS vars are
   **mandatory in production** — the broker refuses to start without them.
+- `VAULT_ROLES_CONFIG` — JSON file mapping each cert's first SAN `dNSName` → `{role, caps}`
+  (capabilities: `ssh-ca`, `ssh-sign`, `creds`, `session`, `leases`). Drives both the
+  SAN→role match and per-role least-privilege authorization. **Required in production** —
+  unset/empty means every verified cert is trusted-but-unauthorised (`403`). Sample:
+  `docs/dev/roles.example.json`.
 - `VAULT_AUDIT_PATH` — durable local B3 audit store (source of truth): a **tamper-evident
   hash-chained** append-only JSONL (each record SHA-256-chained to the previous; edits,
   reorders, and deletions are detectable).

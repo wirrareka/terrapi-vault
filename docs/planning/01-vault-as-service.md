@@ -349,6 +349,14 @@ advances the cursor only on a confirmed ship. So a ship failure / crash / shutdo
 nothing — the next tick or process start **replays** the backlog; shutdown does a best-effort
 final flush. Shipping never blocks issuance (reads the durable file out of band).
 
+**Role authz — DONE:** SAN→role mapping is config-driven (`VAULT_ROLES_CONFIG` JSON →
+`{role, caps}`) and **per-role least-privilege is enforced**: the matcher reads the cert's
+first SAN dNSName; the `Principal` carries its `Capability` set (`ssh-ca|ssh-sign|creds|
+session|leases`); each handler calls `require_cap` → `403` if not granted. Prod requires the
+config (empty = deny-all `403`); dev keeps the header path + all-caps `dev` principal.
+Sample `docs/dev/roles.example.json` (demon-operator, demon-system, aether-backup).
+
 **Next:** the core broker engines are complete (SSH-CA, OpenSearch creds, expiry, audit
-chain + shipping). Future, when needed: additional `CredEngine` adapters for any *modern*
-datastore that requires brokered creds (RethinkDB is out — legacy, no auth).
+chain + shipping, mTLS + role authz). Future, when prioritized: the **KMS wrap/unwrap**
+engine for aether fleet-backup keys (design ack'd, not built); additional `CredEngine`
+adapters for any *modern* datastore that needs brokered creds (RethinkDB is out).

@@ -1,6 +1,8 @@
 //! Broker configuration. Per residency group; the group is a per-instance constant
 //! (structurally a broker cannot serve another group).
 
+use crate::auth::RolePrincipal;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -15,9 +17,10 @@ pub struct BrokerConfig {
     /// At-rest encrypted store (SQLCipher DB) holding the SSH CA key (and, later, the
     /// lease ledger). Created on first unseal; opened with the operator passphrase. See `seal`.
     pub store_path: PathBuf,
-    /// mTLS client-cert SAN → role. In production the rustls layer supplies the SAN;
-    /// this maps it to a broker role. Empty in dev (any SAN accepted as role "dev").
-    pub san_roles: HashMap<String, String>,
+    /// Registered principals: cert SAN (dNSName) → {role, capabilities}. Loaded from the
+    /// JSON roles config (`VAULT_ROLES_CONFIG`). Empty when unset → in production every
+    /// cert is trusted-but-unauthorised (`403`); in dev an unmapped SAN is `dev` (all caps).
+    pub roles: HashMap<String, RolePrincipal>,
     /// When false (production), the listener MUST be mTLS-over-WireGuard; HTTP refused.
     /// True only for local skeleton runs.
     pub allow_insecure_dev: bool,
@@ -74,15 +77,44 @@ impl BrokerConfig {
             }),
             _ => None,
         };
+        let roles = load_roles();
         Self {
             bind,
             residency_group: group,
             node,
             audit_path,
             store_path,
-            san_roles: HashMap::new(),
+            roles,
             allow_insecure_dev,
             tls,
+        }
+    }
+}
+
+/// Roles config file shape (`VAULT_ROLES_CONFIG`, JSON):
+/// `{ "roles": { "<san-dnsname>": { "role": "<name>", "caps": ["ssh-sign", ...] } } }`.
+#[derive(Deserialize)]
+struct RolesFile {
+    roles: HashMap<String, RolePrincipal>,
+}
+
+/// Load SAN→{role,caps} from `VAULT_ROLES_CONFIG`. Fail-closed: a missing var or an
+/// unreadable/invalid file yields an empty map (every prod cert then `403`s) and logs why.
+fn load_roles() -> HashMap<String, RolePrincipal> {
+    let Ok(path) = std::env::var("VAULT_ROLES_CONFIG") else {
+        return HashMap::new();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => match serde_json::from_str::<RolesFile>(&raw) {
+            Ok(f) => f.roles,
+            Err(e) => {
+                eprintln!("vault-broker: VAULT_ROLES_CONFIG parse error ({e}); roles empty (deny-all)");
+                HashMap::new()
+            }
+        },
+        Err(e) => {
+            eprintln!("vault-broker: VAULT_ROLES_CONFIG read error ({e}); roles empty (deny-all)");
+            HashMap::new()
         }
     }
 }
