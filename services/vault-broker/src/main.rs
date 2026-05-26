@@ -1,13 +1,14 @@
 //! vault-broker — proximi.io network secrets broker (Path A).
 //!
 //! Wired now: rustls mTLS-over-WG termination (`tls`) — client-cert required + verified
-//! vs the fleet Root CA, peer SAN → role; a boot-time master-key unseal (`seal`) that
-//! seals mutating ops behind `503` until an operator unseals; the full v1 route surface;
-//! a real session/lease engine with cascade-revoke and CSPRNG ids; and a B3 audit emitter
-//! (`source:"vault"`). Dev (`VAULT_ALLOW_INSECURE_DEV=1`) serves plain HTTP with
-//! header-based identity. SSH-CA signing + dynamic creds (OpenSearch RBAC / RethinkDB)
-//! are typed `501` stubs with their contract shapes fixed. See
-//! ../../docs/planning/01-vault-as-service.md §4 and ../../spec/broker-openapi.yaml.
+//! vs the fleet Root CA, peer SAN → role; a boot-time master-key unseal (`seal`, the
+//! at-rest store) that seals mutating ops behind `503`; the full v1 route surface; a
+//! session/lease engine with cascade-revoke, CSPRNG ids and a TTL/idle expiry `sweeper`;
+//! the SSH-CA (`ssh_ca`) and the OpenSearch dynamic-cred engine (`creds`/`opensearch`);
+//! and a tamper-evident hash-chained B3 audit store (`source:"vault"`) with best-effort
+//! OpenSearch shipping (`audit_ship`). Dev (`VAULT_ALLOW_INSECURE_DEV=1`) serves plain
+//! HTTP with header-based identity. See ../../docs/planning/01-vault-as-service.md §4 and
+//! ../../spec/broker-openapi.yaml.
 
 mod audit_ship;
 mod auth;

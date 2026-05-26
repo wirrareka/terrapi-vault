@@ -7,11 +7,11 @@
 //! its lease.
 //!
 //! v1 roles (demon-confirmed, then infra/owner-corrected):
-//! - `audit-writer` — OpenSearch RBAC, write-only on `audit-events-*` (the modern,
-//!   primary engine). The concrete adapter calls the OpenSearch security REST API; it is
-//!   wired from config and is not exercised in environments without a live OpenSearch.
-//! - `rethinkdb-admin` — **legacy only** (RethinkDB backs legacy services, not the modern
-//!   stack). Kept for those services; not a modern datastore engine.
+//! - `audit-writer` — OpenSearch RBAC, write-only on `audit-events-*`. The only brokered
+//!   cred engine today; the concrete adapter calls the OpenSearch security REST API.
+//!
+//! (No RethinkDB engine: the legacy RethinkDB the stack runs uses no auth, so it is never
+//! brokered — owner, 2026-05-26.)
 //!
 //! This module owns the engine abstraction, a registry, the teardown wiring, and an
 //! in-memory `MockEngine` used for local dev and tests. Concrete network adapters
@@ -23,7 +23,7 @@ use std::sync::Mutex;
 #[derive(Debug, thiserror::Error)]
 pub enum CredError {
     /// The target backend rejected the operation. Constructed by concrete network
-    /// adapters (OpenSearch/RethinkDB); the in-memory `MockEngine` never fails.
+    /// adapters (OpenSearch); the in-memory `MockEngine` never fails.
     #[allow(dead_code)]
     #[error("backend error: {0}")]
     Backend(String),

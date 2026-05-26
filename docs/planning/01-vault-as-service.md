@@ -51,23 +51,23 @@ primitives where they overlap. They do **not** share a data model or a listener.
 ### 2.1 Guiding principle — platform features must not constrain memento/probe
 
 terrapi-vault may grow **whatever the proximi.io platform wants** (broker, dynamic
-OpenSearch/RethinkDB creds, residency, B3 audit, mTLS-over-WG). **But that growth lives
-OUTSIDE the core lib crate and never reaches memento/probe.** OpenSearch, RethinkDB,
+OpenSearch creds, residency, B3 audit, mTLS-over-WG). **But that growth lives
+OUTSIDE the core lib crate and never reaches memento/probe.** OpenSearch,
 tenants, residency, WireGuard, the fleet Root CA are **platform (Svet A) concerns
 only** — they have nothing to do with memento (notes) or probe (API client), which
 merely embed the at-rest library to encrypt a local SQLCipher file (Svet B).
 
 **Dependency firewall (hard rule, CI-enforced):**
 - The **root `terrapi-vault` lib crate stays neutral**: only `rusqlite + argon2 +
-  secrecy + zeroize + serde` as today. **No tokio/axum/reqwest, no OpenSearch/RethinkDB
+  secrecy + zeroize + serde` as today. **No tokio/axum/reqwest, no OpenSearch
   client, no residency/tenant/WG logic** ever enters it. memento/probe must keep
   building unchanged with zero new transitive deps.
 - All platform machinery (broker, `vault-transport`, dynamic-cred engines, B3 emitter,
   residency guard) lives in **separate workspace members** that memento/probe do **not**
   depend on. If anything platform-flavoured ever needs to touch the lib, it goes behind
   an **off-by-default cargo feature** the apps never enable.
-- `vault-sync` (Svet B) carries **none** of Svet A: no OpenSearch, no RethinkDB, no
-  tenants, no residency air-gap, no B3-to-OpenSearch — only E2E oplog + device auth.
+- `vault-sync` (Svet B) carries **none** of Svet A: no OpenSearch, no tenants, no
+  residency air-gap, no B3-to-OpenSearch — only E2E oplog + device auth.
 - CI gate: `cargo build` + `cargo tree` in memento/probe show no new platform deps.
 
 ## 3. Workspace restructure (non-breaking) — REVISED
@@ -132,12 +132,12 @@ API is versioned `/v1/...`. JSON. All mutating ops emit a B3 audit event (§4.5)
   - Host-cert CA = group scope; user-cert principals = tenant-scoped where applicable.
   - Future: `sk-ssh-ed25519` / PIV-backed CA (extension point, not v1).
 
-**(b) Leased service-admin creds (OpenSearch RBAC / RethinkDB user)**
+**(b) Leased service-admin creds (OpenSearch RBAC)**
 - `POST /v1/{group}/{tenant_id}/creds/{role}`
   - `{role}` maps to a backend engine + privilege template, defined in broker config.
-    **First engines (demon-confirmed 2026-05-26): OpenSearch RBAC + RethinkDB admin.**
-    The stack's primary datastore is **RethinkDB, not Postgres** (proximiio-sync) —
-    model the dynamic-user engine for RethinkDB first; Postgres only if introduced later.
+    **Engine: OpenSearch RBAC (`audit-writer`, write-only).** This is the only brokered
+    cred engine — the legacy RethinkDB the stack still runs does **not** use auth, so it is
+    never brokered; if a modern datastore later needs brokered creds we add an engine then.
   - resp: `{ "username", "password", "lease_id", "ttl", "renewable", "max_ttl" }`
   - Broker creates an **ephemeral backend user** with TTL; on lease end/revoke it
     **deletes** that user (Vault database-secrets-engine semantics).
@@ -145,10 +145,10 @@ API is versioned `/v1/...`. JSON. All mutating ops emit a B3 audit event (§4.5)
 > **Demon-confirmed parameters (2026-05-26), lock into v1 OpenAPI:**
 > - Host-cert SSH CA = **group scope** (not per-tenant); tenant scoping only for leased
 >   service-admin creds under `<group>/<tenant_id>/<role>`.
-> - First roles (infra-corrected 2026-05-26): `audit-writer` (OpenSearch RBAC, write-only
->   on `audit-events-*`; demon writes its own `source:"control-plane"` events — distinct
->   from vault's `source:"vault"`) + `rethinkdb-admin`. No `os-metrics-reader`: metrics
->   are Prometheus/PromQL, not OpenSearch.
+> - Roles: `audit-writer` (OpenSearch RBAC, write-only on `audit-events-*`; demon writes
+>   its own `source:"control-plane"` events — distinct from vault's `source:"vault"`). No
+>   `os-metrics-reader` (metrics are Prometheus/PromQL, not OpenSearch); no RethinkDB engine
+>   (legacy RethinkDB uses no auth — owner, 2026-05-26).
 > - **TTLs:** SSH cert 900 s interactive / 300 s automated + touch-per-op (fresh cert per
 >   destructive/secret/CA op). Operator session: **8 h hard cap, 30 min idle**. Every
 >   cert/lease is a child of the session lease → cascade-revoke = revoke-on-session-end.
@@ -311,9 +311,8 @@ so a revoke / session-cascade deletes the backend user (`creds.revoke` B3). `POS
 /v1/{group}/{tenant_id}/creds/{role}` is unstubbed: validates tenant UUIDv4, requires an
 active session (`409`), issues a session-bound lease, emits `creds.issue`. An in-memory
 `MockEngine` (registered in dev) makes the path testable; **OpenSearch RBAC `audit-writer`**
-is the modern engine to wire next. **RethinkDB is legacy-only** (owner-corrected
-2026-05-26 — it backs legacy services, not the modern stack), so a `rethinkdb-admin`
-engine is legacy-scoped, not a modern datastore.
+is the one real engine. **No RethinkDB engine** — the legacy RethinkDB the stack runs uses
+no auth, so it is never brokered (owner, 2026-05-26).
 
 **OpenSearch engine — DONE:** `opensearch.rs` — the modern `audit-writer` adapter behind
 `CredEngine` (async): mints an ephemeral OpenSearch internal user via the security REST
@@ -350,5 +349,6 @@ advances the cursor only on a confirmed ship. So a ship failure / crash / shutdo
 nothing — the next tick or process start **replays** the backlog; shutdown does a best-effort
 final flush. Shipping never blocks issuance (reads the durable file out of band).
 
-**Next:** legacy RethinkDB cred adapter (same `CredEngine` trait; needs a live legacy
-instance to integration-test — low priority since RethinkDB is legacy-only).
+**Next:** the core broker engines are complete (SSH-CA, OpenSearch creds, expiry, audit
+chain + shipping). Future, when needed: additional `CredEngine` adapters for any *modern*
+datastore that requires brokered creds (RethinkDB is out — legacy, no auth).

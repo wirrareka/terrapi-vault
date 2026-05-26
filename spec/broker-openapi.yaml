@@ -105,13 +105,13 @@ components:
 
         - `audit-writer` — OpenSearch RBAC, **write-only** on `audit-events-*`; the leased
           ephemeral user is granted `opendistro_security_roles: ["audit-writer"]`
-          (`opensearch-infra/audit/security/audit-writer.role.json`). This is the modern,
-          primary engine.
-        - `rethinkdb-admin` — **legacy only.** RethinkDB backs legacy services, not the
-          modern stack; kept for those services, not a modern datastore engine.
+          (`opensearch-infra/audit/security/audit-writer.role.json`). This is the only
+          brokered cred engine today.
 
         No metrics-reader role: metrics live in Prometheus (PromQL, WG-only), not
-        OpenSearch, so demon queries Prometheus directly with no brokered cred.
+        OpenSearch, so demon queries Prometheus directly with no brokered cred. No
+        RethinkDB engine: the legacy RethinkDB the stack runs uses no auth, so it is never
+        brokered.
 
         Issuance creates an ephemeral backend user scoped to the role and deletes it on
         revoke/expiry. A role with no engine configured in this instance → `404`.
@@ -316,7 +316,7 @@ paths:
     post:
       tags: [creds]
       operationId: issueCreds
-      summary: Issue leased, ephemeral service-admin creds (OpenSearch RBAC; legacy RethinkDB).
+      summary: Issue leased, ephemeral service-admin creds (OpenSearch RBAC).
       description: |
         Creates an ephemeral backend user scoped to `role` and deletes it on revoke/expiry
         (Vault db-engine semantics). The cred is a lease bound to the caller's **active
