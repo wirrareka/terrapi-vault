@@ -9,7 +9,8 @@ use crate::dto::{
     SealStatus, SessionEndResponse, SessionOpenRequest, SessionOpenResponse, SshSignRequest,
 };
 use crate::state::{
-    AppState, DEFAULT_SESSION_IDLE_SECS, DEFAULT_SESSION_TTL_SECS, SSH_CERT_TTL_INTERACTIVE_SECS,
+    AppState, CREDS_DEFAULT_TTL_SECS, DEFAULT_SESSION_IDLE_SECS, DEFAULT_SESSION_TTL_SECS,
+    SSH_CERT_TTL_INTERACTIVE_SECS,
 };
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -109,14 +110,6 @@ async fn seal_status(State(state): State<AppState>) -> Json<SealStatus> {
         sealed: state.is_sealed(),
         version: Some(env!("CARGO_PKG_VERSION").to_owned()),
     })
-}
-
-fn not_implemented(what: &str) -> (StatusCode, Json<ErrorBody>) {
-    err(
-        StatusCode::NOT_IMPLEMENTED,
-        "not_implemented",
-        &format!("{what} backend lands in the next sub-phase; the contract shape is fixed"),
-    )
 }
 
 /// Gate every mutating op on the broker being unsealed. A sealed broker has no master
@@ -272,9 +265,9 @@ fn rfc3339(unix_secs: u64) -> String {
 
 async fn creds(
     State(state): State<AppState>,
-    _principal: Principal,
-    Path((group, tenant_id, _role)): Path<(String, String, String)>,
-    Json(_req): Json<CredsRequest>,
+    principal: Principal,
+    Path((group, tenant_id, role)): Path<(String, String, String)>,
+    Json(req): Json<CredsRequest>,
 ) -> ApiResult<crate::dto::CredsResponse> {
     check_group(&state, &group)?;
     require_unsealed(&state)?;
@@ -285,9 +278,84 @@ async fn creds(
             "tenant_id must be a lowercase UUIDv4 (Vulture organization_id)",
         ));
     }
-    Err(not_implemented(
-        "dynamic-creds (OpenSearch RBAC / RethinkDB)",
-    ))
+    // Unknown role (or no engine wired for it in this instance) → 404, structurally
+    // indistinguishable from an unprovisioned path (no oracle on which roles exist).
+    if state.engines.get(&role).is_none() {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "unknown_role",
+            "no credential engine for this role in this instance",
+        ));
+    }
+
+    // Every issued cred is a child of the caller's active session.
+    let Some(session_id) = state.active_session(&principal.san) else {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "no_active_session",
+            "open a session (POST /v1/sys/session) before issuing credentials",
+        ));
+    };
+
+    let ttl = req.ttl_secs.unwrap_or(CREDS_DEFAULT_TTL_SECS);
+
+    // Create the ephemeral backend user first; if the lease can't be bound afterwards we
+    // tear it back down so no user outlives a missing lease.
+    let issued = state
+        .engines
+        .get(&role)
+        .expect("engine present (checked above)")
+        .issue(&tenant_id, ttl)
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, "backend_error", &e.to_string()))?;
+
+    let issued_lease = {
+        let mut eng = state.leases.lock().expect("lease lock");
+        eng.issue_lease(&session_id, ttl, issued.max_ttl_secs, true)
+    };
+    let Ok(lease_id) = issued_lease else {
+        // session ended between the active-session check and issue → undo the user
+        let _ = state
+            .engines
+            .get(&role)
+            .expect("engine present")
+            .revoke(&issued.username);
+        return Err(err(
+            StatusCode::CONFLICT,
+            "no_active_session",
+            "the operator session has ended",
+        ));
+    };
+
+    state.cred_handles.lock().expect("cred handles lock").insert(
+        lease_id.clone(),
+        crate::creds::CredHandle {
+            role: role.clone(),
+            username: issued.username.clone(),
+        },
+    );
+
+    state.emit(&AuditEvent::vault(
+        AppState::now_ts(),
+        state.cfg.node.clone(),
+        Some(state.cfg.residency_group.as_str().to_owned()),
+        system_actor(&principal),
+        "creds.issue",
+        Target {
+            kind: "creds".into(),
+            id: Some(format!("role={role};tenant={tenant_id};lease={lease_id}")),
+        },
+        Outcome::Success,
+        None,
+    ));
+
+    Ok(Json(crate::dto::CredsResponse {
+        username: issued.username,
+        password: issued.password,
+        lease_id,
+        ttl_secs: ttl,
+        renewable: true,
+        max_ttl_secs: issued.max_ttl_secs,
+    }))
 }
 
 fn system_actor(principal: &Principal) -> Actor {
@@ -296,6 +364,27 @@ fn system_actor(principal: &Principal) -> Actor {
         kind: ActorKind::System,
         id: Some(principal.role.clone()),
         tenant: None,
+    }
+}
+
+/// Delete the backend users owned by `revoked` cred leases and emit a `creds.revoke`
+/// event per torn-down handle. SSH-cert leases (no backend user) are skipped.
+fn tear_down_creds(state: &AppState, principal: &Principal, revoked: &[String]) {
+    let torn = crate::creds::teardown(&state.engines, &state.cred_handles, revoked);
+    for t in torn {
+        state.emit(&AuditEvent::vault(
+            AppState::now_ts(),
+            state.cfg.node.clone(),
+            Some(state.cfg.residency_group.as_str().to_owned()),
+            system_actor(principal),
+            "creds.revoke",
+            Target {
+                kind: "creds".into(),
+                id: Some(format!("role={}", t.role)),
+            },
+            if t.outcome_ok { Outcome::Success } else { Outcome::Failure },
+            None,
+        ));
     }
 }
 
@@ -344,6 +433,9 @@ async fn session_end(
             .map_err(|e| err(StatusCode::NOT_FOUND, "no_such_session", &e.to_string()))?
     };
     state.unbind_session(&id);
+    // Cascade-revoke deleted child leases in the engine; now delete any backend users
+    // those cred leases owned.
+    tear_down_creds(&state, &principal, &revoked);
     state.emit(&AuditEvent::vault(
         AppState::now_ts(),
         state.cfg.node.clone(),
@@ -386,11 +478,14 @@ async fn lease_revoke(
     Json(req): Json<LeaseRevokeRequest>,
 ) -> ApiResult<Ack> {
     require_unsealed(&state)?;
+    let lease_id = req.lease_id;
     {
         let mut eng = state.leases.lock().expect("lease lock");
-        eng.revoke(&req.lease_id)
+        eng.revoke(&lease_id)
             .map_err(|e| err(StatusCode::CONFLICT, "revoke_failed", &e.to_string()))?;
     }
+    // If this lease owned a backend user, delete it (emits its own creds.revoke).
+    tear_down_creds(&state, &principal, std::slice::from_ref(&lease_id));
     state.emit(&AuditEvent::vault(
         AppState::now_ts(),
         state.cfg.node.clone(),
@@ -399,7 +494,7 @@ async fn lease_revoke(
         "lease.revoke",
         Target {
             kind: "lease".into(),
-            id: Some(req.lease_id),
+            id: Some(lease_id),
         },
         Outcome::Success,
         None,

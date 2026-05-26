@@ -11,6 +11,7 @@
 
 mod auth;
 mod config;
+mod creds;
 mod dto;
 mod http;
 mod seal;

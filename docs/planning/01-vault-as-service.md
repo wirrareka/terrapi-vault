@@ -305,7 +305,17 @@ public key; `POST /v1/{group}/ssh/sign` issues a short-TTL cert as a **session-b
 lease** (keyed by mTLS principal SAN; `409` if no open session; host certs reject a
 tenant). Both unstubbed in the spec.
 
-**Next sub-phase (Phase 3):** dynamic-cred engines (OpenSearch RBAC role `audit-writer`
-write-only, RethinkDB admin) — unstubs `creds`; ephemeral backend user created on issue,
-deleted on revoke/expiry · ship B3 to group-local OpenSearch · hash-chained durable audit
-store. These reuse the same at-rest store + session-bound lease model.
+**Phase 3 — framework DONE (dynamic creds):** `creds.rs` — a `CredEngine` trait
+(issue/revoke ephemeral backend users), a role→engine registry, and lease→teardown wiring
+so a revoke / session-cascade deletes the backend user (`creds.revoke` B3). `POST
+/v1/{group}/{tenant_id}/creds/{role}` is unstubbed: validates tenant UUIDv4, requires an
+active session (`409`), issues a session-bound lease, emits `creds.issue`. An in-memory
+`MockEngine` (registered in dev) makes the path testable; **OpenSearch RBAC `audit-writer`**
+is the modern engine to wire next. **RethinkDB is legacy-only** (owner-corrected
+2026-05-26 — it backs legacy services, not the modern stack), so a `rethinkdb-admin`
+engine is legacy-scoped, not a modern datastore.
+
+**Next:** concrete network adapters behind `CredEngine` (OpenSearch security REST API;
+legacy RethinkDB) — integration-tested against a live backend · ship B3 to group-local
+OpenSearch · hash-chained durable audit store · **lease/session TTL+idle expiry sweeper**
+(today leases only revoke on explicit end, not on TTL timeout).

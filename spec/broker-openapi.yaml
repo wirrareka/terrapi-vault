@@ -105,13 +105,17 @@ components:
 
         - `audit-writer` — OpenSearch RBAC, **write-only** on `audit-events-*`; the leased
           ephemeral user is granted `opendistro_security_roles: ["audit-writer"]`
-          (`opensearch-infra/audit/security/audit-writer.role.json`).
-        - `rethinkdb-admin` — RethinkDB admin (proximiio-sync; the stack's primary
-          datastore — Postgres only if a service later introduces it).
+          (`opensearch-infra/audit/security/audit-writer.role.json`). This is the modern,
+          primary engine.
+        - `rethinkdb-admin` — **legacy only.** RethinkDB backs legacy services, not the
+          modern stack; kept for those services, not a modern datastore engine.
 
         No metrics-reader role: metrics live in Prometheus (PromQL, WG-only), not
         OpenSearch, so demon queries Prometheus directly with no brokered cred.
-      examples: [audit-writer, rethinkdb-admin]
+
+        Issuance creates an ephemeral backend user scoped to the role and deletes it on
+        revoke/expiry. A role with no engine configured in this instance → `404`.
+      examples: [audit-writer]
 
     Lease:
       type: object
@@ -312,9 +316,13 @@ paths:
     post:
       tags: [creds]
       operationId: issueCreds
-      summary: Issue leased, ephemeral service-admin creds (OpenSearch RBAC / RethinkDB).
-      description: Creates an ephemeral backend user on issue; deletes it on revoke/expiry (Vault db-engine semantics).
-      x-implementation-status: stub
+      summary: Issue leased, ephemeral service-admin creds (OpenSearch RBAC; legacy RethinkDB).
+      description: |
+        Creates an ephemeral backend user scoped to `role` and deletes it on revoke/expiry
+        (Vault db-engine semantics). The cred is a lease bound to the caller's **active
+        session** (keyed by the mTLS principal SAN) — open a session first or the request
+        `409`s; it cascade-revokes (and the user is deleted) when the session ends.
+      x-implementation-status: implemented
       x-audit-action: creds.issue
       parameters:
         - { $ref: "#/components/parameters/GroupParam" }
@@ -326,8 +334,9 @@ paths:
         "400": { description: tenant_id not a lowercase UUIDv4, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { description: group mismatch, tenant not provisioned in this group, or unknown role, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
-        "501": { $ref: "#/components/responses/NotImplemented" }
+        "404": { description: group mismatch, tenant not provisioned in this group, or unknown/unconfigured role, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: no active session for this principal, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "502": { description: backend rejected the create (target system error), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "503": { $ref: "#/components/responses/Sealed" }
 
   /v1/sys/session:

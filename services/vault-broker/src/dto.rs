@@ -52,13 +52,12 @@ pub struct SshCaResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct CredsRequest {
-    // Part of the fixed v1 contract; read once the dynamic-creds backend lands.
-    #[allow(dead_code)]
     #[serde(default)]
     pub ttl_secs: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
+/// Carries a generated `password` — intentionally NOT `Debug`, so it can't be logged.
+#[derive(Serialize)]
 pub struct CredsResponse {
     pub username: String,
     pub password: String,

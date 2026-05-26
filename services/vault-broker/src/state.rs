@@ -1,6 +1,7 @@
 //! Shared broker state: config, the lease/session engine, and the audit sink.
 
 use crate::config::BrokerConfig;
+use crate::creds::{CredEngines, CredHandle, MockEngine};
 use crate::ssh_ca::SshCa;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -8,6 +9,9 @@ use std::sync::{Arc, Mutex};
 use terrapi_vault::Vault;
 use vault_transport::audit::{AuditEvent, AuditSink, JsonlSink};
 use vault_transport::lease::LeaseEngine;
+
+/// Default TTL for a leased service-admin cred when the request omits `ttl_secs`.
+pub const CREDS_DEFAULT_TTL_SECS: u64 = 900;
 
 /// The result of a successful boot-time unseal: the opened at-rest store and the SSH CA
 /// loaded from it. `Vault` owns a rusqlite connection (`!Sync`), hence the `Mutex`.
@@ -46,6 +50,12 @@ pub struct AppState {
     /// leases (SSH certs, creds) become children of the caller's active session, so they
     /// cascade-revoke when it ends. One active session per principal (a new open replaces).
     sessions: Arc<Mutex<HashMap<String, String>>>,
+    /// Dynamic-cred engines (role → backend). Built at boot; empty in prod until adapters
+    /// are wired, a `MockEngine` in dev.
+    pub engines: Arc<CredEngines>,
+    /// Backend handles owned by issued cred leases (lease id → {role, username}), so a
+    /// revoke / session-cascade can delete the ephemeral backend user.
+    pub cred_handles: Arc<Mutex<HashMap<String, CredHandle>>>,
 }
 
 /// CSPRNG-backed opaque id: 256 bits of OS randomness, hex. Used for session and lease
@@ -59,6 +69,21 @@ pub fn random_id() -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// Build the dynamic-cred engine registry. Dev registers an in-memory `MockEngine` so the
+/// creds path is exercisable locally; production wires concrete OpenSearch (and legacy
+/// RethinkDB) adapters here from config — until then the registry is empty and an issuance
+/// for any role returns `404` (unknown role).
+fn build_engines(cfg: &BrokerConfig) -> CredEngines {
+    let mut engines = CredEngines::new();
+    if cfg.allow_insecure_dev {
+        engines.register(
+            "audit-writer",
+            Box::new(MockEngine::new("audit-writer", 8 * 60 * 60)),
+        );
+    }
+    engines
 }
 
 impl AppState {
@@ -78,13 +103,15 @@ impl AppState {
             None => (None, None),
         };
         Self {
-            cfg: Arc::new(cfg),
             leases: Arc::new(Mutex::new(LeaseEngine::new(gen))),
             audit: Arc::new(sink),
             sealed: Arc::new(AtomicBool::new(sealed)),
             store,
             ssh_ca,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            engines: Arc::new(build_engines(&cfg)),
+            cred_handles: Arc::new(Mutex::new(HashMap::new())),
+            cfg: Arc::new(cfg),
         }
     }
 
