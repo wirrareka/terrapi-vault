@@ -1,0 +1,33 @@
+# Separate workspace for the proximi.io platform / personal-sync SERVICES.
+# Deliberately NOT rooted at the repo top: the root `terrapi-vault` lib crate keeps
+# its 1.83 MSRV floor (`../rust-toolchain.toml`) and stays dependency-neutral so
+# memento/probe are never constrained (see ../docs/planning/01-vault-as-service.md §2.1).
+# Services consume the lib as a plain path dependency, NOT as a workspace member.
+[workspace]
+resolver = "2"
+members = ["vault-transport", "vault-broker", "vault-sync"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.83"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/terrapi/terrapi-vault"
+
+[workspace.dependencies]
+# The at-rest crypto library — reused, never re-implemented. Path dep, not a member.
+terrapi-vault = { path = ".." }
+vault-transport = { path = "vault-transport" }
+serde = { version = "1.0.215", features = ["derive"] }
+serde_json = "1.0.133"
+thiserror = "1.0.69"
+# Service runtime (Svet A / broker; the neutral lib never sees these).
+tokio = { version = "1.41", features = ["rt-multi-thread", "macros", "net", "signal"] }
+axum = "0.8"
+time = { version = "0.3.36", features = ["formatting", "macros"] }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Prose lint: fires on domain terms (OpenSearch, RethinkDB, WireGuard, SQLCipher…) in
+# doc comments — backticking them reads worse. Matches the lib crate's stance.
+doc_markdown = "allow"

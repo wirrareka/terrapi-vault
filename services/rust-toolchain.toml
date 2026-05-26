@@ -1,0 +1,12 @@
+# Build toolchain for the SERVICES workspace only (overrides the repo-root 1.83 pin
+# for this subtree). The root `terrapi-vault` lib keeps MSRV 1.83 as its floor and is
+# still proven on 1.83 standalone; here the services pull transitive deps (e.g.
+# argon2 → base64ct ≥1.8, which requires edition2024 / Rust ≥1.85) that do NOT build on
+# 1.83. We pin 1.91.1 to match the memento workspace, which already builds the whole
+# tree (including this exact lib) on 1.91.1 — so this is known-good and reproducible.
+# The lib's `rust-version = "1.83"` MSRV guarantee is unchanged; only the build
+# toolchain moved, never the library's floor.
+[toolchain]
+channel = "1.91.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

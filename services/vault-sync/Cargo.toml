@@ -1,0 +1,22 @@
+[package]
+name = "vault-sync"
+description = "Svet B: personal multi-device vault sync for memento/probe — E2E (server-blind), device-keypair auth, row-level oplog (HLC + LWW). Carries NONE of the platform (no OpenSearch/RethinkDB/tenants/residency). Phase 3."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "vault-sync"
+path = "src/main.rs"
+
+[dependencies]
+terrapi-vault.workspace = true
+vault-transport.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

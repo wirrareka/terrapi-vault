@@ -1,0 +1,191 @@
+# terrapi-vault broker — v1 API (Path A). SOURCE OF TRUTH for the "Secrets broker"
+# contract (coordination/CONTRACTS.md points here). Demon-confirmed params 2026-05-26.
+#
+# Status of operations:
+#   implemented: /healthz, /v1/sys/session (open/end), /v1/sys/leases/{renew,revoke}
+#   stub (501, shape fixed): /v1/{group}/ssh/{ca,sign}, /v1/{group}/{tenant_id}/creds/{role}
+openapi: 3.1.0
+info:
+  title: terrapi-vault broker
+  version: "1.0.0-skeleton"
+  description: |
+    Network secrets broker for the proximi.io platform. One instance per residency
+    group (eu/uae); the group is a per-instance constant and a request to another
+    group's path returns 404 (residency air-gap). Auth = mTLS over WireGuard, client
+    cert signed by the fleet Root CA (SAN → role). The broker emits its own B3 audit
+    events (source:"vault"); consumers do not double-record.
+servers:
+  - url: https://vault-{group}.internal:8200
+    description: WG-only, mTLS. {group} = eu|uae.
+    variables:
+      group: { enum: [eu, uae], default: eu }
+
+components:
+  securitySchemes:
+    mtlsWireGuard:
+      type: mutualTLS
+      description: Client cert signed by fleet Root CA; SAN maps to a broker role. WG-only.
+  schemas:
+    Error:
+      type: object
+      required: [error, detail]
+      properties:
+        error: { type: string }
+        detail: { type: string }
+    SshSignRequest:
+      type: object
+      required: [public_key, cert_type, principals, ttl_secs]
+      properties:
+        public_key: { type: string, description: OpenSSH public key to sign }
+        cert_type: { type: string, enum: [user, host] }
+        principals: { type: array, items: { type: string } }
+        ttl_secs:
+          type: integer
+          description: 900 interactive / 300 automated (and per touch-per-op). Capped to remaining session.
+        extensions: { type: object, additionalProperties: true }
+        tenant_id:
+          type: [string, "null"]
+          description: lowercase UUIDv4 (Vulture organization_id); null for group-scope host certs.
+    SshSignResponse:
+      type: object
+      required: [signed_certificate, serial, valid_before, lease_id]
+      properties:
+        signed_certificate: { type: string }
+        serial: { type: integer }
+        valid_before: { type: string, format: date-time }
+        lease_id: { type: string }
+    SshCaResponse:
+      type: object
+      required: [ca_public_key]
+      properties:
+        ca_public_key: { type: string, description: trust anchor; group-scoped host CA }
+    CredsRequest:
+      type: object
+      properties:
+        ttl_secs: { type: [integer, "null"] }
+    CredsResponse:
+      type: object
+      required: [username, password, lease_id, ttl_secs, renewable, max_ttl_secs]
+      properties:
+        username: { type: string }
+        password: { type: string }
+        lease_id: { type: string }
+        ttl_secs: { type: integer }
+        renewable: { type: boolean }
+        max_ttl_secs: { type: integer }
+    SessionOpenRequest:
+      type: object
+      properties:
+        ttl_secs: { type: [integer, "null"], description: "default 28800 (8h hard cap)" }
+        idle_timeout_secs: { type: [integer, "null"], description: "default 1800 (30m)" }
+    SessionOpenResponse:
+      type: object
+      required: [session_id, ttl_secs, idle_timeout_secs]
+      properties:
+        session_id: { type: string }
+        ttl_secs: { type: integer }
+        idle_timeout_secs: { type: integer }
+    SessionEndResponse:
+      type: object
+      required: [session_id, revoked_leases]
+      properties:
+        session_id: { type: string }
+        revoked_leases:
+          type: array
+          items: { type: string }
+          description: child leases cascade-revoked by ending the session
+    LeaseRenewRequest:
+      type: object
+      required: [lease_id, increment_secs]
+      properties:
+        lease_id: { type: string }
+        increment_secs: { type: integer }
+    LeaseRenewResponse:
+      type: object
+      required: [lease_id, ttl_secs]
+      properties:
+        lease_id: { type: string }
+        ttl_secs: { type: integer, description: clamped to max_ttl = remaining session }
+    LeaseRevokeRequest:
+      type: object
+      required: [lease_id]
+      properties: { lease_id: { type: string } }
+    Ack:
+      type: object
+      required: [ok]
+      properties: { ok: { type: boolean } }
+
+security:
+  - mtlsWireGuard: []
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness (unauthenticated)
+      security: []
+      responses: { "200": { description: ok } }
+
+  /v1/{group}/ssh/ca:
+    get:
+      summary: SSH CA public key (trust anchor) — group-scoped host CA. [501 skeleton]
+      parameters: [{ name: group, in: path, required: true, schema: { type: string, enum: [eu, uae] } }]
+      responses:
+        "200": { description: CA public key, content: { application/json: { schema: { $ref: "#/components/schemas/SshCaResponse" } } } }
+        "404": { description: group mismatch, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "501": { description: not yet implemented, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /v1/{group}/ssh/sign:
+    post:
+      summary: Sign an SSH certificate (short-TTL). [501 skeleton]
+      parameters: [{ name: group, in: path, required: true, schema: { type: string, enum: [eu, uae] } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SshSignRequest" } } } }
+      responses:
+        "200": { description: signed cert + lease, content: { application/json: { schema: { $ref: "#/components/schemas/SshSignResponse" } } } }
+        "404": { description: group mismatch, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "501": { description: not yet implemented, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /v1/{group}/{tenant_id}/creds/{role}:
+    post:
+      summary: Issue leased service-admin creds (OpenSearch RBAC / RethinkDB). [501 skeleton]
+      parameters:
+        - { name: group, in: path, required: true, schema: { type: string, enum: [eu, uae] } }
+        - { name: tenant_id, in: path, required: true, schema: { type: string, format: uuid }, description: lowercase UUIDv4 }
+        - { name: role, in: path, required: true, schema: { type: string }, description: "e.g. os-audit-writer, os-metrics-reader, rethinkdb-admin" }
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/CredsRequest" } } } }
+      responses:
+        "200": { description: ephemeral creds + lease, content: { application/json: { schema: { $ref: "#/components/schemas/CredsResponse" } } } }
+        "400": { description: tenant_id not a lowercase UUIDv4, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { description: group mismatch, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "501": { description: not yet implemented, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /v1/sys/session:
+    post:
+      summary: Open an operator session. Leases become its children (cascade-revoked on end).
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/SessionOpenRequest" } } } }
+      responses:
+        "200": { description: session opened, content: { application/json: { schema: { $ref: "#/components/schemas/SessionOpenResponse" } } } }
+        "401": { description: unauthenticated, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /v1/sys/session/{id}:
+    delete:
+      summary: End a session → cascade-revoke all child leases (revoke-on-session-end).
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: ended + revoked list, content: { application/json: { schema: { $ref: "#/components/schemas/SessionEndResponse" } } } }
+        "404": { description: no such session, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /v1/sys/leases/renew:
+    post:
+      summary: Renew a lease (clamped to max_ttl = remaining session).
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/LeaseRenewRequest" } } } }
+      responses:
+        "200": { description: new ttl, content: { application/json: { schema: { $ref: "#/components/schemas/LeaseRenewResponse" } } } }
+        "409": { description: not renewable / revoked / unknown, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /v1/sys/leases/revoke:
+    post:
+      summary: Revoke a single lease.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/LeaseRevokeRequest" } } } }
+      responses:
+        "200": { description: revoked, content: { application/json: { schema: { $ref: "#/components/schemas/Ack" } } } }
+        "409": { description: already revoked / unknown, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }

@@ -1,0 +1,65 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The at-rest library: must keep building + testing on its 1.83 MSRV floor.
+  lib-msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.83 (the lib MSRV floor)
+        uses: dtolnay/rust-toolchain@1.83.0
+        with:
+          components: rustfmt, clippy
+      - run: cargo +1.83.0 fmt --check
+      - run: cargo +1.83.0 clippy --all-targets -- -D warnings
+      - run: cargo +1.83.0 build
+      - run: cargo +1.83.0 test
+
+  # Dependency firewall: the lib must stay platform-neutral so memento/probe are never
+  # constrained (see docs/planning/01-vault-as-service.md §2.1). Fail if any networking /
+  # platform crate leaks into the lib's dependency tree.
+  lib-neutrality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.83.0
+      - name: Assert no platform/networking deps in the lib tree
+        run: |
+          tree="$(cargo +1.83.0 tree -e normal --prefix none | sort -u)"
+          forbidden='tokio|axum|hyper|reqwest|rustls|tower-http|opensearch|reql|rethinkdb'
+          if echo "$tree" | grep -Eiq "^($forbidden) "; then
+            echo "::error::Platform/networking crate leaked into the neutral lib:"
+            echo "$tree" | grep -Ei "^($forbidden) "
+            exit 1
+          fi
+          echo "lib dependency tree is neutral ✓"
+
+  # The services workspace (vault-broker / vault-sync / vault-transport): its own
+  # toolchain (1.91.1), separate from the lib. Lives under services/.
+  services:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.91.1 (services build toolchain)
+        uses: dtolnay/rust-toolchain@1.91.1
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+
+  # Cross-repo regression note: memento and probe consume the lib via
+  # `path = "../terrapi-vault"`. Because Phase 0 left the root lib package byte-for-byte
+  # unchanged, their build cannot regress from this repo. Their own CI builds the full
+  # tree on 1.91.1; we do not vendor them here.
