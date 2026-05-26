@@ -1,17 +1,19 @@
-//! Canonical B3 audit event (`source:"vault"`) + a best-effort local sink.
+//! Canonical B3 audit event (`source:"vault"`) + local sinks.
 //!
 //! Ownership decision (coordination/conventions/secrets-broker.md): the broker emits
-//! its own B3 events; consumers do NOT double-record. Shipping to group-local
-//! OpenSearch is layered on in Phase 2 and must never block an issuance — the durable
-//! local store here is the source of truth, the index is a fan-out copy.
+//! its own B3 events; consumers do NOT double-record. The durable local store
+//! ([`HashChainSink`], tamper-evident) is the source of truth; the broker's OpenSearch
+//! shipper fans out a best-effort copy on top and must never block an issuance.
 //!
 //! **Redaction by construction:** `AuditEvent` has no field that can hold a secret
 //! value, private key, password, or signed certificate. Only metadata (action, ids,
 //! ttl, outcome) is representable, so a secret cannot be emitted by accident.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Actor kind, mirroring `conventions/audit-event-schema.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +132,181 @@ impl AuditSink for JsonlSink {
     }
 }
 
+// --- Hash-chained tamper-evident local store --------------------------------------
+
+const GENESIS: [u8; 32] = [0u8; 32];
+
+/// Durable, **tamper-evident** local audit store: append-only JSONL where each record
+/// carries a SHA-256 hash chained to the previous record. Any edit, reorder, or deletion
+/// of a record breaks the chain and is caught by [`verify`].
+///
+/// Per record: `seq` (0-based), `prev` (previous record's hash, hex), `event` (the
+/// canonical B3 object), and `hash = SHA256(prev_bytes ++ seq_be ++ event_bytes)` (hex).
+/// `event_bytes` is the event serialized by serde_json; on read the exact bytes are
+/// recovered via `RawValue`, so verification is byte-exact without round-tripping the type.
+pub struct HashChainSink {
+    path: PathBuf,
+    state: Mutex<ChainState>,
+}
+
+struct ChainState {
+    seq: u64,
+    prev: [u8; 32],
+}
+
+#[derive(Serialize)]
+struct RecordOut<'a> {
+    seq: u64,
+    prev: &'a str,
+    hash: &'a str,
+    event: &'a AuditEvent,
+}
+
+#[derive(Deserialize)]
+struct RecordIn {
+    seq: u64,
+    prev: String,
+    hash: String,
+    event: Box<serde_json::value::RawValue>,
+}
+
+/// Why a chain failed to verify.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum VerifyError {
+    #[error("read error: {0}")]
+    Io(String),
+    #[error("malformed record at line {0}")]
+    Malformed(u64),
+    #[error("sequence gap: expected {expected}, got {got}")]
+    SeqGap { expected: u64, got: u64 },
+    #[error("broken chain at seq {0}: prev hash does not match")]
+    BrokenChain(u64),
+    #[error("tampered record at seq {0}: hash mismatch")]
+    Tampered(u64),
+}
+
+fn record_hash(prev: &[u8; 32], seq: u64, event_bytes: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(prev);
+    h.update(seq.to_be_bytes());
+    h.update(event_bytes);
+    h.finalize().into()
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+fn from_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+impl HashChainSink {
+    /// Open the store at `path`, recovering the chain tip (next seq + last hash) from any
+    /// existing file so appends continue the chain across restarts.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let (seq, prev) = recover_tip(&path);
+        Self {
+            path,
+            state: Mutex::new(ChainState { seq, prev }),
+        }
+    }
+}
+
+/// Recover `(next_seq, last_hash)` from the file; `(0, GENESIS)` if absent/empty. Uses the
+/// last parseable record (a partial trailing line from a crash is ignored).
+fn recover_tip(path: &Path) -> (u64, [u8; 32]) {
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return (0, GENESIS);
+    };
+    let mut tip = None;
+    for line in data.lines().filter(|l| !l.trim().is_empty()) {
+        if let Ok(r) = serde_json::from_str::<RecordIn>(line) {
+            if let Some(h) = from_hex32(&r.hash) {
+                tip = Some((r.seq, h));
+            }
+        }
+    }
+    tip.map_or((0, GENESIS), |(seq, h)| (seq + 1, h))
+}
+
+impl AuditSink for HashChainSink {
+    fn emit(&self, event: &AuditEvent) {
+        let Ok(event_bytes) = serde_json::to_vec(event) else {
+            return;
+        };
+        let mut st = self.state.lock().expect("audit chain lock");
+        let hash = record_hash(&st.prev, st.seq, &event_bytes);
+        let rec = RecordOut {
+            seq: st.seq,
+            prev: &to_hex(&st.prev),
+            hash: &to_hex(&hash),
+            event,
+        };
+        let Ok(mut line) = serde_json::to_vec(&rec) else {
+            return;
+        };
+        line.push(b'\n');
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            // Only advance the chain once the record is durably appended.
+            if f.write_all(&line).is_ok() {
+                st.seq += 1;
+                st.prev = hash;
+            }
+        }
+    }
+}
+
+/// Verify the whole chain at `path`. Returns the number of records on success, else the
+/// first integrity failure (gap, broken link, or tampered record).
+///
+/// # Errors
+/// See [`VerifyError`].
+pub fn verify(path: impl AsRef<Path>) -> Result<u64, VerifyError> {
+    let data = std::fs::read_to_string(path).map_err(|e| VerifyError::Io(e.to_string()))?;
+    let mut prev = GENESIS;
+    let mut expected: u64 = 0;
+    for line in data.lines().filter(|l| !l.trim().is_empty()) {
+        let r: RecordIn = serde_json::from_str(line).map_err(|_| VerifyError::Malformed(expected))?;
+        if r.seq != expected {
+            return Err(VerifyError::SeqGap {
+                expected,
+                got: r.seq,
+            });
+        }
+        let rec_prev = from_hex32(&r.prev).ok_or(VerifyError::Malformed(r.seq))?;
+        if rec_prev != prev {
+            return Err(VerifyError::BrokenChain(r.seq));
+        }
+        let recomputed = record_hash(&prev, r.seq, r.event.get().as_bytes());
+        let stored = from_hex32(&r.hash).ok_or(VerifyError::Malformed(r.seq))?;
+        if recomputed != stored {
+            return Err(VerifyError::Tampered(r.seq));
+        }
+        prev = recomputed;
+        expected += 1;
+    }
+    Ok(expected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +358,78 @@ mod tests {
         sink.emit(&sample());
         let body = std::fs::read_to_string(&path).unwrap();
         assert_eq!(body.lines().count(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn chain_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "vault-audit-chain-{name}-{}.jsonl",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn hash_chain_verifies_intact() {
+        let path = chain_path("ok");
+        let _ = std::fs::remove_file(&path);
+        let sink = HashChainSink::new(&path);
+        sink.emit(&sample());
+        sink.emit(&sample());
+        sink.emit(&sample());
+        assert_eq!(verify(&path), Ok(3));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hash_chain_recovers_across_reopen() {
+        let path = chain_path("reopen");
+        let _ = std::fs::remove_file(&path);
+        {
+            let sink = HashChainSink::new(&path);
+            sink.emit(&sample());
+            sink.emit(&sample());
+        }
+        // reopen → recover tip → append continues the chain
+        {
+            let sink = HashChainSink::new(&path);
+            sink.emit(&sample());
+        }
+        assert_eq!(verify(&path), Ok(3));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tampering_with_an_event_is_detected() {
+        let path = chain_path("tamper");
+        let _ = std::fs::remove_file(&path);
+        let sink = HashChainSink::new(&path);
+        sink.emit(&sample());
+        sink.emit(&sample());
+        // flip a field in the second record's event without recomputing the hash
+        let body = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = body.lines().map(str::to_owned).collect();
+        lines[1] = lines[1].replace("ssh.sign", "ssh.forged");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        assert_eq!(verify(&path), Err(VerifyError::Tampered(1)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deleting_a_record_breaks_the_chain() {
+        let path = chain_path("delete");
+        let _ = std::fs::remove_file(&path);
+        let sink = HashChainSink::new(&path);
+        sink.emit(&sample());
+        sink.emit(&sample());
+        sink.emit(&sample());
+        // drop the middle record → the next record's seq no longer matches
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        std::fs::write(&path, format!("{}\n{}\n", lines[0], lines[2])).unwrap();
+        assert_eq!(
+            verify(&path),
+            Err(VerifyError::SeqGap { expected: 1, got: 2 })
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

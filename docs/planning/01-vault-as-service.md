@@ -336,6 +336,12 @@ to group-local OpenSearch `audit-events-{group}-YYYY.MM` (`_bulk` NDJSON). Best-
 non-blocking: `emit` only enqueues, a ship failure never blocks issuance (event stays in
 JSONL). Enabled by `VAULT_AUDIT_OS_*`. Integration-tested against a live cluster.
 
-**Next:** legacy RethinkDB adapter (same trait) · **hash-chained tamper-evident durable
-audit store** (the local JSONL → append-only hash chain) · replay of locally-durable
-events that failed to ship.
+**Hash-chained audit store — DONE:** `HashChainSink` (vault-transport) — the durable local
+JSONL is now tamper-evident: each record carries `seq` + `prev` + `hash =
+SHA256(prev ++ seq ++ event_bytes)` (event bytes recovered byte-exact via `RawValue`).
+The chain tip is recovered on restart so appends continue across reboots; `audit::verify`
+detects edits, reorders, gaps, and deletions. The broker's `ShippingSink` wraps it (durable
+chain first, best-effort OpenSearch fan-out on top).
+
+**Next:** legacy RethinkDB adapter (same trait) · replay of locally-durable events that
+failed to ship to OpenSearch · graceful shutdown that drains the ship queue.

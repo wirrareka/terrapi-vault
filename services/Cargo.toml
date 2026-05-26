@@ -19,8 +19,10 @@ repository = "https://github.com/terrapi/terrapi-vault"
 terrapi-vault = { path = ".." }
 vault-transport = { path = "vault-transport" }
 serde = { version = "1.0.215", features = ["derive"] }
-serde_json = "1.0.133"
+serde_json = { version = "1.0.133", features = ["raw_value"] }
 thiserror = "1.0.69"
+# Tamper-evident audit hash chain (SHA-256 over prev-hash ++ seq ++ event bytes).
+sha2 = "0.10"
 # Master-key handling for the broker unseal: the same zeroizing secret wrapper the lib
 # pins, so the SecretBox<DerivedKey> returned by terrapi-vault::derive_key is one type.
 secrecy = "0.10.3"

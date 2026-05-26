@@ -13,11 +13,11 @@
 use crate::config::BrokerConfig;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use vault_transport::audit::{AuditEvent, AuditSink, JsonlSink};
+use vault_transport::audit::{AuditEvent, AuditSink, HashChainSink};
 
-/// Composite sink: durable local JSONL + optional non-blocking ship queue.
+/// Composite sink: durable tamper-evident local hash chain + optional non-blocking ship queue.
 pub struct ShippingSink {
-    local: JsonlSink,
+    local: HashChainSink,
     tx: Option<mpsc::UnboundedSender<AuditEvent>>,
 }
 
@@ -64,7 +64,7 @@ impl ShipConfig {
 /// Build the broker's audit sink and, if shipping is configured, the background ship task.
 #[must_use]
 pub fn build(cfg: &BrokerConfig) -> (Arc<dyn AuditSink>, Option<ShipTask>) {
-    let local = JsonlSink::new(cfg.audit_path.clone());
+    let local = HashChainSink::new(cfg.audit_path.clone());
     let Some(ship) = ShipConfig::from_env() else {
         return (Arc::new(ShippingSink { local, tx: None }), None);
     };
