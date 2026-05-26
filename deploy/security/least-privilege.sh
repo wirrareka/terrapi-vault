@@ -1,0 +1,38 @@
+#!/bin/sh
+# least-privilege.sh — hardening notes + idempotent setup for the broker host.
+# Read as a runbook; the CMDs are safe to run as root on the jail host.
+#
+# Principle: the broker runs unprivileged; humans reach the box as `ops` + sudo;
+# root SSH is disabled; the crown-jewel files are root/vault-owned, mode-600.
+set -eu
+
+# --- Service user: unprivileged, nologin, home on the encrypted dataset. ---
+pw groupadd -n vault 2>/dev/null || true
+pw useradd  -n vault -g vault -d /var/db/terrapi-vault -s /usr/sbin/nologin \
+    -c "terrapi-vault broker" 2>/dev/null || true
+
+# --- File ownership / modes (defense in depth on top of ZFS encryption). ---
+#   /var/db/terrapi-vault        : vault:vault 0700 (store + audit live here)
+#   unseal.pass, secrets/*       : vault:vault 0600 (master-key passphrase, OS admin)
+#   /usr/local/etc/terrapi-vault : config dir; env + roles.json 0600 root:vault
+install -d -o vault -g vault -m 0700 /var/db/terrapi-vault          2>/dev/null || true
+install -d -o vault -g vault -m 0700 /var/db/terrapi-vault/secrets  2>/dev/null || true
+install -d -o vault -g vault -m 0700 /var/db/terrapi-vault/snapshots 2>/dev/null || true
+[ -f /var/db/terrapi-vault/unseal.pass ] && chown vault:vault /var/db/terrapi-vault/unseal.pass && chmod 0600 /var/db/terrapi-vault/unseal.pass || true
+[ -f /usr/local/etc/terrapi-vault/vault-broker.env ] && chown root:vault /usr/local/etc/terrapi-vault/vault-broker.env && chmod 0600 /usr/local/etc/terrapi-vault/vault-broker.env || true
+[ -f /usr/local/etc/terrapi-vault/roles.json ] && chown root:vault /usr/local/etc/terrapi-vault/roles.json && chmod 0600 /usr/local/etc/terrapi-vault/roles.json || true
+[ -f /usr/local/etc/terrapi-vault/tls/server.key ] && chown root:vault /usr/local/etc/terrapi-vault/tls/server.key && chmod 0600 /usr/local/etc/terrapi-vault/tls/server.key || true
+
+# --- SSH: no root login, key-only, admin via `ops` + sudo. ---
+# In /etc/ssh/sshd_config (apply by hand / config mgmt; shown here as intent):
+#   PermitRootLogin no
+#   PasswordAuthentication no
+#   AllowUsers ops
+pw groupadd -n ops 2>/dev/null || true
+pw useradd  -n ops -g ops -G wheel -m -s /bin/sh -c "Operations admin" 2>/dev/null || true
+# sudo (pkg install sudo): %wheel ALL=(ALL:ALL) ALL, require password + syslog.
+# The vault service account gets NO sudo and NO shell.
+
+echo "least-privilege applied. Set sshd PermitRootLogin no + restart sshd by hand."
+echo "Reminder: unseal.pass + the SSH-CA key (in store.sqlcipher) are CROWN JEWELS —"
+echo "          back them up to the offline encrypted-USB store, kept SEPARATE from snapshots."

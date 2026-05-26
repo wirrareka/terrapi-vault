@@ -1,0 +1,59 @@
+# Bastillefile — provision a terrapi-vault broker jail (one per residency group).
+#
+# Usage (on the bastille host):
+#   bastille create vault-eu 14.2-RELEASE 10.200.0.0/24   # eu  WG subnet
+#   bastille create vault-uae 14.2-RELEASE 10.210.0.0/24  # uae WG subnet
+#   bastille template vault-eu /path/to/terrapi-vault/deploy/jail --arg GROUP=eu
+#
+# ASSUMPTIONS (confirm with operator):
+#   - FreeBSD 14.2-RELEASE base.
+#   - vnet jail (own routing onto the WG mesh).
+#   - WG subnets: 10.200.0.0/24 (eu), 10.210.0.0/24 (uae) per residency.md.
+#   - The encrypted dataset zroot/terrapi/vault is delegated/mounted into the
+#     jail at /var/db/terrapi-vault (zfs jail delegation OR nullfs of the mount).
+#   - The binary is built per deploy/build.sh and present at
+#     deploy/jail/usr/local/sbin/vault-broker before templating.
+#
+# eu and uae NEVER co-reside: distinct jails, distinct WG meshes, distinct
+# datasets, one broker per residency group. No cross-group anything.
+
+# Runtime deps: base + CA trust store only (SQLCipher is bundled; rustls = aws-lc-rs).
+PKG ca_root_nss
+
+# Service user (unprivileged; nologin; home on the encrypted dataset).
+CMD pw groupadd -n vault 2>/dev/null || true
+CMD pw useradd -n vault -g vault -d /var/db/terrapi-vault -s /usr/sbin/nologin -c "terrapi-vault broker" 2>/dev/null || true
+
+# Layout.
+CMD install -d -m 755 /usr/local/sbin
+CMD install -d -m 755 /usr/local/etc/rc.d
+CMD install -d -m 755 /usr/local/etc/terrapi-vault
+CMD install -d -m 755 /usr/local/etc/terrapi-vault/tls
+CMD install -d -m 755 /usr/local/etc/terrapi-vault-deploy
+
+# Binary (built per deploy/build.sh; copy in via bastille cp before templating).
+CP usr/local/sbin/vault-broker /usr/local/sbin/vault-broker
+CMD chmod 755 /usr/local/sbin/vault-broker
+
+# rc.d scripts. zfskeys MUST come up before vault_broker (rc REQUIRE handles it).
+CP rc.d/vault-broker /usr/local/etc/rc.d/vault-broker
+CP zfs/zfskeys       /usr/local/etc/rc.d/zfskeys
+CMD chmod 755 /usr/local/etc/rc.d/vault-broker /usr/local/etc/rc.d/zfskeys
+
+# Contract-check + security helpers (run on demand / from monitoring).
+CP zfs/check-encryption.sh /usr/local/etc/terrapi-vault-deploy/check-encryption.sh
+CP security/fim-watchlist.txt /usr/local/etc/terrapi-vault-deploy/fim-watchlist.txt
+CP security/pf.conf.snippet /usr/local/etc/terrapi-vault-deploy/pf.conf.snippet
+CMD chmod 755 /usr/local/etc/terrapi-vault-deploy/check-encryption.sh
+
+# Config + env drop-in are laid down out-of-band by deploy/install.sh (they carry
+# per-instance values + reference dataset secrets). Pre-create with safe perms.
+CMD touch /usr/local/etc/terrapi-vault/vault-broker.env && chmod 600 /usr/local/etc/terrapi-vault/vault-broker.env && chown root:vault /usr/local/etc/terrapi-vault/vault-broker.env
+CMD touch /usr/local/etc/terrapi-vault/roles.json && chmod 600 /usr/local/etc/terrapi-vault/roles.json && chown root:vault /usr/local/etc/terrapi-vault/roles.json
+
+# Enable services.
+SYSRC zfskeys_enable=YES
+SYSRC vault_broker_enable=YES
+
+# Firewall: deploy/security/pf.conf.snippet — WG-only ingress to :8200 (broker
+# API, mTLS-over-WG) and :8201 (metrics, on-box Prometheus). NEVER ext_if.

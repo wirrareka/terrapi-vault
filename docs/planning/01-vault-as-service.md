@@ -375,6 +375,14 @@ aether fleet-mode backup keys; preserves their zero-knowledge model (KEK never l
 - **Unattended unseal** — `VAULT_UNSEAL_PASSPHRASE_FILE` (mode-600 fallback). Full
   broker-master-key KMS-wrap stays deferred (needs a per-group KMS that doesn't exist yet).
 
+**FreeBSD deploy module — DONE:** `deploy/` mirrors `identity/deploy/` — `build.sh`,
+`jail/{Bastillefile,provision.sh}` (bastille vnet jail per group), `rc.d/vault-broker`
+(unprivileged `vault` user, `REQUIRE zfskeys`), `zfs/{zfskeys,check-encryption.sh}`
+(encrypted `zroot/terrapi/vault` → `/var/db/terrapi-vault`), `vault-broker.env.sample` +
+`roles.json.sample`, `security/{pf,fim,least-privilege,audit_control}`, `alerts/`, and an
+`install.sh` runbook. Crown jewels (SSH-CA key + KMS KEKs in `store.sqlcipher`, `unseal.pass`)
+on the encrypted dataset. Infra confirmed + ready to run host steps on `medina`.
+
 **Next:** additional `CredEngine` adapters for any *modern* datastore that needs brokered
 creds (RethinkDB is out); broker-master-key KMS-wrap for unattended unseal once a KMS
-exists; FreeBSD deploy (rc.d) on EU `medina`; `vault-sync` (Svet B).
+exists; `vault-sync` (Svet B).

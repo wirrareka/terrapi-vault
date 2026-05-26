@@ -1,0 +1,101 @@
+#!/bin/sh
+# install.sh — terrapi-vault broker operator runbook + idempotent installer (run
+# INSIDE the jail, as root). Canonical install ORDER — read top to bottom.
+#
+#   ./install.sh eu
+#   ./install.sh uae
+#
+# Pre-req: the jail exists (deploy/jail/provision.sh), the binary is built
+# (deploy/build.sh) and present at /usr/local/sbin/vault-broker, and infra has
+# delivered: the server mTLS cert/key, the fleet Root CA bundle, and the
+# audit-writer/OpenSearch-admin secret.
+#
+# INSTALL ORDER (do not reorder):
+#   1) least-privilege user/dirs (also done by Bastillefile; idempotent)
+#   2) zfs key   -> unlock the encrypted dataset BEFORE the broker
+#   3) secrets   -> unseal.pass + os-admin.pass onto the dataset (mode 600)
+#   4) config    -> vault-broker.env (0600) + roles.json (0600) + tls/
+#   5) rc enable -> zfskeys + vault_broker = YES
+#   6) start     -> service zfskeys start ; service vault_broker start
+set -eu
+
+GROUP="${1:?usage: install.sh <eu|uae>}"
+HERE="$(cd "$(dirname "$0")" && pwd)"          # deploy/
+DATASET="${DATASET:-zroot/terrapi/vault}"
+DATA="/var/db/terrapi-vault"
+ETC="/usr/local/etc/terrapi-vault"
+
+echo "=== terrapi-vault broker install — group=${GROUP} ==="
+
+# --- step 1: least-privilege + user/dirs ------------------------------------
+sh "${HERE}/security/least-privilege.sh"
+
+# --- step 2: unlock the encrypted dataset and verify (NEVER run sealed in prod) ---
+echo "--> unlocking encrypted dataset ${DATASET}"
+service zfskeys start || { echo "zfskeys start FAILED — abort"; exit 1; }
+sh "${HERE}/zfs/check-encryption.sh" "${DATASET}" "${DATA}" || \
+    { echo "encryption check FAILED — abort"; exit 1; }
+
+# --- step 3: secrets onto the encrypted dataset (operator-provided) ----------
+# unseal.pass — the broker's master-key passphrase (Argon2id → SQLCipher key).
+#   Generate ONCE, back up to the offline encrypted-USB store, keep SEPARATE
+#   from any store snapshot. mode 600, owned by the vault user.
+if [ ! -f "${DATA}/unseal.pass" ]; then
+    echo "ABORT: place the unseal passphrase at ${DATA}/unseal.pass (mode 600) first."
+    echo "       e.g. head -c 32 /dev/random | b64encode -r - > ${DATA}/unseal.pass"
+    exit 1
+fi
+install -d -o vault -g vault -m 700 "${DATA}/secrets"
+[ -f "${DATA}/secrets/os-admin.pass" ] || \
+    echo "    NOTE: drop the OpenSearch admin secret at ${DATA}/secrets/os-admin.pass (mode 600)."
+chown vault:vault "${DATA}/unseal.pass"; chmod 600 "${DATA}/unseal.pass"
+
+# --- step 4: config + roles + tls -------------------------------------------
+install -d -m 755 "${ETC}" "${ETC}/tls"
+if [ ! -s "${ETC}/vault-broker.env" ]; then
+    install -m 600 -o root -g vault "${HERE}/vault-broker.env.sample" "${ETC}/vault-broker.env"
+    echo "--> wrote ${ETC}/vault-broker.env from sample — EDIT it (group, WG IP, OS URL)."
+fi
+if [ ! -s "${ETC}/roles.json" ]; then
+    install -m 600 -o root -g vault "${HERE}/roles.json.sample" "${ETC}/roles.json"
+    echo "--> wrote ${ETC}/roles.json from sample — confirm the SAN→role/caps map."
+fi
+echo "    REQUIRED: ${ETC}/tls/{server.pem,server.key,fleet-root-ca.pem} from infra."
+[ -f "${ETC}/tls/server.pem" ] && [ -f "${ETC}/tls/fleet-root-ca.pem" ] || \
+    echo "    WARN: TLS material missing — the broker refuses to start in prod without it."
+
+# --- step 5: enable services (zfskeys BEFORE vault_broker via rc REQUIRE) ----
+sysrc zfskeys_enable=YES
+sysrc vault_broker_enable=YES
+
+# --- step 6: start + verify --------------------------------------------------
+service vault_broker start
+sleep 1
+service vault_broker status || true
+echo "--> readiness: curl -s http://\$VAULT_METRICS_BIND/metrics | grep vault_sealed  (expect 0)"
+
+cat <<'RUNBOOK'
+
+=== RUNBOOK ===
+* UNSEAL (boot): the broker reads VAULT_UNSEAL_PASSPHRASE_FILE at start. If it
+  boots SEALED, every mutating op 503s — check the dataset is unlocked and the
+  passphrase file is correct. `GET /v1/sys/seal-status` shows {sealed:false} when ready.
+
+* SSH-CA key / KMS KEKs: live INSIDE store.sqlcipher (encrypted at rest). Back up
+  via `POST /v1/sys/store-snapshot` (online VACUUM INTO → ciphertext) + the .meta.json
+  sidecar; ship both. NEVER co-locate a snapshot with the unseal passphrase.
+
+* ROTATE a backup KEK: POST /v1/{group}/{tenant}/kms/{key_id}/rotate (old blobs keep
+  unwrapping under their version).
+
+* ROLES change: edit ${ETC}/roles.json (SAN→{role,caps}) and restart the broker.
+
+* COMPROMISE-IR (host/store suspected exposed):
+  1) Stop the broker; rotate the unseal passphrase + re-key the dataset.
+  2) The SSH-CA key is the crown jewel — if exposed, mint a new CA, redistribute
+     the trust anchor (GET /v1/{group}/ssh/ca), and add outstanding serials to the
+     revocation list (GET /v1/{group}/ssh/revoked → build an sshd KRL).
+  3) Rotate every brokered OpenSearch user (they are short-TTL; end sessions to
+     cascade-delete). FIM/auditd: was unseal.pass / store read off-window?
+RUNBOOK
+echo "=== install complete ==="

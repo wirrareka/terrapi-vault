@@ -1,0 +1,35 @@
+# pf snippet — terrapi-vault broker ingress is WG-only. Apply on the HOST.
+#
+# The broker binds its WG /32 INSIDE the jail:
+#   :8200  broker API   — mTLS-over-WireGuard vs the fleet Root CA (daemon auth)
+#   :8201  metrics      — Prometheus text, plaintext/unauth (on-box Prometheus jail)
+# Both are WG-only. The broker must NEVER be reachable on the public NIC.
+#
+# Per-group WG subnets (residency.md — ASSUMPTION, confirm):
+#   eu  : 10.200.0.0/24
+#   uae : 10.210.0.0/24
+# eu and uae never co-reside; a host only ever carries ONE group's mesh.
+
+# --- macros (set per host) ---
+wg_if      = "wg0"            # the residency-group WG interface
+ext_if     = "vtnet0"        # public NIC — the broker gets NO inbound here
+jail_ip    = "10.200.0.101"  # vault-broker jail address on the WG mesh (eu example)
+api_port   = "8200"
+metrics_port = "8201"
+prom_ip    = "10.200.0.10"   # the on-box Prometheus jail (scrapes :8201)
+
+# Default deny inbound.
+block in all
+
+# Allow the WG mesh to reach the broker API (mTLS terminates in-app).
+pass in quick on $wg_if proto tcp from $wg_if:network to $jail_ip port $api_port keep state
+
+# Allow ONLY the Prometheus jail to scrape metrics (plaintext → tightest source).
+pass in quick on $wg_if proto tcp from $prom_ip to $jail_ip port $metrics_port keep state
+
+# Explicitly drop any attempt to reach the broker from the public NIC.
+block in quick on $ext_if proto tcp to $jail_ip port { $api_port, $metrics_port }
+
+# Egress the broker needs: own-group OpenSearch (dynamic creds + B3 audit ship),
+# and the WG peers it brokers for. Egress stays on the WG mesh.
+pass out quick on $wg_if proto tcp from $jail_ip keep state

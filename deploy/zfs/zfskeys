@@ -1,0 +1,83 @@
+#!/bin/sh
+#
+# PROVIDE: zfskeys
+# REQUIRE: FILESYSTEMS
+# BEFORE:  vault_broker
+# KEYWORD: shutdown
+#
+# Load the ZFS-native-encryption key for the terrapi-vault crown-jewel dataset
+# and mount it BEFORE vault-broker starts. The dataset holds (all mode-0600):
+#   - the at-rest store       store.sqlcipher  (SSH-CA signing key + KMS KEKs)
+#   - the unseal passphrase   unseal.pass
+#   - backend secrets         secrets/os-admin.pass
+#   - the hash-chained audit  audit.jsonl  (+ .shipped ship cursor)
+#
+# Encryption-at-rest contract (infra encryption-at-rest.md): ZFS-native
+# aes-256-gcm. The keysource itself is a raw key file kept OFF this pool
+# (USB / KMIP / prompt) — NEVER on the dataset it protects, NEVER in the repo.
+#
+# === KEY BACKUP DISCIPLINE ===
+# Back up the dataset encryption key to the OFFLINE encrypted-USB store, kept
+# SEPARATE from any store snapshot. A combined backup (snapshot + the key that
+# decrypts it) defeats encryption-at-rest entirely. (The store snapshot itself
+# is ciphertext under the broker's unseal passphrase — also kept separate.)
+#
+# Enable (inside the jail's /etc/rc.conf):
+#   zfskeys_enable="YES"
+#   zfskeys_dataset="zroot/terrapi/vault"
+#   zfskeys_keylocation="file:///root/.zfskeys/terrapi-vault.key"  # off-pool
+
+. /etc/rc.subr
+
+name="zfskeys"
+rcvar="zfskeys_enable"
+load_rc_config $name
+
+: ${zfskeys_enable:="NO"}
+# ASSUMPTION (confirm with operator): dataset path + jail-visible mountpoint.
+: ${zfskeys_dataset:="zroot/terrapi/vault"}
+: ${zfskeys_mountpoint:="/var/db/terrapi-vault"}
+# Keysource MUST be off this pool. Operator overrides per host.
+: ${zfskeys_keylocation:="prompt"}
+
+start_cmd="zfskeys_start"
+stop_cmd="zfskeys_stop"
+status_cmd="zfskeys_status"
+
+zfskeys_start() {
+    keystatus=$(zfs get -H -o value keystatus "${zfskeys_dataset}" 2>/dev/null)
+    if [ "${keystatus}" = "available" ]; then
+        echo "zfskeys: ${zfskeys_dataset} key already loaded."
+    else
+        echo "zfskeys: loading key for ${zfskeys_dataset} (source: ${zfskeys_keylocation})"
+        if [ "${zfskeys_keylocation}" = "prompt" ]; then
+            zfs load-key "${zfskeys_dataset}" || { warn "zfskeys: key load FAILED"; exit 1; }
+        else
+            zfs set keylocation="${zfskeys_keylocation}" "${zfskeys_dataset}" >/dev/null 2>&1
+            zfs load-key "${zfskeys_dataset}" || { warn "zfskeys: key load FAILED"; exit 1; }
+            zfs set keylocation=prompt "${zfskeys_dataset}" >/dev/null 2>&1
+        fi
+    fi
+    if ! zfs get -H -o value mounted "${zfskeys_dataset}" | grep -q yes; then
+        zfs mount "${zfskeys_dataset}" || { warn "zfskeys: mount FAILED"; exit 1; }
+    fi
+    echo "zfskeys: ${zfskeys_dataset} unlocked + mounted at ${zfskeys_mountpoint}."
+}
+
+zfskeys_stop() {
+    # Unmount + unload on shutdown so the key isn't resident in a powered-down
+    # box (disk theft / RMA threat model). vault-broker is stopped first (BEFORE).
+    zfs unmount "${zfskeys_dataset}" 2>/dev/null
+    zfs unload-key "${zfskeys_dataset}" 2>/dev/null
+    echo "zfskeys: ${zfskeys_dataset} unmounted + key unloaded."
+}
+
+zfskeys_status() {
+    echo "dataset:    ${zfskeys_dataset}"
+    echo "keystatus:  $(zfs get -H -o value keystatus "${zfskeys_dataset}" 2>/dev/null)"
+    echo "encryption: $(zfs get -H -o value encryption "${zfskeys_dataset}" 2>/dev/null)"
+    echo "mounted:    $(zfs get -H -o value mounted "${zfskeys_dataset}" 2>/dev/null)"
+    echo "mountpoint: $(zfs get -H -o value mountpoint "${zfskeys_dataset}" 2>/dev/null)"
+}
+
+run_rc_command "$1"

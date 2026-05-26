@@ -1,0 +1,96 @@
+#!/bin/sh
+#
+# PROVIDE: vault_broker
+# REQUIRE: NETWORKING zfskeys
+# KEYWORD: shutdown
+#
+# terrapi-vault broker (Path A) — the stack's network secrets broker (Rust/Axum).
+# Single self-contained binary, runs as the unprivileged `vault` user inside a
+# bastille vnet jail on the per-group WireGuard mesh. ONE instance per residency
+# group (eu / uae) — the two NEVER co-reside (residency.md).
+#
+# REQUIRE: zfskeys — we MUST NOT start until the ZFS-native-encrypted dataset
+# holding the at-rest store (SSH-CA signing key + KMS KEKs), the unseal
+# passphrase, and the OpenSearch admin secret is unlocked + mounted. See deploy/zfs/.
+#
+# Enable (inside the jail's /etc/rc.conf):
+#   vault_broker_enable="YES"
+#
+# Optional overrides (defaults shown):
+#   vault_broker_user="vault"
+#   vault_broker_data="/var/db/terrapi-vault"           # on the encrypted dataset
+#   vault_broker_env="/usr/local/etc/terrapi-vault/vault-broker.env"  # mode 0600
+#   vault_broker_log="/var/log/vault-broker.log"
+
+. /etc/rc.subr
+
+name="vault_broker"
+rcvar="vault_broker_enable"
+load_rc_config $name
+
+: ${vault_broker_enable:="NO"}
+: ${vault_broker_user:="vault"}
+: ${vault_broker_group:="vault"}
+: ${vault_broker_data:="/var/db/terrapi-vault"}
+: ${vault_broker_env:="/usr/local/etc/terrapi-vault/vault-broker.env"}
+: ${vault_broker_log:="/var/log/vault-broker.log"}
+
+pidfile="/var/run/vault-broker.pid"
+procname="/usr/local/sbin/vault-broker"
+
+command="/usr/sbin/daemon"
+start_precmd="vault_broker_prestart"
+stop_postcmd="vault_broker_poststop"
+
+vault_broker_prestart() {
+    # 1. Encrypted-dataset gate. Refuse to start unless the dataset (which holds
+    #    the at-rest store + the unseal passphrase) is unlocked + mounted. zfskeys
+    #    runs first via REQUIRE; assert here too so a manual unmount fails loud.
+    if ! zfs get -H -o value mounted "${vault_broker_data}" >/dev/null 2>&1; then
+        # data may be a plain dir on the mounted dataset; fall back to a path check.
+        :
+    fi
+    if [ ! -f "${vault_broker_data}/unseal.pass" ]; then
+        warn "vault-broker: unseal passphrase not present at ${vault_broker_data}/unseal.pass"
+        warn "vault-broker: is the encrypted dataset unlocked? run: service zfskeys status"
+        return 1
+    fi
+
+    # 2. Data dirs with locked-down perms (idempotent) — live on the encrypted dataset.
+    install -d -o ${vault_broker_user} -g ${vault_broker_group} -m 700 ${vault_broker_data}
+    install -d -o ${vault_broker_user} -g ${vault_broker_group} -m 700 ${vault_broker_data}/snapshots
+    install -d -o ${vault_broker_user} -g ${vault_broker_group} -m 700 ${vault_broker_data}/secrets
+
+    # 3. Env drop-in (secrets sourced from the encrypted dataset). Must be mode-600.
+    if [ ! -f "${vault_broker_env}" ]; then
+        warn "vault-broker: missing env drop-in ${vault_broker_env}"
+        return 1
+    fi
+
+    # 4. Roles config must exist — without it every verified cert is 403 (deny-all),
+    #    so a missing roles.json is a hard misconfig, not a soft default.
+    roles="$(. ${vault_broker_env} 2>/dev/null; echo "${VAULT_ROLES_CONFIG:-}")"
+    if [ -z "${roles}" ] || [ ! -f "${roles}" ]; then
+        warn "vault-broker: VAULT_ROLES_CONFIG missing/unset (${roles}) — would 403 every cert"
+        return 1
+    fi
+
+    # 5. Touch the log so daemon(8) doesn't create it as root.
+    if [ ! -f ${vault_broker_log} ]; then
+        install -o ${vault_broker_user} -g ${vault_broker_group} -m 640 /dev/null ${vault_broker_log}
+    fi
+
+    # 6. Source the env drop-in (secrets pulled from the dataset) and exec the
+    #    broker so secrets stay out of argv. The binary is env-driven (no flags).
+    rc_flags="-c -f -p ${pidfile} -u ${vault_broker_user} -o ${vault_broker_log} \
+        /bin/sh -c '. ${vault_broker_env}; exec ${procname}'"
+}
+
+vault_broker_poststop() {
+    rm -f ${pidfile}
+}
+
+# daemon(8) args are assembled in prestart (so the env file is sourced into the child).
+command_args="${rc_flags:--c -f -p ${pidfile} -u ${vault_broker_user} -o ${vault_broker_log} /bin/sh -c '. ${vault_broker_env}; exec ${procname}'}"
+
+run_rc_command "$1"

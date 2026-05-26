@@ -1,0 +1,33 @@
+# terrapi-vault broker FIM watch list — HAND TO INFRA host-fim.md pipeline.
+# Any create/modify/delete/attr-change on these paths => drift alert (email-first).
+# Post-incident, FIM also answers "was the unseal passphrase / store read off-window?"
+# Pair with auditd +fm (read events) on the crown-jewel files.
+#
+# Format: one path/glob per line; lines starting with # are comments.
+
+# --- Unseal passphrase (crown jewel — derives the SQLCipher master key). ---
+/var/db/terrapi-vault/unseal.pass
+
+# --- Backend secrets sourced into the env at boot. ---
+/var/db/terrapi-vault/secrets/os-admin.pass
+
+# --- At-rest store sidecar (salt + KDF params; needed to open the store). ---
+/var/db/terrapi-vault/store.sqlcipher.meta.json
+
+# --- Config + env drop-in + roles + TLS material (mode-0600). ---
+/usr/local/etc/terrapi-vault/vault-broker.env
+/usr/local/etc/terrapi-vault/roles.json
+/usr/local/etc/terrapi-vault/tls/server.key
+/usr/local/etc/terrapi-vault/tls/server.pem
+/usr/local/etc/terrapi-vault/tls/fleet-root-ca.pem
+
+# --- The binary + rc.d (tamper / supply-chain). ---
+/usr/local/sbin/vault-broker
+/usr/local/etc/rc.d/vault-broker
+/usr/local/etc/rc.d/zfskeys
+
+# NOTE: do NOT FIM-hash store.sqlcipher itself (it changes constantly — KEKs,
+# revoked serials, audit). Its integrity is covered by SQLCipher + the encrypted
+# dataset. Watch perms only on /var/db/terrapi-vault (mode 700) if FIM supports it.
+# Likewise audit.jsonl is the tamper-EVIDENT hash chain (verify via the broker),
+# not a FIM target.

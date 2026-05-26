@@ -1,0 +1,17 @@
+{
+  "_comment": "Production VAULT_ROLES_CONFIG for the EU broker. SAN(dNSName) -> {role, caps}. Capabilities: ssh-ca, ssh-sign, creds, session, leases, kms, snapshot. An unmapped/trusted SAN -> 403; a cap the role lacks -> 403. Mint client certs with these exact dNSNames (demon-mtls-san-matcher.md).",
+  "roles": {
+    "demon-operator.eu.proximi.internal": {
+      "role": "demon-operator",
+      "caps": ["ssh-sign", "creds", "session", "leases"]
+    },
+    "demon-system.eu.proximi.internal": {
+      "role": "demon-system",
+      "caps": ["ssh-sign", "session", "leases"]
+    },
+    "aether-backup.eu.proximi.internal": {
+      "role": "aether-backup",
+      "caps": ["kms", "snapshot"]
+    }
+  }
+}

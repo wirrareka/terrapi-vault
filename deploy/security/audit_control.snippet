@@ -1,0 +1,25 @@
+# auditd / BSM policy snippet for the terrapi-vault broker jail host.
+# HAND TO INFRA audit-detection.md. Merge into /etc/security/audit_control.
+# Policy: lo,ad,ex,pc,+fm
+#   lo  = login/logout         ad = administrative
+#   ex  = exec                 pc = process ops (fork/exit)
+#   +fm = file attribute mods + file reads/writes on flagged paths
+#
+# Feeds the email-first security telemetry pipe AND answers the IR question
+# "was the unseal passphrase / at-rest store read or modified off-window?".
+
+flags:lo,ad,ex,pc
+naflags:lo,ad
+policy:cnt,argv
+filesz:2M
+expire-after:10M
+
+# --- Per-object read/write auditing of the crown-jewel files ---
+# Log EVERY read of the unseal passphrase + store. Alert on reads outside a
+# known maintenance/boot window:
+#   auditreduce -m AUE_OPEN_R /var/db/terrapi-vault/unseal.pass | praudit
+#   auditreduce -m AUE_OPEN_R /var/db/terrapi-vault/store.sqlcipher | praudit
+#
+# The broker emits its own canonical B3 audit (source:"vault") for ssh.sign /
+# creds.issue / kms.{wrap,unwrap,rotate} / lease.* / session.* / store.snapshot —
+# that is the app-level trail; this BSM policy is the host-level backstop.
