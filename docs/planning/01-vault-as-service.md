@@ -343,5 +343,12 @@ The chain tip is recovered on restart so appends continue across reboots; `audit
 detects edits, reorders, gaps, and deletions. The broker's `ShippingSink` wraps it (durable
 chain first, best-effort OpenSearch fan-out on top).
 
-**Next:** legacy RethinkDB adapter (same trait) · replay of locally-durable events that
-failed to ship to OpenSearch · graceful shutdown that drains the ship queue.
+**Shipping = chain-tailing + replay + drain — DONE:** the shipper no longer uses an
+in-memory channel; it **tails the durable hash chain** from a persisted byte cursor
+(`<audit>.shipped`), bulk-indexes new events' B3 docs (index from each event's own ts), and
+advances the cursor only on a confirmed ship. So a ship failure / crash / shutdown loses
+nothing — the next tick or process start **replays** the backlog; shutdown does a best-effort
+final flush. Shipping never blocks issuance (reads the durable file out of band).
+
+**Next:** legacy RethinkDB cred adapter (same `CredEngine` trait; needs a live legacy
+instance to integration-test — low priority since RethinkDB is legacy-only).

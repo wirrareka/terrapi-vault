@@ -1,47 +1,38 @@
 //! B3 audit shipping to group-local OpenSearch.
 //!
-//! Vault owns its audit (`source:"vault"`). The durable local JSONL sink is the source of
-//! truth (written synchronously on every emit); shipping to OpenSearch is **best-effort**
-//! and **non-blocking** — `emit` only enqueues, a background task bulk-indexes into
-//! `audit-events-{group}-YYYY.MM`. A ship failure never blocks issuance (the event is
-//! already durable locally).
+//! Vault owns its audit (`source:"vault"`). The durable tamper-evident hash chain
+//! (`HashChainSink`) is the source of truth and the **shipping queue**: a background task
+//! tails the chain file from a persisted byte **cursor**, bulk-indexes the new events'
+//! B3 docs into `audit-events-{group}-YYYY.MM` (per the event's own timestamp), and only
+//! advances the cursor once a batch is confirmed shipped.
 //!
-//! Shipping is enabled by `VAULT_AUDIT_OS_URL` (+ `_USER` / `_PASSWORD`, optional
-//! `_INSECURE_TLS=1`). Absent → local-only. Redaction holds by construction: `AuditEvent`
-//! has no secret field.
+//! This gives durability + replay + drain for free: a ship failure (or crash/shutdown)
+//! leaves the cursor unmoved, so the next tick — or the next process start — re-ships the
+//! backlog. Shipping never blocks issuance (it reads the durable file out of band).
+//!
+//! Enabled by `VAULT_AUDIT_OS_URL` (+ `_USER` / `_PASSWORD`, optional `_INSECURE_TLS=1`).
 
 use crate::config::BrokerConfig;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use vault_transport::audit::{AuditEvent, AuditSink, HashChainSink};
+use std::time::Duration;
+use vault_transport::audit::{AuditSink, HashChainSink};
 
-/// Composite sink: durable tamper-evident local hash chain + optional non-blocking ship queue.
-pub struct ShippingSink {
-    local: HashChainSink,
-    tx: Option<mpsc::UnboundedSender<AuditEvent>>,
-}
-
-impl AuditSink for ShippingSink {
-    fn emit(&self, event: &AuditEvent) {
-        self.local.emit(event); // durable first
-        if let Some(tx) = &self.tx {
-            // best-effort: a closed/backed-up channel must never block the caller
-            let _ = tx.send(event.clone());
-        }
-    }
-}
+/// How often the shipper tails the chain for new records.
+const SHIP_INTERVAL_SECS: u64 = 5;
 
 /// Work handed to the background shipper.
 pub struct ShipTask {
-    rx: mpsc::UnboundedReceiver<AuditEvent>,
     client: reqwest::Client,
     base_url: String,
     user: String,
     password: String,
     group: String,
+    chain_path: PathBuf,
+    cursor_path: PathBuf,
 }
 
-/// OpenSearch shipping config from `VAULT_AUDIT_OS_*`.
 struct ShipConfig {
     base_url: String,
     user: String,
@@ -61,12 +52,12 @@ impl ShipConfig {
     }
 }
 
-/// Build the broker's audit sink and, if shipping is configured, the background ship task.
+/// Build the durable audit sink and, if shipping is configured, the background ship task.
 #[must_use]
 pub fn build(cfg: &BrokerConfig) -> (Arc<dyn AuditSink>, Option<ShipTask>) {
-    let local = HashChainSink::new(cfg.audit_path.clone());
+    let sink: Arc<dyn AuditSink> = Arc::new(HashChainSink::new(cfg.audit_path.clone()));
     let Some(ship) = ShipConfig::from_env() else {
-        return (Arc::new(ShippingSink { local, tx: None }), None);
+        return (sink, None);
     };
     let client = match reqwest::Client::builder()
         .danger_accept_invalid_certs(ship.insecure)
@@ -75,74 +66,160 @@ pub fn build(cfg: &BrokerConfig) -> (Arc<dyn AuditSink>, Option<ShipTask>) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("vault-broker: audit shipper DISABLED (http client: {e})");
-            return (Arc::new(ShippingSink { local, tx: None }), None);
+            return (sink, None);
         }
     };
-    let (tx, rx) = mpsc::unbounded_channel();
+    let mut cursor_path = cfg.audit_path.clone();
+    cursor_path.set_extension("shipped");
+    eprintln!("vault-broker: audit shipping to OpenSearch enabled (tails the durable chain)");
     let task = ShipTask {
-        rx,
         client,
         base_url: ship.base_url,
         user: ship.user,
         password: ship.password,
         group: cfg.residency_group.as_str().to_owned(),
+        chain_path: cfg.audit_path.clone(),
+        cursor_path,
     };
-    eprintln!("vault-broker: audit shipping to OpenSearch enabled");
-    (Arc::new(ShippingSink { local, tx: Some(tx) }), Some(task))
+    (sink, Some(task))
 }
 
-/// Drain the queue and bulk-index batches to OpenSearch until the broker shuts down.
-pub async fn run(mut task: ShipTask) {
-    while let Some(first) = task.rx.recv().await {
-        let mut batch = vec![first];
-        while let Ok(ev) = task.rx.try_recv() {
-            batch.push(ev);
-            if batch.len() >= 500 {
-                break;
+/// Tail the chain and ship new records every `SHIP_INTERVAL_SECS`, with a final flush on
+/// shutdown. The persisted cursor makes a missed flush harmless (replayed next start).
+pub async fn run(task: ShipTask) {
+    let mut tick = tokio::time::interval(Duration::from_secs(SHIP_INTERVAL_SECS));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut shutdown = Box::pin(tokio::signal::ctrl_c());
+    loop {
+        tokio::select! {
+            _ = tick.tick() => ship_backlog(&task).await,
+            _ = &mut shutdown => {
+                ship_backlog(&task).await; // best-effort drain
+                return;
             }
-        }
-        let index = monthly_index(&task.group);
-        if let Err(e) = ship_events(
-            &task.client,
-            &task.base_url,
-            &task.user,
-            &task.password,
-            &index,
-            &batch,
-        )
-        .await
-        {
-            // Best-effort: the events remain in the durable local JSONL.
-            eprintln!("vault-broker: audit ship failed ({} events): {e}", batch.len());
         }
     }
 }
 
-/// `audit-events-{group}-YYYY.MM` for the current UTC month.
-fn monthly_index(group: &str) -> String {
-    let now = time::OffsetDateTime::now_utc();
-    format!("audit-events-{group}-{:04}.{:02}", now.year(), u8::from(now.month()))
+/// Ship every chain record past the cursor; advance the cursor only on success.
+async fn ship_backlog(task: &ShipTask) {
+    let from = read_cursor(&task.cursor_path);
+    let Some((items, new_offset)) = read_new_records(&task.chain_path, from, &task.group) else {
+        return;
+    };
+    if items.is_empty() {
+        return;
+    }
+    let n = items.len();
+    match bulk_ship(&task.client, &task.base_url, &task.user, &task.password, &items).await {
+        Ok(()) => write_cursor(&task.cursor_path, new_offset),
+        Err(e) => eprintln!("vault-broker: audit ship failed ({n} events): {e}"),
+    }
 }
 
-/// Bulk-index `events` into `index` via the OpenSearch `_bulk` NDJSON API.
+/// Read complete chain lines after byte `from`; return `(index, event_json)` per record and
+/// the new cursor offset (bytes up to and including the last complete line).
+fn read_new_records(
+    chain_path: &PathBuf,
+    from: u64,
+    group: &str,
+) -> Option<(Vec<(String, String)>, u64)> {
+    let mut f = std::fs::File::open(chain_path).ok()?;
+    let len = f.metadata().ok()?.len();
+    // File rotated/truncated below the cursor → re-ship from the start.
+    let from = if from > len { 0 } else { from };
+    f.seek(SeekFrom::Start(from)).ok()?;
+    let mut buf = String::new();
+    f.read_to_string(&mut buf).ok()?;
+    Some(collect_backlog(&buf, from, group))
+}
+
+/// Pure backlog parse: split complete (newline-terminated) lines, extract each record's
+/// event + its target index, and compute the new absolute cursor offset.
+fn collect_backlog(buf: &str, from: u64, group: &str) -> (Vec<(String, String)>, u64) {
+    let mut items = Vec::new();
+    let mut consumed = 0usize; // bytes of complete lines within buf
+    for line in buf.split_inclusive('\n') {
+        if !line.ends_with('\n') {
+            break; // trailing partial line (mid-write) — stop, ship it next time
+        }
+        consumed += line.len();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((index, event)) = record_to_index_and_event(trimmed, group) {
+            items.push((index, event));
+        }
+    }
+    (items, from + consumed as u64)
+}
+
+/// Extract the shippable `(index, event_json)` from one chain line. The OpenSearch doc is
+/// the inner B3 `event` (not the chain envelope); the index is derived from the event ts.
+fn record_to_index_and_event(line: &str, group: &str) -> Option<(String, String)> {
+    #[derive(serde::Deserialize)]
+    struct Rec {
+        event: Box<serde_json::value::RawValue>,
+    }
+    #[derive(serde::Deserialize)]
+    struct TsOnly {
+        ts: String,
+    }
+    let rec: Rec = serde_json::from_str(line).ok()?;
+    let event_json = rec.event.get().to_owned();
+    let ts: TsOnly = serde_json::from_str(&event_json).ok()?;
+    Some((index_for(group, &ts.ts), event_json))
+}
+
+/// `audit-events-{group}-YYYY.MM` from an RFC3339 ts (`YYYY-MM-...`). Falls back to a
+/// no-date index if the ts is malformed (should not happen).
+fn index_for(group: &str, ts: &str) -> String {
+    let ym = if ts.len() >= 7 && ts.as_bytes()[4] == b'-' {
+        format!("{}.{}", &ts[0..4], &ts[5..7])
+    } else {
+        "unknown".to_string()
+    };
+    format!("audit-events-{group}-{ym}")
+}
+
+fn read_cursor(path: &PathBuf) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn write_cursor(path: &PathBuf, offset: u64) {
+    if std::fs::write(path, offset.to_string()).is_ok() {
+        restrict(path);
+    }
+}
+
+#[cfg(unix)]
+fn restrict(path: &PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+#[cfg(not(unix))]
+fn restrict(_path: &PathBuf) {}
+
+/// Bulk-index `(index, event_json)` items via the OpenSearch `_bulk` NDJSON API.
 ///
 /// # Errors
-/// Returns a message if the request fails or the cluster reports a non-success status.
-async fn ship_events(
+/// A request failure or a non-success cluster status.
+async fn bulk_ship(
     client: &reqwest::Client,
     base_url: &str,
     user: &str,
     password: &str,
-    index: &str,
-    events: &[AuditEvent],
+    items: &[(String, String)],
 ) -> Result<(), String> {
-    let mut body = String::with_capacity(events.len() * 256);
-    let action = format!("{{\"index\":{{\"_index\":\"{index}\"}}}}\n");
-    for ev in events {
-        let doc = serde_json::to_string(ev).map_err(|e| e.to_string())?;
-        body.push_str(&action);
-        body.push_str(&doc);
-        body.push('\n');
+    use std::fmt::Write as _;
+    let mut body = String::with_capacity(items.len() * 256);
+    for (index, event) in items {
+        let _ = writeln!(body, "{{\"index\":{{\"_index\":\"{index}\"}}}}");
+        let _ = writeln!(body, "{event}");
     }
     let resp = client
         .post(format!("{base_url}/_bulk"))
@@ -163,40 +240,45 @@ async fn ship_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vault_transport::audit::{Actor, ActorKind, Outcome, Target};
 
-    fn sample(action: &str) -> AuditEvent {
-        AuditEvent::vault(
-            "2026-05-27T10:00:00.000Z".into(),
-            "vault-eu-1".into(),
-            Some("eu".into()),
-            Actor {
-                label: "vault-sweeper".into(),
-                kind: ActorKind::System,
-                id: Some("sweeper".into()),
-                tenant: None,
-            },
-            action,
-            Target { kind: "lease".into(), id: Some("id-1".into()) },
-            Outcome::Success,
-            None,
-        )
+    #[test]
+    fn index_for_derives_year_month() {
+        assert_eq!(index_for("eu", "2026-05-27T10:00:00.000Z"), "audit-events-eu-2026.05");
+        assert_eq!(index_for("uae", "2026-12-01T00:00:00Z"), "audit-events-uae-2026.12");
     }
 
     #[test]
-    fn monthly_index_shape() {
-        let idx = monthly_index("eu");
-        assert!(idx.starts_with("audit-events-eu-"));
-        // audit-events-eu-YYYY.MM
-        let date = idx.rsplit('-').next().unwrap();
-        assert_eq!(date.len(), 7);
-        assert_eq!(&date[4..5], ".");
+    fn collect_backlog_ships_complete_lines_only() {
+        // two complete chain records + a trailing partial line
+        let l1 = r#"{"seq":0,"prev":"00","hash":"aa","event":{"ts":"2026-05-01T00:00:00Z","action":"a"}}"#;
+        let l2 = r#"{"seq":1,"prev":"aa","hash":"bb","event":{"ts":"2026-06-02T00:00:00Z","action":"b"}}"#;
+        let partial = r#"{"seq":2,"prev":"bb""#; // no newline → not yet complete
+        let buf = format!("{l1}\n{l2}\n{partial}");
+        let (items, consumed) = collect_backlog(&buf, 100, "eu");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].0, "audit-events-eu-2026.05");
+        assert_eq!(items[1].0, "audit-events-eu-2026.06");
+        // consumed counts only the two newline-terminated lines, offset is absolute
+        assert_eq!(consumed, 100 + (l1.len() + 1 + l2.len() + 1) as u64);
+        // the shipped doc is the inner event, not the chain envelope
+        assert!(items[0].1.contains("\"action\":\"a\""));
+        assert!(!items[0].1.contains("\"seq\""));
     }
 
-    /// Integration test: ship to a live OpenSearch and read the docs back. Skipped unless
+    #[test]
+    fn cursor_roundtrip() {
+        let p = std::env::temp_dir().join(format!("vault-ship-cursor-{}.shipped", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(read_cursor(&p), 0); // missing → 0
+        write_cursor(&p, 4096);
+        assert_eq!(read_cursor(&p), 4096);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Integration test: ship into a live OpenSearch and read the docs back. Skipped unless
     /// `VAULT_AUDIT_OS_TEST_URL` is set (docs/dev/opensearch-it.md for the docker cluster).
     #[tokio::test]
-    async fn ships_events_into_an_index() {
+    async fn bulk_ships_events_into_an_index() {
         let Ok(url) = std::env::var("VAULT_AUDIT_OS_TEST_URL") else {
             eprintln!("skipping: VAULT_AUDIT_OS_TEST_URL unset");
             return;
@@ -204,46 +286,19 @@ mod tests {
         let user = std::env::var("VAULT_AUDIT_OS_TEST_USER").unwrap_or_else(|_| "admin".into());
         let pass = std::env::var("VAULT_AUDIT_OS_TEST_PASSWORD").expect("VAULT_AUDIT_OS_TEST_PASSWORD");
         let base = url.trim_end_matches('/').to_string();
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap();
+        let client = reqwest::Client::builder().danger_accept_invalid_certs(true).build().unwrap();
         let index = format!("audit-events-it-{}", std::process::id());
-
-        ship_events(
-            &client,
-            &base,
-            &user,
-            &pass,
-            &index,
-            &[sample("lease.expire"), sample("creds.revoke")],
-        )
-        .await
-        .unwrap();
-
-        // refresh so the docs are searchable, then count
-        client
-            .post(format!("{base}/{index}/_refresh"))
-            .basic_auth(&user, Some(&pass))
-            .send()
-            .await
-            .unwrap();
+        let items = vec![
+            (index.clone(), r#"{"ts":"2026-05-27T00:00:00Z","action":"lease.expire"}"#.to_string()),
+            (index.clone(), r#"{"ts":"2026-05-27T00:00:01Z","action":"creds.revoke"}"#.to_string()),
+        ];
+        bulk_ship(&client, &base, &user, &pass, &items).await.unwrap();
+        client.post(format!("{base}/{index}/_refresh")).basic_auth(&user, Some(&pass)).send().await.unwrap();
         let count: serde_json::Value = client
             .get(format!("{base}/{index}/_count"))
             .basic_auth(&user, Some(&pass))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+            .send().await.unwrap().json().await.unwrap();
         assert_eq!(count["count"], 2);
-
-        // cleanup
-        let _ = client
-            .delete(format!("{base}/{index}"))
-            .basic_auth(&user, Some(&pass))
-            .send()
-            .await;
+        let _ = client.delete(format!("{base}/{index}")).basic_auth(&user, Some(&pass)).send().await;
     }
 }
