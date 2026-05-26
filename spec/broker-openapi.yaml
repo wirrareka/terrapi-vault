@@ -1,83 +1,182 @@
 # terrapi-vault broker — v1 API (Path A). SOURCE OF TRUTH for the "Secrets broker"
 # contract (coordination/CONTRACTS.md points here). Demon-confirmed params 2026-05-26.
 #
-# Status of operations:
-#   implemented: /healthz, /v1/sys/session (open/end), /v1/sys/leases/{renew,revoke}
-#   stub (501, shape fixed): /v1/{group}/ssh/{ca,sign}, /v1/{group}/{tenant_id}/creds/{role}
+# Implementation status is tracked per-operation via `x-implementation-status`:
+#   implemented : /healthz, /v1/sys/seal-status, /v1/sys/session (open/end),
+#                 /v1/sys/leases/{renew,revoke}
+#   stub        : /v1/{group}/ssh/{ca,sign}, /v1/{group}/{tenant_id}/creds/{role}
+#                 (return 501; request/response shape is FROZEN and safe to build clients against)
 openapi: 3.1.0
 info:
   title: terrapi-vault broker
-  version: "1.0.0-skeleton"
+  version: "1.0.0"
+  summary: Network secrets broker for the proximi.io platform (one instance per residency group).
   description: |
-    Network secrets broker for the proximi.io platform. One instance per residency
-    group (eu/uae); the group is a per-instance constant and a request to another
-    group's path returns 404 (residency air-gap). Auth = mTLS over WireGuard, client
-    cert signed by the fleet Root CA (SAN → role). The broker emits its own B3 audit
-    events (source:"vault"); consumers do not double-record.
+    Network secrets broker for the proximi.io platform. **One instance per residency
+    group** (`eu`/`uae`); `group` is a per-instance constant and a request addressed to
+    another group's path returns `404` (residency air-gap — there is no cross-group route).
+
+    **Auth.** mutual TLS over WireGuard, client cert signed by the fleet Root CA; the
+    cert SAN maps to a registered service role (no bearer tokens / AppRole). The listener
+    is reachable only on the WG mesh.
+
+    **Namespace.** Leased service-admin creds live under `<group>/<tenant_id>/<role>`,
+    where `tenant_id` is the Vulture `organization_id` (lowercase UUIDv4). Host/operator
+    SSH CA material is **group-scoped**, not tenant-scoped.
+
+    **Leases & sessions.** Every issued credential is a lease with a parent. Opening a
+    session (`POST /v1/sys/session`) makes subsequently-issued leases its children; ending
+    the session (or its TTL/idle timeout) cascade-revokes every child — this is
+    "creds die when the operator session ends".
+
+    **Audit (vault owns it).** Every mutating operation emits a canonical B3 audit event
+    with `source:"vault"` to group-local OpenSearch (`audit-events-{group}-YYYY.MM`),
+    durably hash-chained locally first then best-effort shipped — a ship failure never
+    blocks issuance. Events are **redacted at the emitter**: never keys/passwords/certs,
+    metadata only (`action`, `lease_id`, `role`, `tenant`, `ttl`, `serial`, `principals`,
+    `outcome`). Consumers (e.g. demon) do **not** double-record as `source:"control-plane"`.
+    The emitted `action` for each mutating operation is given by its `x-audit-action`.
+
+    **Seal state.** The broker boots sealed; its master key is unsealed by an operator
+    passphrase (FreeBSD, no TPM). While sealed, mutating operations return `503`. Poll
+    `GET /v1/sys/seal-status` for readiness.
+  contact: { name: terrapi-vault (vault), url: "https://github.com/terrapi/terrapi-vault" }
+  license: { name: MIT OR Apache-2.0 }
 servers:
   - url: https://vault-{group}.internal:8200
     description: WG-only, mTLS. {group} = eu|uae.
     variables:
       group: { enum: [eu, uae], default: eu }
 
+tags:
+  - { name: system, description: Liveness, seal state, sessions, and lease lifecycle. }
+  - { name: ssh, description: SSH signed-certificate CA (group-scoped). }
+  - { name: creds, description: Leased, ephemeral service-admin credentials (tenant-scoped). }
+
+security:
+  - mtlsWireGuard: []
+
 components:
   securitySchemes:
     mtlsWireGuard:
       type: mutualTLS
       description: Client cert signed by fleet Root CA; SAN maps to a broker role. WG-only.
+
+  parameters:
+    GroupParam:
+      name: group
+      in: path
+      required: true
+      description: Residency group. Must equal this instance's constant or the request 404s.
+      schema: { type: string, enum: [eu, uae] }
+    TenantIdParam:
+      name: tenant_id
+      in: path
+      required: true
+      description: Vulture organization_id, lowercase UUIDv4. Not provisioned in this group → 404.
+      schema:
+        type: string
+        format: uuid
+        pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    RoleParam:
+      name: role
+      in: path
+      required: true
+      description: Backend role; maps to an engine + privilege template in broker config.
+      schema: { $ref: "#/components/schemas/RoleName" }
+
   schemas:
     Error:
       type: object
       required: [error, detail]
       properties:
-        error: { type: string }
-        detail: { type: string }
+        error: { type: string, description: machine-readable code, e.g. group_mismatch, sealed, not_renewable }
+        detail: { type: string, description: human-readable explanation (no secret material) }
+      examples:
+        - { error: group_mismatch, detail: "this broker serves group 'eu'" }
+
+    RoleName:
+      type: string
+      description: |
+        v1 backend roles (demon-confirmed 2026-05-26). The set is extensible via broker
+        config; clients must treat unknown roles as a `404`. RethinkDB is the stack's
+        primary datastore (proximiio-sync); Postgres only if a service later introduces it.
+      examples: [os-audit-writer, os-metrics-reader, rethinkdb-admin]
+
+    Lease:
+      type: object
+      description: Common lease envelope shared by every issued credential.
+      required: [lease_id, ttl_secs, renewable, max_ttl_secs]
+      properties:
+        lease_id: { type: string, description: opaque; child of the active session lease if one is open }
+        ttl_secs: { type: integer, minimum: 1, description: current remaining lifetime }
+        renewable: { type: boolean }
+        max_ttl_secs: { type: integer, description: hard ceiling = remaining session lifetime }
+
     SshSignRequest:
       type: object
-      required: [public_key, cert_type, principals, ttl_secs]
+      required: [public_key, cert_type, principals]
       properties:
-        public_key: { type: string, description: OpenSSH public key to sign }
-        cert_type: { type: string, enum: [user, host] }
-        principals: { type: array, items: { type: string } }
+        public_key: { type: string, description: OpenSSH public key to sign (e.g. "ssh-ed25519 AAAA…") }
+        cert_type:
+          type: string
+          enum: [user, host]
+          description: "host certs are group-scoped (tenant_id must be null); user certs may be tenant-scoped."
+        principals:
+          type: array
+          minItems: 1
+          items: { type: string }
+          description: usernames (cert_type=user) or hostnames (cert_type=host)
         ttl_secs:
-          type: integer
-          description: 900 interactive / 300 automated (and per touch-per-op). Capped to remaining session.
-        extensions: { type: object, additionalProperties: true }
+          type: [integer, "null"]
+          description: >
+            Default 900 (interactive) / 300 (automated & touch-per-op). Clamped to remaining
+            session lifetime. Null → server default for the request context.
+        extensions:
+          type: object
+          additionalProperties: true
+          description: SSH cert extensions (e.g. permit-pty); omitted → CA policy default.
         tenant_id:
           type: [string, "null"]
-          description: lowercase UUIDv4 (Vulture organization_id); null for group-scope host certs.
+          description: lowercase UUIDv4 (Vulture organization_id); MUST be null for cert_type=host.
+      examples:
+        - { public_key: "ssh-ed25519 AAAAC3Nza…", cert_type: user, principals: [ops], ttl_secs: 900, tenant_id: "3f1a9c2e-7b44-4d1e-9a2b-1c0d5e6f7a8b" }
     SshSignResponse:
       type: object
       required: [signed_certificate, serial, valid_before, lease_id]
       properties:
-        signed_certificate: { type: string }
-        serial: { type: integer }
+        signed_certificate: { type: string, description: OpenSSH certificate (e.g. "ssh-ed25519-cert-v01@openssh.com AAAA…") }
+        serial: { type: integer, format: int64, description: u64 cert serial; revocation key for the KRL }
+        valid_after: { type: [string, "null"], format: date-time }
         valid_before: { type: string, format: date-time }
         lease_id: { type: string }
+
     SshCaResponse:
       type: object
       required: [ca_public_key]
       properties:
-        ca_public_key: { type: string, description: trust anchor; group-scoped host CA }
+        ca_public_key: { type: string, description: trust anchor (TrustedUserCAKeys / known host CA); group-scoped }
+
     CredsRequest:
       type: object
       properties:
-        ttl_secs: { type: [integer, "null"] }
+        ttl_secs: { type: [integer, "null"], description: requested TTL; null → role default. Clamped to remaining session. }
+      examples:
+        - { ttl_secs: 900 }
     CredsResponse:
-      type: object
-      required: [username, password, lease_id, ttl_secs, renewable, max_ttl_secs]
-      properties:
-        username: { type: string }
-        password: { type: string }
-        lease_id: { type: string }
-        ttl_secs: { type: integer }
-        renewable: { type: boolean }
-        max_ttl_secs: { type: integer }
+      allOf:
+        - $ref: "#/components/schemas/Lease"
+        - type: object
+          required: [username, password]
+          properties:
+            username: { type: string, description: ephemeral backend user, created on issue, deleted on revoke/expiry }
+            password: { type: string, description: generated secret — NEVER logged or audited }
+
     SessionOpenRequest:
       type: object
       properties:
-        ttl_secs: { type: [integer, "null"], description: "default 28800 (8h hard cap)" }
-        idle_timeout_secs: { type: [integer, "null"], description: "default 1800 (30m)" }
+        ttl_secs: { type: [integer, "null"], description: "hard cap; default 28800 (8h)" }
+        idle_timeout_secs: { type: [integer, "null"], description: "default 1800 (30m); idle past this cascade-revokes" }
     SessionOpenResponse:
       type: object
       required: [session_id, ttl_secs, idle_timeout_secs]
@@ -94,18 +193,26 @@ components:
           type: array
           items: { type: string }
           description: child leases cascade-revoked by ending the session
+
+    SealStatus:
+      type: object
+      required: [sealed]
+      properties:
+        sealed: { type: boolean, description: true until an operator unseals; mutating ops 503 while true }
+        version: { type: [string, "null"], description: broker build version }
+
     LeaseRenewRequest:
       type: object
       required: [lease_id, increment_secs]
       properties:
         lease_id: { type: string }
-        increment_secs: { type: integer }
+        increment_secs: { type: integer, minimum: 1, description: requested extension; result clamped to max_ttl }
     LeaseRenewResponse:
       type: object
       required: [lease_id, ttl_secs]
       properties:
         lease_id: { type: string }
-        ttl_secs: { type: integer, description: clamped to max_ttl = remaining session }
+        ttl_secs: { type: integer, description: new remaining TTL, clamped to max_ttl = remaining session }
     LeaseRevokeRequest:
       type: object
       required: [lease_id]
@@ -115,77 +222,148 @@ components:
       required: [ok]
       properties: { ok: { type: boolean } }
 
-security:
-  - mtlsWireGuard: []
+  responses:
+    Unauthorized:
+      description: missing / invalid client cert (mTLS not satisfied)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Forbidden:
+      description: cert SAN role not permitted for this operation
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    GroupMismatch:
+      description: group does not match this instance (residency air-gap)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Conflict:
+      description: lease/session not renewable, already revoked, or unknown
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Sealed:
+      description: broker is sealed (master key not unsealed); retry after unseal
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    NotImplemented:
+      description: operation stubbed in this build (shape is frozen)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
 
 paths:
   /healthz:
     get:
-      summary: Liveness (unauthenticated)
+      tags: [system]
+      operationId: healthz
+      summary: Liveness (unauthenticated).
       security: []
+      x-implementation-status: implemented
       responses: { "200": { description: ok } }
+
+  /v1/sys/seal-status:
+    get:
+      tags: [system]
+      operationId: sealStatus
+      summary: Report whether the broker is sealed (readiness).
+      security: []
+      x-implementation-status: implemented
+      responses:
+        "200": { description: seal state, content: { application/json: { schema: { $ref: "#/components/schemas/SealStatus" } } } }
 
   /v1/{group}/ssh/ca:
     get:
-      summary: SSH CA public key (trust anchor) — group-scoped host CA. [501 skeleton]
-      parameters: [{ name: group, in: path, required: true, schema: { type: string, enum: [eu, uae] } }]
+      tags: [ssh]
+      operationId: getSshCa
+      summary: SSH CA public key (trust anchor) — group-scoped host CA.
+      x-implementation-status: stub
+      parameters: [{ $ref: "#/components/parameters/GroupParam" }]
       responses:
         "200": { description: CA public key, content: { application/json: { schema: { $ref: "#/components/schemas/SshCaResponse" } } } }
-        "404": { description: group mismatch, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
-        "501": { description: not yet implemented, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/GroupMismatch" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
 
   /v1/{group}/ssh/sign:
     post:
-      summary: Sign an SSH certificate (short-TTL). [501 skeleton]
-      parameters: [{ name: group, in: path, required: true, schema: { type: string, enum: [eu, uae] } }]
+      tags: [ssh]
+      operationId: signSshCert
+      summary: Sign a short-TTL SSH certificate.
+      description: CA private key lives in the broker's at-rest encrypted store and is never exported.
+      x-implementation-status: stub
+      x-audit-action: ssh.sign
+      parameters: [{ $ref: "#/components/parameters/GroupParam" }]
       requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SshSignRequest" } } } }
       responses:
         "200": { description: signed cert + lease, content: { application/json: { schema: { $ref: "#/components/schemas/SshSignResponse" } } } }
-        "404": { description: group mismatch, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
-        "501": { description: not yet implemented, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "400": { description: "malformed key, or cert_type=host with non-null tenant_id", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/GroupMismatch" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+        "503": { $ref: "#/components/responses/Sealed" }
 
   /v1/{group}/{tenant_id}/creds/{role}:
     post:
-      summary: Issue leased service-admin creds (OpenSearch RBAC / RethinkDB). [501 skeleton]
+      tags: [creds]
+      operationId: issueCreds
+      summary: Issue leased, ephemeral service-admin creds (OpenSearch RBAC / RethinkDB).
+      description: Creates an ephemeral backend user on issue; deletes it on revoke/expiry (Vault db-engine semantics).
+      x-implementation-status: stub
+      x-audit-action: creds.issue
       parameters:
-        - { name: group, in: path, required: true, schema: { type: string, enum: [eu, uae] } }
-        - { name: tenant_id, in: path, required: true, schema: { type: string, format: uuid }, description: lowercase UUIDv4 }
-        - { name: role, in: path, required: true, schema: { type: string }, description: "e.g. os-audit-writer, os-metrics-reader, rethinkdb-admin" }
+        - { $ref: "#/components/parameters/GroupParam" }
+        - { $ref: "#/components/parameters/TenantIdParam" }
+        - { $ref: "#/components/parameters/RoleParam" }
       requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/CredsRequest" } } } }
       responses:
         "200": { description: ephemeral creds + lease, content: { application/json: { schema: { $ref: "#/components/schemas/CredsResponse" } } } }
         "400": { description: tenant_id not a lowercase UUIDv4, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
-        "404": { description: group mismatch, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
-        "501": { description: not yet implemented, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: group mismatch, tenant not provisioned in this group, or unknown role, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+        "503": { $ref: "#/components/responses/Sealed" }
 
   /v1/sys/session:
     post:
-      summary: Open an operator session. Leases become its children (cascade-revoked on end).
+      tags: [system]
+      operationId: openSession
+      summary: Open an operator session. Subsequent leases become its children.
+      x-implementation-status: implemented
+      x-audit-action: session.open
       requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/SessionOpenRequest" } } } }
       responses:
         "200": { description: session opened, content: { application/json: { schema: { $ref: "#/components/schemas/SessionOpenResponse" } } } }
-        "401": { description: unauthenticated, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/Sealed" }
 
   /v1/sys/session/{id}:
     delete:
+      tags: [system]
+      operationId: endSession
       summary: End a session → cascade-revoke all child leases (revoke-on-session-end).
+      x-implementation-status: implemented
+      x-audit-action: session.end
       parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
       responses:
         "200": { description: ended + revoked list, content: { application/json: { schema: { $ref: "#/components/schemas/SessionEndResponse" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: no such session, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
 
   /v1/sys/leases/renew:
     post:
+      tags: [system]
+      operationId: renewLease
       summary: Renew a lease (clamped to max_ttl = remaining session).
+      x-implementation-status: implemented
+      x-audit-action: lease.renew
       requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/LeaseRenewRequest" } } } }
       responses:
         "200": { description: new ttl, content: { application/json: { schema: { $ref: "#/components/schemas/LeaseRenewResponse" } } } }
-        "409": { description: not renewable / revoked / unknown, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
 
   /v1/sys/leases/revoke:
     post:
-      summary: Revoke a single lease.
+      tags: [system]
+      operationId: revokeLease
+      summary: Revoke a single lease (tears down its backend user / KRL-revokes its cert serial).
+      x-implementation-status: implemented
+      x-audit-action: lease.revoke
       requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/LeaseRevokeRequest" } } } }
       responses:
         "200": { description: revoked, content: { application/json: { schema: { $ref: "#/components/schemas/Ack" } } } }
-        "409": { description: already revoked / unknown, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
