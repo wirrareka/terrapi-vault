@@ -362,7 +362,19 @@ session-bound. `POST …/kms/{key_id}/wrap` `{dek}` → `{wrapped,kek_id}` and `
 `{wrapped}` → `{dek}` (AES-256-GCM envelope; cap `kms`, aether-backup principal). For
 aether fleet-mode backup keys; preserves their zero-knowledge model (KEK never leaves).
 
-**Next:** the broker is feature-complete for the planned scope (SSH-CA, OpenSearch creds,
-KMS wrap/unwrap, expiry, audit chain + shipping, mTLS + role authz). Future, when
-prioritized: additional `CredEngine` adapters for any *modern* datastore that needs
-brokered creds (RethinkDB is out); broker-master-key KMS-wrap for unattended unseal.
+**Hardening round — DONE (B gaps):**
+- **SSH revocation tracking** — revoking/expiring an ssh-cert lease records its serial in
+  the store; `GET /v1/{group}/ssh/revoked` lists serials (build an sshd KRL at deploy).
+  (Short-TTL certs mostly self-expire; binary-KRL distribution stays a deploy concern.)
+- **KMS KEK rotation** — `POST …/kms/{key_id}/rotate` (versioned KEKs; old blobs carry a
+  version prefix and keep unwrapping; new wraps use the latest).
+- **Store snapshot** — `POST /v1/sys/store-snapshot` (online `VACUUM INTO`, ciphertext;
+  for aether Ask 2), cap `snapshot`.
+- **Metrics** — `127.0.0.1:8201/metrics` Prometheus text (per-action audit counters +
+  `vault_sealed` gauge), loopback-only.
+- **Unattended unseal** — `VAULT_UNSEAL_PASSPHRASE_FILE` (mode-600 fallback). Full
+  broker-master-key KMS-wrap stays deferred (needs a per-group KMS that doesn't exist yet).
+
+**Next:** additional `CredEngine` adapters for any *modern* datastore that needs brokered
+creds (RethinkDB is out); broker-master-key KMS-wrap for unattended unseal once a KMS
+exists; FreeBSD deploy (rc.d) on EU `medina`; `vault-sync` (Svet B).

@@ -48,6 +48,12 @@ pub struct SshCaResponse {
     pub ca_public_key: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct SshRevokedResponse {
+    /// Revoked cert serials (ascending). Build an sshd KRL from these (`ssh-keygen -k`).
+    pub revoked_serials: Vec<u64>,
+}
+
 // --- Leased service-admin creds -------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +145,25 @@ pub struct KmsUnwrapRequest {
 pub struct KmsUnwrapResponse {
     /// Base64 plaintext data-encryption key.
     pub dek: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KmsRotateResponse {
+    pub kek_id: String,
+    /// New current KEK version; existing wrapped blobs keep unwrapping under their version.
+    pub version: u32,
+}
+
+// --- System: store snapshot (aether fleet backup) -------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct StoreSnapshotResponse {
+    /// Path of the consistent at-rest snapshot (SQLCipher ciphertext, same key as the store).
+    pub snapshot_path: String,
+    /// Path of the plaintext meta sidecar (salt + KDF params, no secret) — back this up too.
+    pub meta_path: String,
+    pub sha256: String,
+    pub bytes: u64,
 }
 
 // --- System: seal state ---------------------------------------------------------

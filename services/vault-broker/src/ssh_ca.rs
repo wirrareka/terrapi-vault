@@ -165,6 +165,57 @@ impl SshCa {
     }
 }
 
+/// Record `serials` as revoked (idempotent). Serials are stored bit-exact (u64↔i64).
+/// Short-TTL certs mostly self-expire; this list lets a host build an sshd KRL
+/// (`ssh-keygen -k`) for belt-and-suspenders revocation. CA-scoped (one CA per group).
+///
+/// # Errors
+/// `Store` on a DB error.
+pub fn record_revoked(vault: &Vault, serials: &[u64], now_ts: &str) -> Result<(), CaError> {
+    vault
+        .with_connection(|c| {
+            c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS ssh_revoked (serial INTEGER PRIMARY KEY, revoked_at TEXT NOT NULL);",
+            )
+        })
+        .map_err(|e| CaError::Store(e.to_string()))?;
+    for s in serials {
+        #[allow(clippy::cast_possible_wrap)]
+        let signed = *s as i64;
+        vault
+            .with_connection(|c| {
+                c.execute(
+                    "INSERT OR IGNORE INTO ssh_revoked (serial, revoked_at) VALUES (?1, ?2)",
+                    rusqlite::params![signed, now_ts],
+                )
+            })
+            .map_err(|e| CaError::Store(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// List revoked cert serials (ascending).
+///
+/// # Errors
+/// `Store` on a DB error.
+pub fn list_revoked(vault: &Vault) -> Result<Vec<u64>, CaError> {
+    vault
+        .with_connection(|c| {
+            c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS ssh_revoked (serial INTEGER PRIMARY KEY, revoked_at TEXT NOT NULL);",
+            )
+        })
+        .map_err(|e| CaError::Store(e.to_string()))?;
+    vault
+        .with_connection(|c| {
+            let mut stmt = c.prepare("SELECT serial FROM ssh_revoked ORDER BY serial")?;
+            let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+            #[allow(clippy::cast_sign_loss)]
+            rows.map(|r| r.map(|v| v as u64)).collect::<rusqlite::Result<Vec<u64>>>()
+        })
+        .map_err(|e| CaError::Store(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -17,6 +17,9 @@ pub struct BrokerConfig {
     /// At-rest encrypted store (SQLCipher DB) holding the SSH CA key (and, later, the
     /// lease ledger). Created on first unseal; opened with the operator passphrase. See `seal`.
     pub store_path: PathBuf,
+    /// Directory where `store-snapshot` writes consistent at-rest snapshots (for aether
+    /// fleet backup). Defaults next to the store.
+    pub snapshot_dir: PathBuf,
     /// Registered principals: cert SAN (dNSName) → {role, capabilities}. Loaded from the
     /// JSON roles config (`VAULT_ROLES_CONFIG`). Empty when unset → in production every
     /// cert is trusted-but-unauthorised (`403`); in dev an unmapped SAN is `dev` (all caps).
@@ -64,6 +67,10 @@ impl BrokerConfig {
             |_| std::env::temp_dir().join("vault-broker-store.sqlcipher"),
             PathBuf::from,
         );
+        let snapshot_dir = std::env::var("VAULT_SNAPSHOT_DIR").map_or_else(
+            |_| std::env::temp_dir(),
+            PathBuf::from,
+        );
         let allow_insecure_dev = std::env::var("VAULT_ALLOW_INSECURE_DEV").as_deref() == Ok("1");
         let tls = match (
             std::env::var("VAULT_TLS_CERT"),
@@ -84,6 +91,7 @@ impl BrokerConfig {
             node,
             audit_path,
             store_path,
+            snapshot_dir,
             roles,
             allow_insecure_dev,
             tls,

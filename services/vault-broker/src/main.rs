@@ -41,13 +41,11 @@ fn boot_unseal(cfg: &BrokerConfig) -> Option<Unsealed> {
     let store = if cfg.allow_insecure_dev {
         seal::unseal_dev()
     } else {
-        match std::env::var("VAULT_UNSEAL_PASSPHRASE") {
-            Ok(p) if !p.is_empty() => seal::unseal(&cfg.store_path, &p, KdfParams::default()),
-            _ => {
-                eprintln!("vault-broker: no VAULT_UNSEAL_PASSPHRASE; starting SEALED");
-                return None;
-            }
-        }
+        let Some(p) = unseal_passphrase() else {
+            eprintln!("vault-broker: no VAULT_UNSEAL_PASSPHRASE[_FILE]; starting SEALED");
+            return None;
+        };
+        seal::unseal(&cfg.store_path, &p, KdfParams::default())
     };
     let store = match store {
         Ok(v) => v,
@@ -57,6 +55,26 @@ fn boot_unseal(cfg: &BrokerConfig) -> Option<Unsealed> {
         }
     };
     load_ca(store, cfg.residency_group.as_str())
+}
+
+/// The operator unseal passphrase, from `VAULT_UNSEAL_PASSPHRASE` or, for unattended
+/// restart, a `mode 600` file at `VAULT_UNSEAL_PASSPHRASE_FILE` (on a ZFS-encrypted
+/// dataset — see docs/broker-bootstrap.md). Env wins; trailing whitespace is trimmed.
+fn unseal_passphrase() -> Option<String> {
+    if let Ok(p) = std::env::var("VAULT_UNSEAL_PASSPHRASE") {
+        if !p.is_empty() {
+            return Some(p);
+        }
+    }
+    let path = std::env::var("VAULT_UNSEAL_PASSPHRASE_FILE").ok()?;
+    match std::fs::read_to_string(&path) {
+        Ok(s) if !s.trim().is_empty() => Some(s.trim_end_matches(['\n', '\r']).to_owned()),
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("vault-broker: VAULT_UNSEAL_PASSPHRASE_FILE read error ({e})");
+            None
+        }
+    }
 }
 
 /// Load (or generate on first run) the SSH CA from the just-opened store.
@@ -109,6 +127,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.clone(),
         std::time::Duration::from_secs(SWEEP_INTERVAL_SECS),
     ));
+
+    // Prometheus metrics on a loopback-only listener (never on the WG/mTLS surface).
+    let metrics_bind =
+        std::env::var("VAULT_METRICS_BIND").unwrap_or_else(|_| "127.0.0.1:8201".to_owned());
+    let metrics_state = state.clone();
+    tokio::spawn(async move {
+        match tokio::net::TcpListener::bind(&metrics_bind).await {
+            Ok(l) => {
+                eprintln!("vault-broker: metrics on http://{metrics_bind}/metrics");
+                let _ = axum::serve(l, http::metrics_router(metrics_state)).await;
+            }
+            Err(e) => eprintln!("vault-broker: metrics listener disabled ({e})"),
+        }
+    });
 
     let app = http::router(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;

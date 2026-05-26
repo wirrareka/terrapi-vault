@@ -5,9 +5,9 @@
 
 use crate::auth::{Capability, Principal};
 use crate::dto::{
-    Ack, CredsRequest, ErrorBody, KmsUnwrapRequest, KmsUnwrapResponse, KmsWrapRequest,
-    KmsWrapResponse, LeaseRenewRequest, LeaseRenewResponse, LeaseRevokeRequest, SealStatus,
-    SessionEndResponse, SessionOpenRequest, SessionOpenResponse, SshSignRequest,
+    Ack, CredsRequest, ErrorBody, KmsRotateResponse, KmsUnwrapRequest, KmsUnwrapResponse,
+    KmsWrapRequest, KmsWrapResponse, LeaseRenewRequest, LeaseRenewResponse, LeaseRevokeRequest,
+    SealStatus, SessionEndResponse, SessionOpenRequest, SessionOpenResponse, SshSignRequest,
 };
 use base64::Engine as _;
 use crate::state::{
@@ -92,12 +92,15 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/v1/sys/seal-status", get(seal_status))
         .route("/v1/{group}/ssh/ca", get(ssh_ca))
+        .route("/v1/{group}/ssh/revoked", get(ssh_revoked))
         .route("/v1/{group}/ssh/sign", post(ssh_sign))
         .route("/v1/{group}/{tenant_id}/creds/{role}", post(creds))
         .route("/v1/{group}/{tenant_id}/kms/{key_id}/wrap", post(kms_wrap))
         .route("/v1/{group}/{tenant_id}/kms/{key_id}/unwrap", post(kms_unwrap))
+        .route("/v1/{group}/{tenant_id}/kms/{key_id}/rotate", post(kms_rotate))
         .route("/v1/sys/session", post(session_open))
         .route("/v1/sys/session/{id}", delete(session_end))
+        .route("/v1/sys/store-snapshot", post(store_snapshot))
         .route("/v1/sys/leases/renew", post(lease_renew))
         .route("/v1/sys/leases/revoke", post(lease_revoke))
         .with_state(state)
@@ -105,6 +108,15 @@ pub fn router(state: AppState) -> Router {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// Loopback-only metrics router (`8201`): Prometheus text, no auth (WG/loopback bound).
+pub fn metrics_router(state: AppState) -> Router {
+    Router::new().route("/metrics", get(metrics)).with_state(state)
+}
+
+async fn metrics(State(state): State<AppState>) -> String {
+    state.metrics.render(state.is_sealed())
 }
 
 /// Readiness probe (unauthenticated): is the master key unsealed yet? Demon polls this
@@ -163,6 +175,24 @@ async fn ssh_ca(
     Ok(Json(crate::dto::SshCaResponse {
         ca_public_key: ca.public_openssh(),
     }))
+}
+
+async fn ssh_revoked(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(group): Path<String>,
+) -> ApiResult<crate::dto::SshRevokedResponse> {
+    require_cap(&principal, Capability::SshCa)?;
+    check_group(&state, &group)?;
+    let Some(store) = state.store.clone() else {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "sealed", "broker is sealed"));
+    };
+    let revoked_serials = {
+        let v = store.lock().expect("store lock");
+        crate::ssh_ca::list_revoked(&v)
+    }
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "store_error", &e.to_string()))?;
+    Ok(Json(crate::dto::SshRevokedResponse { revoked_serials }))
 }
 
 async fn ssh_sign(
@@ -245,6 +275,10 @@ async fn ssh_sign(
         }
     };
 
+    // Remember the serial so revoking/expiring this lease can record it in the CA's
+    // revocation list.
+    state.record_ssh_serial(&lease_id, signed.serial);
+
     state.emit(&AuditEvent::vault(
         AppState::now_ts(),
         state.cfg.node.clone(),
@@ -264,6 +298,71 @@ async fn ssh_sign(
         serial: signed.serial,
         valid_before: rfc3339(signed.valid_before),
         lease_id,
+    }))
+}
+
+async fn store_snapshot(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> ApiResult<crate::dto::StoreSnapshotResponse> {
+    require_cap(&principal, Capability::Snapshot)?;
+    require_unsealed(&state)?;
+    let Some(store) = state.store.clone() else {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "sealed", "broker is sealed"));
+    };
+    if let Err(e) = std::fs::create_dir_all(&state.cfg.snapshot_dir) {
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "store_error", &e.to_string()));
+    }
+    let snap_path = state.cfg.snapshot_dir.join(format!(
+        "vault-store-{}-{}.sqlcipher",
+        state.cfg.residency_group.as_str(),
+        now_unix()
+    ));
+    let snap_str = snap_path.to_string_lossy().to_string();
+
+    // Online, consistent snapshot — SQLCipher copies under the same key (ciphertext).
+    {
+        let v = store.lock().expect("store lock");
+        v.with_connection(|c| c.execute("VACUUM INTO ?1", [snap_str.as_str()]).map(|_| ()))
+    }
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "snapshot_failed", &e.to_string()))?;
+
+    let data = std::fs::read(&snap_path)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "store_error", &e.to_string()))?;
+    let sha256 = {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+        let d = Sha256::digest(&data);
+        let mut s = String::with_capacity(64);
+        for b in d {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    };
+    let bytes = data.len() as u64;
+    let meta_path = terrapi_vault::meta_path_for(&state.cfg.store_path)
+        .to_string_lossy()
+        .to_string();
+
+    state.emit(&AuditEvent::vault(
+        AppState::now_ts(),
+        state.cfg.node.clone(),
+        Some(state.cfg.residency_group.as_str().to_owned()),
+        system_actor(&principal),
+        "store.snapshot",
+        Target {
+            kind: "store".into(),
+            id: Some(snap_str.clone()),
+        },
+        Outcome::Success,
+        None,
+    ));
+
+    Ok(Json(crate::dto::StoreSnapshotResponse {
+        snapshot_path: snap_str,
+        meta_path,
+        sha256,
+        bytes,
     }))
 }
 
@@ -496,6 +595,37 @@ async fn kms_unwrap(
     }))
 }
 
+async fn kms_rotate(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path((group, tenant_id, key_id)): Path<(String, String, String)>,
+) -> ApiResult<KmsRotateResponse> {
+    let store = kms_preflight(&state, &principal, &group, &tenant_id, &key_id)?;
+    let version = {
+        let v = store.lock().expect("store lock");
+        crate::kms::rotate(&v, &group, &tenant_id, &key_id)
+    }
+    .map_err(map_kms_err)?;
+
+    state.emit(&AuditEvent::vault(
+        AppState::now_ts(),
+        state.cfg.node.clone(),
+        Some(state.cfg.residency_group.as_str().to_owned()),
+        system_actor(&principal),
+        "kms.rotate",
+        Target {
+            kind: "kms-kek".into(),
+            id: Some(format!("{group}/{tenant_id}/{key_id}")),
+        },
+        Outcome::Success,
+        None,
+    ));
+    Ok(Json(KmsRotateResponse {
+        kek_id: format!("{group}/{tenant_id}/{key_id}"),
+        version,
+    }))
+}
+
 fn system_actor(principal: &Principal) -> Actor {
     Actor {
         label: principal.san.clone(),
@@ -507,6 +637,21 @@ fn system_actor(principal: &Principal) -> Actor {
 
 /// Delete the backend users owned by `revoked` cred leases and emit a `creds.revoke`
 /// event per torn-down handle. SSH-cert leases (no backend user) are skipped.
+/// Record the SSH cert serials owned by `revoked` leases in the CA revocation list.
+pub(crate) fn record_revoked_ssh(state: &AppState, revoked: &[String]) {
+    let serials = state.take_ssh_serials(revoked);
+    if serials.is_empty() {
+        return;
+    }
+    if let Some(store) = state.store.clone() {
+        let now = AppState::now_ts();
+        let v = store.lock().expect("store lock");
+        if let Err(e) = crate::ssh_ca::record_revoked(&v, &serials, &now) {
+            eprintln!("vault-broker: failed to record revoked SSH serials: {e}");
+        }
+    }
+}
+
 async fn tear_down_creds(state: &AppState, principal: &Principal, revoked: &[String]) {
     let torn = crate::creds::teardown(&state.engines, &state.cred_handles, revoked).await;
     for t in torn {
@@ -574,8 +719,9 @@ async fn session_end(
     };
     state.unbind_session(&id);
     // Cascade-revoke deleted child leases in the engine; now delete any backend users
-    // those cred leases owned.
+    // those cred leases owned + record any SSH cert serials as revoked.
     tear_down_creds(&state, &principal, &revoked).await;
+    record_revoked_ssh(&state, &revoked);
     state.emit(&AuditEvent::vault(
         AppState::now_ts(),
         state.cfg.node.clone(),
@@ -626,8 +772,10 @@ async fn lease_revoke(
         eng.revoke(&lease_id)
             .map_err(|e| err(StatusCode::CONFLICT, "revoke_failed", &e.to_string()))?;
     }
-    // If this lease owned a backend user, delete it (emits its own creds.revoke).
+    // If this lease owned a backend user, delete it (emits its own creds.revoke); if it
+    // owned an SSH cert, record its serial as revoked.
     tear_down_creds(&state, &principal, std::slice::from_ref(&lease_id)).await;
+    record_revoked_ssh(&state, std::slice::from_ref(&lease_id));
     state.emit(&AuditEvent::vault(
         AppState::now_ts(),
         state.cfg.node.clone(),

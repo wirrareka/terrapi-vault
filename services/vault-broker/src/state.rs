@@ -20,6 +20,44 @@ pub struct Unsealed {
     pub ssh_ca: SshCa,
 }
 
+/// Minimal in-process metrics, exposed as Prometheus text on the loopback `8201` listener.
+/// Per-action audit-event counters are bumped at the single `AppState::emit` site, so every
+/// broker action (`ssh.sign`, `creds.issue`, `lease.expire`, …) is counted for free.
+#[derive(Default)]
+pub struct Metrics {
+    events: Mutex<HashMap<String, u64>>,
+}
+
+impl Metrics {
+    fn incr(&self, action: &str) {
+        *self
+            .events
+            .lock()
+            .expect("metrics lock")
+            .entry(action.to_owned())
+            .or_insert(0) += 1;
+    }
+
+    /// Render the Prometheus text exposition for `/metrics`. `sealed` is the live gauge.
+    #[must_use]
+    pub fn render(&self, sealed: bool) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        out.push_str("# HELP vault_sealed 1 if the broker is sealed, 0 if unsealed.\n");
+        out.push_str("# TYPE vault_sealed gauge\n");
+        let _ = writeln!(out, "vault_sealed {}", u8::from(sealed));
+        out.push_str("# HELP vault_audit_events_total B3 audit events emitted, by action.\n");
+        out.push_str("# TYPE vault_audit_events_total counter\n");
+        let events = self.events.lock().expect("metrics lock");
+        let mut actions: Vec<_> = events.iter().collect();
+        actions.sort_by(|a, b| a.0.cmp(b.0));
+        for (action, n) in actions {
+            let _ = writeln!(out, "vault_audit_events_total{{action=\"{action}\"}} {n}");
+        }
+        out
+    }
+}
+
 /// Demon-confirmed defaults (coordination/conventions/secrets-broker.md):
 /// operator session 8 h hard cap, 30 min idle.
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 8 * 60 * 60;
@@ -55,6 +93,11 @@ pub struct AppState {
     /// Backend handles owned by issued cred leases (lease id → {role, username}), so a
     /// revoke / session-cascade can delete the ephemeral backend user.
     pub cred_handles: Arc<Mutex<HashMap<String, CredHandle>>>,
+    /// SSH-cert lease id → cert serial, so a revoke / expiry can record the serial in the
+    /// CA's revocation list.
+    ssh_serials: Arc<Mutex<HashMap<String, u64>>>,
+    /// Process metrics, exposed on the loopback `8201` listener.
+    pub metrics: Arc<Metrics>,
 }
 
 /// Current unix time in seconds — the clock the lease/session engine is driven by.
@@ -128,6 +171,8 @@ impl AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             engines: Arc::new(build_engines(&cfg)),
             cred_handles: Arc::new(Mutex::new(HashMap::new())),
+            ssh_serials: Arc::new(Mutex::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
             cfg: Arc::new(cfg),
         }
     }
@@ -164,6 +209,22 @@ impl AppState {
             .retain(|_, v| v != session_id);
     }
 
+    /// Remember an issued SSH cert's serial against its lease (for later revocation).
+    pub fn record_ssh_serial(&self, lease_id: &str, serial: u64) {
+        self.ssh_serials
+            .lock()
+            .expect("ssh serials lock")
+            .insert(lease_id.to_owned(), serial);
+    }
+
+    /// Take (and forget) the cert serials owned by `lease_ids` — called when those leases
+    /// are revoked/expired, so the serials can be recorded in the CA revocation list.
+    #[must_use]
+    pub fn take_ssh_serials(&self, lease_ids: &[String]) -> Vec<u64> {
+        let mut map = self.ssh_serials.lock().expect("ssh serials lock");
+        lease_ids.iter().filter_map(|id| map.remove(id)).collect()
+    }
+
     /// RFC3339 UTC timestamp for audit events.
     #[must_use]
     pub fn now_ts() -> String {
@@ -174,6 +235,7 @@ impl AppState {
     }
 
     pub fn emit(&self, event: &AuditEvent) {
+        self.metrics.incr(&event.action);
         self.audit.emit(event);
     }
 }

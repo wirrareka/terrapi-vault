@@ -16,6 +16,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use terrapi_vault::{random_salt, rusqlite, Vault};
 
 const NONCE_LEN: usize = 12;
+const VER_LEN: usize = 4; // u32 LE KEK-version prefix on the wrapped blob
 
 #[derive(Debug, thiserror::Error)]
 pub enum KmsError {
@@ -27,16 +28,7 @@ pub enum KmsError {
     Crypto,
 }
 
-/// Load the per-target KEK from the store, generating + persisting one on first use.
-///
-/// # Errors
-/// `Store` on a DB error.
-fn load_or_create_kek(
-    vault: &Vault,
-    group: &str,
-    tenant_id: &str,
-    key_id: &str,
-) -> Result<[u8; 32], KmsError> {
+fn ensure_table(vault: &Vault) -> Result<(), KmsError> {
     vault
         .with_connection(|c| {
             c.execute_batch(
@@ -44,19 +36,77 @@ fn load_or_create_kek(
                     group_name TEXT NOT NULL,
                     tenant_id  TEXT NOT NULL,
                     key_id     TEXT NOT NULL,
+                    version    INTEGER NOT NULL,
                     kek        BLOB NOT NULL,
                     created_at TEXT NOT NULL,
-                    PRIMARY KEY (group_name, tenant_id, key_id)
+                    PRIMARY KEY (group_name, tenant_id, key_id, version)
                 );",
             )
         })
-        .map_err(|e| KmsError::Store(e.to_string()))?;
+        .map_err(|e| KmsError::Store(e.to_string()))
+}
 
-    let existing: Option<Vec<u8>> = vault
+fn gen_kek() -> [u8; 32] {
+    // 32 bytes of OS randomness (two 16-byte CSPRNG draws).
+    let mut kek = [0u8; 32];
+    kek[..16].copy_from_slice(&random_salt());
+    kek[16..].copy_from_slice(&random_salt());
+    kek
+}
+
+fn insert_kek(vault: &Vault, g: &str, t: &str, k: &str, version: u32, kek: &[u8; 32]) -> Result<(), KmsError> {
+    let now = crate::state::AppState::now_ts();
+    vault
+        .with_connection(|c| {
+            c.execute(
+                "INSERT INTO kms_keks (group_name, tenant_id, key_id, version, kek, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![g, t, k, version, &kek[..], now],
+            )
+        })
+        .map_err(|e| KmsError::Store(e.to_string()))?;
+    Ok(())
+}
+
+/// The current (highest) KEK version for a target, creating version 1 on first use.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn current_kek(vault: &Vault, g: &str, t: &str, k: &str) -> Result<(u32, [u8; 32]), KmsError> {
+    ensure_table(vault)?;
+    let found: Option<(u32, Vec<u8>)> = vault
         .with_connection(|c| {
             c.query_row(
-                "SELECT kek FROM kms_keks WHERE group_name=?1 AND tenant_id=?2 AND key_id=?3",
-                rusqlite::params![group, tenant_id, key_id],
+                "SELECT version, kek FROM kms_keks
+                 WHERE group_name=?1 AND tenant_id=?2 AND key_id=?3
+                 ORDER BY version DESC LIMIT 1",
+                rusqlite::params![g, t, k],
+                |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, Vec<u8>>(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })
+        })
+        .map_err(|e| KmsError::Store(e.to_string()))?;
+    if let Some((ver, bytes)) = found {
+        let kek = bytes
+            .try_into()
+            .map_err(|_| KmsError::Store("stored KEK has wrong length".into()))?;
+        return Ok((ver, kek));
+    }
+    let kek = gen_kek();
+    insert_kek(vault, g, t, k, 1, &kek)?;
+    Ok((1, kek))
+}
+
+/// Load a specific KEK version (for unwrapping an older blob).
+fn kek_at(vault: &Vault, g: &str, t: &str, k: &str, version: u32) -> Result<Option<[u8; 32]>, KmsError> {
+    ensure_table(vault)?;
+    let bytes: Option<Vec<u8>> = vault
+        .with_connection(|c| {
+            c.query_row(
+                "SELECT kek FROM kms_keks WHERE group_name=?1 AND tenant_id=?2 AND key_id=?3 AND version=?4",
+                rusqlite::params![g, t, k, i64::from(version)],
                 |r| r.get(0),
             )
             .map(Some)
@@ -66,31 +116,38 @@ fn load_or_create_kek(
             })
         })
         .map_err(|e| KmsError::Store(e.to_string()))?;
-
-    if let Some(bytes) = existing {
-        return bytes
-            .try_into()
-            .map_err(|_| KmsError::Store("stored KEK has wrong length".into()));
+    match bytes {
+        Some(b) => Ok(Some(
+            b.try_into().map_err(|_| KmsError::Store("stored KEK has wrong length".into()))?,
+        )),
+        None => Ok(None),
     }
+}
 
-    // 32 bytes of OS randomness (two 16-byte CSPRNG draws), persisted once.
-    let mut kek = [0u8; 32];
-    kek[..16].copy_from_slice(&random_salt());
-    kek[16..].copy_from_slice(&random_salt());
-    let now = crate::state::AppState::now_ts();
-    vault
+/// Rotate the target's KEK: create a new (higher) version. New wraps use it; existing
+/// blobs keep unwrapping under their own (older) version. Returns the new version.
+///
+/// # Errors
+/// `Store` on a DB error.
+pub fn rotate(vault: &Vault, group: &str, tenant_id: &str, key_id: &str) -> Result<u32, KmsError> {
+    ensure_table(vault)?;
+    let max: i64 = vault
         .with_connection(|c| {
-            c.execute(
-                "INSERT INTO kms_keks (group_name, tenant_id, key_id, kek, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![group, tenant_id, key_id, &kek[..], now],
+            c.query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM kms_keks
+                 WHERE group_name=?1 AND tenant_id=?2 AND key_id=?3",
+                rusqlite::params![group, tenant_id, key_id],
+                |r| r.get(0),
             )
         })
         .map_err(|e| KmsError::Store(e.to_string()))?;
-    Ok(kek)
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let next = (max as u32) + 1;
+    insert_kek(vault, group, tenant_id, key_id, next, &gen_kek())?;
+    Ok(next)
 }
 
-/// Wrap `dek` under the target's KEK. Returns `nonce(12) || ct+tag`.
+/// Wrap `dek` under the target's **current** KEK. Returns `version(4 LE) || nonce(12) || ct+tag`.
 ///
 /// # Errors
 /// `Store` on a DB error; `Crypto` on an AEAD failure.
@@ -101,22 +158,23 @@ pub fn wrap(
     key_id: &str,
     dek: &[u8],
 ) -> Result<Vec<u8>, KmsError> {
-    let kek = load_or_create_kek(vault, group, tenant_id, key_id)?;
+    let (version, kek) = current_kek(vault, group, tenant_id, key_id)?;
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&kek));
     let nonce_bytes = random_salt(); // 16 bytes; take 12
     let nonce = Nonce::from_slice(&nonce_bytes[..NONCE_LEN]);
     let ct = cipher.encrypt(nonce, dek).map_err(|_| KmsError::Crypto)?;
-    let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
+    let mut out = Vec::with_capacity(VER_LEN + NONCE_LEN + ct.len());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&nonce_bytes[..NONCE_LEN]);
     out.extend_from_slice(&ct);
     Ok(out)
 }
 
-/// Unwrap `wrapped` (`nonce(12) || ct+tag`) under the target's KEK.
+/// Unwrap `wrapped` (`version(4) || nonce(12) || ct+tag`) under that version's KEK.
 ///
 /// # Errors
-/// `BadInput` if too short; `Store` on a DB error; `Crypto` if the KEK/nonce/tag don't
-/// authenticate (wrong target or tampered blob).
+/// `BadInput` if too short; `Store` on a DB error; `Crypto` if the version is unknown or
+/// the KEK/nonce/tag don't authenticate (wrong target or tampered blob).
 pub fn unwrap(
     vault: &Vault,
     group: &str,
@@ -124,12 +182,15 @@ pub fn unwrap(
     key_id: &str,
     wrapped: &[u8],
 ) -> Result<Vec<u8>, KmsError> {
-    if wrapped.len() <= NONCE_LEN {
+    if wrapped.len() <= VER_LEN + NONCE_LEN {
         return Err(KmsError::BadInput("wrapped blob too short".into()));
     }
-    let kek = load_or_create_kek(vault, group, tenant_id, key_id)?;
+    let version = u32::from_le_bytes([wrapped[0], wrapped[1], wrapped[2], wrapped[3]]);
+    let Some(kek) = kek_at(vault, group, tenant_id, key_id, version)? else {
+        return Err(KmsError::Crypto); // unknown version → treat as auth failure
+    };
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&kek));
-    let (nonce_bytes, ct) = wrapped.split_at(NONCE_LEN);
+    let (nonce_bytes, ct) = wrapped[VER_LEN..].split_at(NONCE_LEN);
     cipher
         .decrypt(Nonce::from_slice(nonce_bytes), ct)
         .map_err(|_| KmsError::Crypto)
@@ -208,6 +269,24 @@ mod tests {
             unwrap(&v, "eu", "11111111-1111-4111-8111-111111111111", "t", &w1).unwrap(),
             b"x"
         );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rotate_keeps_old_blobs_decryptable() {
+        let (v, path) = dev_vault("rotate");
+        let tid = "11111111-1111-4111-8111-111111111111";
+        // wrap under v1, then rotate to v2
+        let old = wrap(&v, "eu", tid, "t", b"old-dek").unwrap();
+        assert_eq!(old[0], 1); // version prefix = 1 (LE)
+        let new_ver = rotate(&v, "eu", tid, "t").unwrap();
+        assert_eq!(new_ver, 2);
+        // new wraps use v2
+        let fresh = wrap(&v, "eu", tid, "t", b"new-dek").unwrap();
+        assert_eq!(fresh[0], 2);
+        // BOTH still unwrap (old under v1, fresh under v2)
+        assert_eq!(unwrap(&v, "eu", tid, "t", &old).unwrap(), b"old-dek");
+        assert_eq!(unwrap(&v, "eu", tid, "t", &fresh).unwrap(), b"new-dek");
         cleanup(&path);
     }
 }

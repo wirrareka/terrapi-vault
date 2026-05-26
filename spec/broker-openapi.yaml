@@ -19,8 +19,9 @@ info:
     **Auth.** mutual TLS over WireGuard, client cert signed by the fleet Root CA; the
     cert's first SAN `dNSName` maps to a registered service role (no bearer tokens /
     AppRole). The listener is reachable only on the WG mesh. Each role is granted a set of
-    **capabilities** (ssh-ca, ssh-sign, creds, session, leases); calling an op the role
-    isn't granted returns `403` (least privilege).
+    **capabilities** (ssh-ca, ssh-sign, creds, session, leases, kms, snapshot); calling an
+    op the role isn't granted returns `403` (least privilege). Prometheus metrics are served
+    on a separate loopback listener (`127.0.0.1:8201/metrics`), never on this mTLS surface.
 
     **Namespace.** Leased service-admin creds live under `<group>/<tenant_id>/<role>`,
     where `tenant_id` is the Vulture `organization_id` (lowercase UUIDv4). Host/operator
@@ -174,6 +175,15 @@ components:
       properties:
         ca_public_key: { type: string, description: trust anchor (TrustedUserCAKeys / known host CA); group-scoped }
 
+    SshRevokedResponse:
+      type: object
+      required: [revoked_serials]
+      properties:
+        revoked_serials:
+          type: array
+          items: { type: integer, format: int64 }
+          description: revoked cert serials (ascending); build an sshd KRL from these (ssh-keygen -k)
+
     CredsRequest:
       type: object
       properties:
@@ -210,6 +220,21 @@ components:
       required: [dek]
       properties:
         dek: { type: string, description: base64 plaintext DEK — NEVER logged or audited }
+    KmsRotateResponse:
+      type: object
+      required: [kek_id, version]
+      properties:
+        kek_id: { type: string }
+        version: { type: integer, description: new current KEK version; old blobs keep unwrapping under their version }
+
+    StoreSnapshotResponse:
+      type: object
+      required: [snapshot_path, meta_path, sha256, bytes]
+      properties:
+        snapshot_path: { type: string, description: consistent at-rest snapshot (SQLCipher ciphertext, same key as the store) }
+        meta_path: { type: string, description: plaintext meta sidecar (salt + KDF params, no secret) — back up too }
+        sha256: { type: string }
+        bytes: { type: integer, format: int64 }
 
     SessionOpenRequest:
       type: object
@@ -301,6 +326,24 @@ paths:
       responses:
         "200": { description: seal state, content: { application/json: { schema: { $ref: "#/components/schemas/SealStatus" } } } }
 
+  /v1/sys/store-snapshot:
+    post:
+      tags: [system]
+      operationId: storeSnapshot
+      summary: Consistent snapshot of vault's own at-rest store (for aether fleet backup).
+      description: |
+        Online `VACUUM INTO` of the SQLCipher store (ciphertext, same key) under
+        `VAULT_SNAPSHOT_DIR`; returns the snapshot + meta sidecar paths, sha256 and size.
+        The agent ships both as ciphertext (it never sees the key/passphrase). cap `snapshot`.
+      x-implementation-status: implemented
+      x-audit-action: store.snapshot
+      responses:
+        "200": { description: snapshot produced, content: { application/json: { schema: { $ref: "#/components/schemas/StoreSnapshotResponse" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { description: snapshot/io failed, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/Sealed" }
+
   /v1/{group}/ssh/ca:
     get:
       tags: [ssh]
@@ -310,6 +353,24 @@ paths:
       parameters: [{ $ref: "#/components/parameters/GroupParam" }]
       responses:
         "200": { description: CA public key, content: { application/json: { schema: { $ref: "#/components/schemas/SshCaResponse" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/GroupMismatch" }
+        "503": { $ref: "#/components/responses/Sealed" }
+
+  /v1/{group}/ssh/revoked:
+    get:
+      tags: [ssh]
+      operationId: getSshRevoked
+      summary: Revoked SSH cert serials (for building an sshd KRL).
+      description: |
+        Serials recorded when an SSH-cert lease is revoked or expires. Short-TTL certs
+        mostly self-expire; this list is for hosts that want belt-and-suspenders revocation
+        (turn it into an sshd KRL at deploy). Requires the `ssh-ca` capability.
+      x-implementation-status: implemented
+      parameters: [{ $ref: "#/components/parameters/GroupParam" }]
+      responses:
+        "200": { description: revoked serials, content: { application/json: { schema: { $ref: "#/components/schemas/SshRevokedResponse" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/GroupMismatch" }
@@ -404,6 +465,28 @@ paths:
       responses:
         "200": { description: plaintext DEK, content: { application/json: { schema: { $ref: "#/components/schemas/KmsUnwrapResponse" } } } }
         "400": { description: bad input, or blob did not authenticate (wrong target / tampered), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/GroupMismatch" }
+        "503": { $ref: "#/components/responses/Sealed" }
+
+  /v1/{group}/{tenant_id}/kms/{key_id}/rotate:
+    post:
+      tags: [kms]
+      operationId: kmsRotate
+      summary: Rotate the per-target KEK (new version; old blobs stay decryptable).
+      description: |
+        Creates a new KEK version. New `wrap`s use it; previously-wrapped blobs keep
+        unwrapping under their own (older) version. cap `kms`.
+      x-implementation-status: implemented
+      x-audit-action: kms.rotate
+      parameters:
+        - { $ref: "#/components/parameters/GroupParam" }
+        - { $ref: "#/components/parameters/TenantIdParam" }
+        - { name: key_id, in: path, required: true, schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,128}$" }, description: backup target id }
+      responses:
+        "200": { description: rotated, content: { application/json: { schema: { $ref: "#/components/schemas/KmsRotateResponse" } } } }
+        "400": { description: bad tenant_id / key_id, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/GroupMismatch" }

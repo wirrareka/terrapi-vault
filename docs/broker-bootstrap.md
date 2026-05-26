@@ -33,6 +33,11 @@ ZFS dataset encryption, and WG isolation.
 - `VAULT_RESIDENCY_GROUP` — `eu` | `uae` (per-instance constant; default `eu`).
 - `VAULT_BROKER_BIND` — listen addr (prod: the WG address only; default `127.0.0.1:8200`).
 - `VAULT_UNSEAL_PASSPHRASE` — operator unseal passphrase (prod). Absent/invalid → sealed.
+- `VAULT_UNSEAL_PASSPHRASE_FILE` — unattended-restart fallback: a `mode 600` file (on a
+  ZFS-encrypted dataset) holding the passphrase, read if the env var is unset.
+- `VAULT_SNAPSHOT_DIR` — where `POST /v1/sys/store-snapshot` writes consistent at-rest
+  snapshots (default: temp dir).
+- `VAULT_METRICS_BIND` — Prometheus metrics listener (default `127.0.0.1:8201`, loopback).
 - `VAULT_STORE_PATH` — at-rest SQLCipher store (SSH CA key, later the lease ledger);
   created on first unseal, opened with the passphrase thereafter.
 - `VAULT_TLS_CERT` / `VAULT_TLS_KEY` — broker server cert chain + key (PEM).

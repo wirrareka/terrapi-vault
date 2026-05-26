@@ -36,6 +36,9 @@ async fn sweep_once(state: &AppState) {
         emit(state, "session.expire", "session", Some(sid.clone()), Outcome::Success);
     }
 
+    // Record any expired SSH cert serials in the CA revocation list.
+    crate::http::record_revoked_ssh(state, &swept.revoked_leases);
+
     // Delete the backend users owned by expired cred leases (SSH-cert leases have none).
     let torn = creds::teardown(&state.engines, &state.cred_handles, &swept.revoked_leases).await;
     for t in torn {

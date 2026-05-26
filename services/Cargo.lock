@@ -2184,6 +2184,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2",
  "ssh-key",
  "terrapi-vault",
  "thiserror 1.0.69",
