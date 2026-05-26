@@ -349,6 +349,7 @@ paths:
         "200": { description: ended + revoked list, content: { application/json: { schema: { $ref: "#/components/schemas/SessionEndResponse" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: no such session, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/Sealed" }
 
   /v1/sys/leases/renew:
     post:
@@ -362,6 +363,7 @@ paths:
         "200": { description: new ttl, content: { application/json: { schema: { $ref: "#/components/schemas/LeaseRenewResponse" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/Sealed" }
 
   /v1/sys/leases/revoke:
     post:
@@ -375,3 +377,4 @@ paths:
         "200": { description: revoked, content: { application/json: { schema: { $ref: "#/components/schemas/Ack" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/Sealed" }

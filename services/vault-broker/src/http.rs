@@ -116,6 +116,20 @@ fn not_implemented(what: &str) -> (StatusCode, Json<ErrorBody>) {
     )
 }
 
+/// Gate every mutating op on the broker being unsealed. A sealed broker has no master
+/// key and is not operational → `503` (the consumer polls `/v1/sys/seal-status`).
+fn require_unsealed(state: &AppState) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    if state.is_sealed() {
+        Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sealed",
+            "broker is sealed; an operator must unseal it before issuing",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 async fn ssh_ca(
     State(state): State<AppState>,
     _principal: Principal,
@@ -132,6 +146,7 @@ async fn ssh_sign(
     Json(_req): Json<SshSignRequest>,
 ) -> ApiResult<crate::dto::SshSignResponse> {
     check_group(&state, &group)?;
+    require_unsealed(&state)?;
     Err(not_implemented("ssh-sign"))
 }
 
@@ -142,6 +157,7 @@ async fn creds(
     Json(_req): Json<CredsRequest>,
 ) -> ApiResult<crate::dto::CredsResponse> {
     check_group(&state, &group)?;
+    require_unsealed(&state)?;
     if !is_uuid_v4_lower(&tenant_id) {
         return Err(err(
             StatusCode::BAD_REQUEST,
@@ -168,6 +184,7 @@ async fn session_open(
     principal: Principal,
     Json(req): Json<SessionOpenRequest>,
 ) -> ApiResult<SessionOpenResponse> {
+    require_unsealed(&state)?;
     let ttl = req.ttl_secs.unwrap_or(DEFAULT_SESSION_TTL_SECS);
     let idle = req.idle_timeout_secs.unwrap_or(DEFAULT_SESSION_IDLE_SECS);
     let id = {
@@ -199,6 +216,7 @@ async fn session_end(
     principal: Principal,
     Path(id): Path<String>,
 ) -> ApiResult<SessionEndResponse> {
+    require_unsealed(&state)?;
     let revoked = {
         let mut eng = state.leases.lock().expect("lease lock");
         eng.end_session(&id)
@@ -228,6 +246,7 @@ async fn lease_renew(
     _principal: Principal,
     Json(req): Json<LeaseRenewRequest>,
 ) -> ApiResult<LeaseRenewResponse> {
+    require_unsealed(&state)?;
     let ttl = {
         let mut eng = state.leases.lock().expect("lease lock");
         eng.renew(&req.lease_id, req.increment_secs)
@@ -244,6 +263,7 @@ async fn lease_revoke(
     principal: Principal,
     Json(req): Json<LeaseRevokeRequest>,
 ) -> ApiResult<Ack> {
+    require_unsealed(&state)?;
     {
         let mut eng = state.leases.lock().expect("lease lock");
         eng.revoke(&req.lease_id)

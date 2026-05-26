@@ -11,10 +11,38 @@ mod auth;
 mod config;
 mod dto;
 mod http;
+mod seal;
 mod state;
 
 use config::BrokerConfig;
 use state::AppState;
+use terrapi_vault::KdfParams;
+
+/// Attempt a boot-time unseal. Dev mode auto-unseals (ephemeral key); production requires
+/// `VAULT_UNSEAL_PASSPHRASE` and verifies it against the seal sidecar. A failed/absent
+/// unseal is non-fatal: the broker starts SEALED and mutating ops `503` until it is
+/// restarted with a valid passphrase.
+fn boot_unseal(cfg: &BrokerConfig) -> Option<seal::Unsealed> {
+    if cfg.allow_insecure_dev {
+        return Some(seal::unseal_dev());
+    }
+    match std::env::var("VAULT_UNSEAL_PASSPHRASE") {
+        Ok(p) if !p.is_empty() => match seal::unseal(&cfg.seal_path, &p, KdfParams::default()) {
+            Ok(u) => {
+                eprintln!("vault-broker: unsealed (seal meta {})", cfg.seal_path.display());
+                Some(u)
+            }
+            Err(e) => {
+                eprintln!("vault-broker: unseal FAILED ({e}); starting SEALED");
+                None
+            }
+        },
+        _ => {
+            eprintln!("vault-broker: no VAULT_UNSEAL_PASSPHRASE; starting SEALED");
+            None
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -35,8 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.audit_path.display(),
     );
 
+    let seal = boot_unseal(&cfg);
     let bind = cfg.bind;
-    let app = http::router(AppState::new(cfg));
+    let app = http::router(AppState::new(cfg, seal));
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!("vault-broker listening on {bind}");
 

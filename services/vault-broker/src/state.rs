@@ -1,8 +1,11 @@
 //! Shared broker state: config, the lease/session engine, and the audit sink.
 
 use crate::config::BrokerConfig;
+use crate::seal::Unsealed;
+use secrecy::SecretBox;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use terrapi_vault::DerivedKey;
 use vault_transport::audit::{AuditEvent, AuditSink, JsonlSink};
 use vault_transport::lease::LeaseEngine;
 
@@ -24,32 +27,45 @@ pub struct AppState {
     pub cfg: Arc<BrokerConfig>,
     pub leases: Arc<Mutex<LeaseEngine<BoxedGen>>>,
     pub audit: Arc<dyn AuditSink>,
-    /// Master-key seal state, reported by `GET /v1/sys/seal-status`. This build has no
-    /// master-key gating yet (manual unseal lands with broker bootstrap, Phase 1b), so it
-    /// boots unsealed; the flag is wired now so the contract endpoint reports truthfully.
+    /// Master-key seal state, reported by `GET /v1/sys/seal-status`. `true` until an
+    /// operator unseals; while sealed, mutating ops return `503` (`http::require_unsealed`).
     pub sealed: Arc<AtomicBool>,
+    /// The unsealed master key (held in a zeroizing `SecretBox`). `None` while sealed.
+    /// The wrapping key the at-rest store (SSH CA key, lease ledger) will use — consumed
+    /// once those engines land (Phase 2/3).
+    #[allow(dead_code)]
+    master_key: Option<Arc<SecretBox<DerivedKey>>>,
+}
+
+/// CSPRNG-backed opaque id: 256 bits of OS randomness, hex. Used for session and lease
+/// ids so they are unguessable. Reuses the lib's CSPRNG (`random_salt`) rather than
+/// pulling a second RNG into the service tree.
+#[must_use]
+pub fn random_id() -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(64);
+    for b in terrapi_vault::random_salt().iter().chain(terrapi_vault::random_salt().iter()) {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 impl AppState {
+    /// Build state from config and the result of the boot-time unseal attempt. `seal`
+    /// is `None` when the broker could not unseal (no/invalid passphrase) — it then runs
+    /// sealed and mutating ops `503` until restarted with a valid passphrase.
     #[must_use]
-    pub fn new(cfg: BrokerConfig) -> Self {
+    pub fn new(cfg: BrokerConfig, seal: Option<Unsealed>) -> Self {
         let sink = JsonlSink::new(cfg.audit_path.clone());
-        // Opaque id generator. NOTE: counter+nanos is fine for the skeleton; the real
-        // broker swaps this for a CSPRNG so lease/session ids are unguessable.
-        #[allow(clippy::cast_possible_truncation)]
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64);
-        let mut counter = 0u64;
-        let gen: BoxedGen = Box::new(move || {
-            counter += 1;
-            format!("{seed:016x}{counter:08x}")
-        });
+        let gen: BoxedGen = Box::new(random_id);
+        let sealed = seal.is_none();
+        let master_key = seal.map(|u| Arc::new(u.master_key));
         Self {
             cfg: Arc::new(cfg),
             leases: Arc::new(Mutex::new(LeaseEngine::new(gen))),
             audit: Arc::new(sink),
-            sealed: Arc::new(AtomicBool::new(false)),
+            sealed: Arc::new(AtomicBool::new(sealed)),
+            master_key,
         }
     }
 
