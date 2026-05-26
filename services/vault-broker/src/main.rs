@@ -1,9 +1,11 @@
-//! vault-broker — proximi.io network secrets broker (Path A). Phase 1 skeleton.
+//! vault-broker — proximi.io network secrets broker (Path A).
 //!
-//! Wired now: axum listener on `8200`, the full v1 route surface, an authenticated
-//! `Principal` boundary (mTLS-over-WG model; rustls termination is the next step),
-//! a real session/lease engine with cascade-revoke, and a B3 audit emitter
-//! (`source:"vault"`). SSH-CA signing + dynamic creds (OpenSearch RBAC / RethinkDB)
+//! Wired now: rustls mTLS-over-WG termination (`tls`) — client-cert required + verified
+//! vs the fleet Root CA, peer SAN → role; a boot-time master-key unseal (`seal`) that
+//! seals mutating ops behind `503` until an operator unseals; the full v1 route surface;
+//! a real session/lease engine with cascade-revoke and CSPRNG ids; and a B3 audit emitter
+//! (`source:"vault"`). Dev (`VAULT_ALLOW_INSECURE_DEV=1`) serves plain HTTP with
+//! header-based identity. SSH-CA signing + dynamic creds (OpenSearch RBAC / RethinkDB)
 //! are typed `501` stubs with their contract shapes fixed. See
 //! ../../docs/planning/01-vault-as-service.md §4 and ../../spec/broker-openapi.yaml.
 
@@ -13,6 +15,7 @@ mod dto;
 mod http;
 mod seal;
 mod state;
+mod tls;
 
 use config::BrokerConfig;
 use state::AppState;
@@ -65,13 +68,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let seal = boot_unseal(&cfg);
     let bind = cfg.bind;
+    let allow_insecure_dev = cfg.allow_insecure_dev;
+    let tls = cfg.tls.clone();
     let app = http::router(AppState::new(cfg, seal));
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!("vault-broker listening on {bind}");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    if allow_insecure_dev {
+        // Dev only: plain HTTP, header-based identity. Never in production.
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+    } else {
+        // Production: mTLS-over-WG is mandatory. Refuse to start without the material
+        // rather than silently serving plain HTTP that auth would reject anyway.
+        let Some(tls) = tls else {
+            return Err("production requires VAULT_TLS_CERT, VAULT_TLS_KEY and \
+                        VAULT_TLS_CLIENT_CA (mTLS-over-WireGuard); refusing to start"
+                .into());
+        };
+        tls::serve(listener, app, &tls).await?;
+    }
     Ok(())
 }
 

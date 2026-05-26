@@ -21,6 +21,20 @@ pub struct BrokerConfig {
     /// When false (production), the listener MUST be mTLS-over-WireGuard; HTTP refused.
     /// True only for local skeleton runs.
     pub allow_insecure_dev: bool,
+    /// mTLS material. `Some` in production (server cert/key + the fleet Root CA bundle
+    /// used to require + verify client certs). `None` only in `allow_insecure_dev`.
+    pub tls: Option<TlsPaths>,
+}
+
+/// Filesystem paths to the broker's mTLS material (PEM).
+#[derive(Debug, Clone)]
+pub struct TlsPaths {
+    /// Server certificate chain (leaf first), PEM.
+    pub cert: PathBuf,
+    /// Server private key, PEM (PKCS#8 / SEC1 / PKCS#1).
+    pub key: PathBuf,
+    /// Fleet Root CA bundle (PEM) — trust anchor for verifying client certs.
+    pub client_ca: PathBuf,
 }
 
 impl BrokerConfig {
@@ -48,6 +62,18 @@ impl BrokerConfig {
             PathBuf::from,
         );
         let allow_insecure_dev = std::env::var("VAULT_ALLOW_INSECURE_DEV").as_deref() == Ok("1");
+        let tls = match (
+            std::env::var("VAULT_TLS_CERT"),
+            std::env::var("VAULT_TLS_KEY"),
+            std::env::var("VAULT_TLS_CLIENT_CA"),
+        ) {
+            (Ok(cert), Ok(key), Ok(client_ca)) => Some(TlsPaths {
+                cert: PathBuf::from(cert),
+                key: PathBuf::from(key),
+                client_ca: PathBuf::from(client_ca),
+            }),
+            _ => None,
+        };
         Self {
             bind,
             residency_group: group,
@@ -56,6 +82,7 @@ impl BrokerConfig {
             seal_path,
             san_roles: HashMap::new(),
             allow_insecure_dev,
+            tls,
         }
     }
 }

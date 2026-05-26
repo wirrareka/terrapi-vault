@@ -21,6 +21,16 @@ secrecy.workspace = true
 tokio.workspace = true
 axum.workspace = true
 time.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+x509-parser.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tower.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
 
 [lints]
 workspace = true

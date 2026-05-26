@@ -28,6 +28,18 @@ secrecy = "0.10.3"
 tokio = { version = "1.41", features = ["rt-multi-thread", "macros", "net", "signal"] }
 axum = "0.8"
 time = { version = "0.3.36", features = ["formatting", "macros"] }
+# mTLS-over-WireGuard termination (daemon auth): rustls with required client-cert
+# verification vs the fleet Root CA, peer-cert SAN -> role. Manual accept loop over
+# hyper-util so the verified SAN reaches the Principal extractor.
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+x509-parser = "0.16"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+tower = { version = "0.5", features = ["util"] }
+# Test-only certificate generation (dev/unit certs for the mTLS path).
+rcgen = "0.13"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

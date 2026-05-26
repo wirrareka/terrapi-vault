@@ -290,9 +290,15 @@ still build against the lib.
 with an *invalid* body returns 400 (deserialize) before 404 (group). Valid requests to
 the wrong group correctly 404. Make `group` a validated extractor to order-independent.
 
-**Next sub-phase (Phase 1b/2):** rustls mTLS-over-WG termination (real SAN from peer
-cert) · SSH cert signing (CA key in the at-rest store, `ssh-key` crate) · dynamic-cred
-engines (OpenSearch RBAC role `audit-writer` write-only, RethinkDB admin) ·
-ship B3 to group-local OpenSearch · hash-chained durable audit store · CSPRNG lease ids.
-Then notify `inbox/demon/` that v1 OpenAPI is published (coordination repo handled by
-its owning agent).
+**Phase 1b — DONE:** rustls mTLS-over-WG termination (`tls.rs`: client-cert required +
+verified vs the fleet Root CA, peer DNS-SAN → role via `auth::ClientSan`; dev keeps the
+header path) · CSPRNG session/lease ids (256-bit, reusing the lib CSPRNG) · boot-time
+master-key unseal (`seal.rs`: Argon2id via the lib, zeroizing `SecretBox`, constant-time
+passphrase verifier, `mode 600` sidecar) gating all mutating ops behind `503` until
+unsealed (`GET /v1/sys/seal-status`). v1 OpenAPI published + demon ack'd.
+
+**Next sub-phase (Phase 2/3):** SSH cert signing (CA key in the at-rest store, `ssh-key`
+crate) — unstubs `ssh/{ca,sign}` · dynamic-cred engines (OpenSearch RBAC role
+`audit-writer` write-only, RethinkDB admin) — unstubs `creds` · ship B3 to group-local
+OpenSearch · hash-chained durable audit store. The unsealed master key (`AppState`) is
+the wrapping key for the at-rest CA/ledger store these consume.
