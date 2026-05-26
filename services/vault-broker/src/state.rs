@@ -71,17 +71,27 @@ pub fn random_id() -> String {
     s
 }
 
-/// Build the dynamic-cred engine registry. Dev registers an in-memory `MockEngine` so the
-/// creds path is exercisable locally; production wires concrete OpenSearch (and legacy
-/// RethinkDB) adapters here from config — until then the registry is empty and an issuance
-/// for any role returns `404` (unknown role).
+/// Build the dynamic-cred engine registry. If `VAULT_OS_*` is configured, the real
+/// OpenSearch RBAC engine is registered under its role; otherwise dev registers an
+/// in-memory `MockEngine` so the creds path is exercisable locally. With neither, the
+/// registry is empty and an issuance for any role returns `404` (unconfigured role).
 fn build_engines(cfg: &BrokerConfig) -> CredEngines {
     let mut engines = CredEngines::new();
-    if cfg.allow_insecure_dev {
-        engines.register(
-            "audit-writer",
-            Box::new(MockEngine::new("audit-writer", 8 * 60 * 60)),
-        );
+    match crate::opensearch::OpenSearchEngine::from_env() {
+        Ok(Some(os)) => {
+            let role = os.role().to_owned();
+            eprintln!("vault-broker: OpenSearch cred engine registered for role '{role}'");
+            engines.register(role, Box::new(os));
+        }
+        Ok(None) => {
+            if cfg.allow_insecure_dev {
+                engines.register(
+                    "audit-writer",
+                    Box::new(MockEngine::new("audit-writer", 8 * 60 * 60)),
+                );
+            }
+        }
+        Err(e) => eprintln!("vault-broker: OpenSearch cred engine DISABLED ({e})"),
     }
     engines
 }

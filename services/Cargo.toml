@@ -43,6 +43,10 @@ rcgen = "0.13"
 # SSH signed-certificate CA (Phase 2): ed25519 CA key + OpenSSH certificate signing.
 ssh-key = { version = "0.6", features = ["ed25519", "std"] }
 rand = "0.8"
+# Dynamic-cred engines (Phase 3): async trait for backend adapters + the OpenSearch
+# security REST client (rustls TLS, no OpenSSL).
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

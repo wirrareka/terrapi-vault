@@ -30,6 +30,8 @@ hyper-util.workspace = true
 tower.workspace = true
 ssh-key.workspace = true
 rand.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true

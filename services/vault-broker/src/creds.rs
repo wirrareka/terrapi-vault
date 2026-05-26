@@ -37,19 +37,21 @@ pub struct Issued {
     pub max_ttl_secs: u64,
 }
 
-/// A backend engine that mints and revokes ephemeral users for one role.
+/// A backend engine that mints and revokes ephemeral users for one role. Async because
+/// concrete adapters talk to a network backend; `async_trait` keeps it `dyn`-compatible.
+#[async_trait::async_trait]
 pub trait CredEngine: Send + Sync {
     /// Create an ephemeral user for `tenant` valid up to `ttl_secs`.
     ///
     /// # Errors
     /// `Backend` if the target system rejects the create.
-    fn issue(&self, tenant: &str, ttl_secs: u64) -> Result<Issued, CredError>;
+    async fn issue(&self, tenant: &str, ttl_secs: u64) -> Result<Issued, CredError>;
 
     /// Delete the ephemeral `username` (idempotent: a missing user is success).
     ///
     /// # Errors
     /// `Backend` if the target system errors on delete.
-    fn revoke(&self, username: &str) -> Result<(), CredError>;
+    async fn revoke(&self, username: &str) -> Result<(), CredError>;
 }
 
 /// role → engine. Built at boot from config (prod) or with a mock (dev).
@@ -90,20 +92,22 @@ pub struct TornDown {
 /// Tear down the backend users for `lease_ids` (called after `revoke`/`end_session`):
 /// for each lease that owns a cred handle, delete its backend user and drop the handle.
 /// Returns one entry per torn-down handle so the caller can emit a `creds.revoke` event.
-pub fn teardown(
+pub async fn teardown(
     engines: &CredEngines,
     handles: &Mutex<HashMap<String, CredHandle>>,
     lease_ids: &[String],
 ) -> Vec<TornDown> {
-    let mut torn = Vec::new();
-    let mut guard = handles.lock().expect("cred handles lock");
-    for id in lease_ids {
-        let Some(handle) = guard.remove(id) else {
-            continue; // not a dynamic cred (e.g. an SSH-cert lease) — nothing to delete
+    // Collect + remove the handles under the lock, then await deletes lock-free.
+    let owned: Vec<CredHandle> = {
+        let mut guard = handles.lock().expect("cred handles lock");
+        lease_ids.iter().filter_map(|id| guard.remove(id)).collect()
+    };
+    let mut torn = Vec::with_capacity(owned.len());
+    for handle in owned {
+        let outcome_ok = match engines.get(&handle.role) {
+            Some(e) => e.revoke(&handle.username).await.is_ok(),
+            None => false,
         };
-        let outcome_ok = engines
-            .get(&handle.role)
-            .is_some_and(|e| e.revoke(&handle.username).is_ok());
         torn.push(TornDown {
             role: handle.role,
             outcome_ok,
@@ -138,8 +142,9 @@ impl MockEngine {
     }
 }
 
+#[async_trait::async_trait]
 impl CredEngine for MockEngine {
-    fn issue(&self, tenant: &str, ttl_secs: u64) -> Result<Issued, CredError> {
+    async fn issue(&self, tenant: &str, ttl_secs: u64) -> Result<Issued, CredError> {
         let username = format!("v-{}-{tenant}-{}", self.role, crate::state::random_id());
         let password = crate::state::random_id();
         self.users
@@ -153,7 +158,7 @@ impl CredEngine for MockEngine {
         })
     }
 
-    fn revoke(&self, username: &str) -> Result<(), CredError> {
+    async fn revoke(&self, username: &str) -> Result<(), CredError> {
         self.users.lock().expect("mock users lock").remove(username);
         Ok(())
     }
@@ -163,17 +168,17 @@ impl CredEngine for MockEngine {
 mod tests {
     use super::*;
 
-    #[test]
-    fn issue_then_teardown_deletes_the_backend_user() {
+    #[tokio::test]
+    async fn issue_then_teardown_deletes_the_backend_user() {
         let mut engines = CredEngines::new();
         engines.register("audit-writer", Box::new(MockEngine::new("audit-writer", 3600)));
         let handles = Mutex::new(HashMap::new());
 
-        // issue
         let issued = engines
             .get("audit-writer")
             .unwrap()
             .issue("3f1a9c2e-7b44-4d1e-9a2b-1c0d5e6f7a8b", 900)
+            .await
             .unwrap();
         handles.lock().unwrap().insert(
             "lease-1".to_string(),
@@ -182,34 +187,30 @@ mod tests {
                 username: issued.username.clone(),
             },
         );
-        // confirm the mock now tracks the user
-        let mock_ref = engines.get("audit-writer").unwrap();
-        // SAFETY-free downcast avoided; re-issue check via teardown effect below.
 
         // teardown the lease → user deleted, handle dropped
-        let torn = teardown(&engines, &handles, &["lease-1".to_string()]);
+        let torn = teardown(&engines, &handles, &["lease-1".to_string()]).await;
         assert_eq!(torn.len(), 1);
         assert!(torn[0].outcome_ok);
         assert!(handles.lock().unwrap().is_empty());
-        let _ = mock_ref;
     }
 
-    #[test]
-    fn teardown_ignores_non_cred_leases() {
+    #[tokio::test]
+    async fn teardown_ignores_non_cred_leases() {
         let engines = CredEngines::new();
         let handles = Mutex::new(HashMap::new());
         // an SSH-cert lease id with no cred handle → no-op, no panic
-        let torn = teardown(&engines, &handles, &["ssh-lease".to_string()]);
+        let torn = teardown(&engines, &handles, &["ssh-lease".to_string()]).await;
         assert!(torn.is_empty());
     }
 
-    #[test]
-    fn mock_issue_tracks_and_revoke_clears() {
+    #[tokio::test]
+    async fn mock_issue_tracks_and_revoke_clears() {
         let m = MockEngine::new("audit-writer", 3600);
-        let c = m.issue("tenant", 900).unwrap();
+        let c = m.issue("tenant", 900).await.unwrap();
         assert!(m.has_user(&c.username));
         assert!(c.max_ttl_secs <= 3600);
-        m.revoke(&c.username).unwrap();
+        m.revoke(&c.username).await.unwrap();
         assert!(!m.has_user(&c.username));
     }
 }

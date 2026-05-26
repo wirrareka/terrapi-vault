@@ -40,6 +40,11 @@ ZFS dataset encryption, and WG isolation.
   against it, and the peer DNS-SAN maps to a broker role. All three TLS vars are
   **mandatory in production** — the broker refuses to start without them.
 - `VAULT_AUDIT_PATH` — B3 audit JSONL sink path.
+- `VAULT_OS_URL` / `VAULT_OS_ADMIN_USER` / `VAULT_OS_ADMIN_PASSWORD` — OpenSearch
+  dynamic-cred engine: the cluster + the admin credential the broker uses to mint/delete
+  ephemeral users. Set `VAULT_OS_URL` to enable the engine. `VAULT_OS_ROLE` (default
+  `audit-writer`), `VAULT_OS_MAX_TTL_SECS` (default 28800), `VAULT_OS_INSECURE_TLS=1`
+  (dev/self-signed only). See `docs/dev/opensearch-it.md`.
 - `VAULT_ALLOW_INSECURE_DEV=1` — **local dev only**: plain HTTP, `X-Client-Cert-SAN`
   header identity, auto-unseal with an ephemeral key. Never in production.
 

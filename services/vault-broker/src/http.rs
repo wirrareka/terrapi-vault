@@ -306,6 +306,7 @@ async fn creds(
         .get(&role)
         .expect("engine present (checked above)")
         .issue(&tenant_id, ttl)
+        .await
         .map_err(|e| err(StatusCode::BAD_GATEWAY, "backend_error", &e.to_string()))?;
 
     let issued_lease = {
@@ -318,7 +319,8 @@ async fn creds(
             .engines
             .get(&role)
             .expect("engine present")
-            .revoke(&issued.username);
+            .revoke(&issued.username)
+            .await;
         return Err(err(
             StatusCode::CONFLICT,
             "no_active_session",
@@ -369,8 +371,8 @@ fn system_actor(principal: &Principal) -> Actor {
 
 /// Delete the backend users owned by `revoked` cred leases and emit a `creds.revoke`
 /// event per torn-down handle. SSH-cert leases (no backend user) are skipped.
-fn tear_down_creds(state: &AppState, principal: &Principal, revoked: &[String]) {
-    let torn = crate::creds::teardown(&state.engines, &state.cred_handles, revoked);
+async fn tear_down_creds(state: &AppState, principal: &Principal, revoked: &[String]) {
+    let torn = crate::creds::teardown(&state.engines, &state.cred_handles, revoked).await;
     for t in torn {
         state.emit(&AuditEvent::vault(
             AppState::now_ts(),
@@ -435,7 +437,7 @@ async fn session_end(
     state.unbind_session(&id);
     // Cascade-revoke deleted child leases in the engine; now delete any backend users
     // those cred leases owned.
-    tear_down_creds(&state, &principal, &revoked);
+    tear_down_creds(&state, &principal, &revoked).await;
     state.emit(&AuditEvent::vault(
         AppState::now_ts(),
         state.cfg.node.clone(),
@@ -485,7 +487,7 @@ async fn lease_revoke(
             .map_err(|e| err(StatusCode::CONFLICT, "revoke_failed", &e.to_string()))?;
     }
     // If this lease owned a backend user, delete it (emits its own creds.revoke).
-    tear_down_creds(&state, &principal, std::slice::from_ref(&lease_id));
+    tear_down_creds(&state, &principal, std::slice::from_ref(&lease_id)).await;
     state.emit(&AuditEvent::vault(
         AppState::now_ts(),
         state.cfg.node.clone(),

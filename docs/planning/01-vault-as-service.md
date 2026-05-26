@@ -315,7 +315,13 @@ is the modern engine to wire next. **RethinkDB is legacy-only** (owner-corrected
 2026-05-26 — it backs legacy services, not the modern stack), so a `rethinkdb-admin`
 engine is legacy-scoped, not a modern datastore.
 
-**Next:** concrete network adapters behind `CredEngine` (OpenSearch security REST API;
-legacy RethinkDB) — integration-tested against a live backend · ship B3 to group-local
-OpenSearch · hash-chained durable audit store · **lease/session TTL+idle expiry sweeper**
-(today leases only revoke on explicit end, not on TTL timeout).
+**OpenSearch engine — DONE:** `opensearch.rs` — the modern `audit-writer` adapter behind
+`CredEngine` (async): mints an ephemeral OpenSearch internal user via the security REST
+API (`PUT …/internalusers/{u}`, admin basic-auth, rustls) mapped to the security role, and
+deletes it on revoke/expiry. Registered when `VAULT_OS_*` is configured. Integration-tested
+against a live single-node OpenSearch (full create→exists→delete cycle; `docs/dev/opensearch-it.md`).
+The `CredEngine` trait is now async (`async_trait`) and `teardown` awaits deletes lock-free.
+
+**Next:** legacy RethinkDB adapter (same trait) · ship B3 to group-local OpenSearch ·
+hash-chained durable audit store · **lease/session TTL+idle expiry sweeper** (today leases
+only revoke on explicit end / session cascade, not on TTL timeout).
