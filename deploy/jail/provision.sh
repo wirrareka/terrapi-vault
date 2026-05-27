@@ -7,13 +7,18 @@
 #   ./provision.sh uae 10.210.0.0/24
 #
 # ASSUMPTIONS — confirm with operator:
-#   FREEBSD_REL=14.2-RELEASE ; DATASET=zroot/terrapi/vault ; vnet jail.
+#   FREEBSD_REL=15.0-RELEASE (medina) ; DATASET=zroot/terrapi/vault.
+#
+# NOTE: the fleet (kalista/opensearch) runs jails as **ip4=inherit + a WG /32 alias**,
+# NOT `-V` VNET. Create the jail the inherit way and alias the WG /32 (10.200.0.101)
+# onto it; this script's `bastille create -V` is a fallback — prefer the inherit
+# pattern per the coordination decision. The broker only ever binds its WG /32.
 set -eu
 
 GROUP="${1:?usage: provision.sh <group> <wg-subnet/cidr>}"
 WG_CIDR="${2:?missing WG subnet, e.g. 10.200.0.0/24}"
 JAIL="vault-${GROUP}"
-FREEBSD_REL="${FREEBSD_REL:-14.2-RELEASE}"
+FREEBSD_REL="${FREEBSD_REL:-15.0-RELEASE}"
 DATASET="${DATASET:-zroot/terrapi/vault}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"   # deploy/
 

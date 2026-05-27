@@ -26,6 +26,7 @@ CMD pw useradd -n vault -g vault -d /var/db/terrapi-vault -s /usr/sbin/nologin -
 
 # Layout.
 CMD install -d -m 755 /usr/local/sbin
+CMD install -d -m 755 /usr/local/libexec
 CMD install -d -m 755 /usr/local/etc/rc.d
 CMD install -d -m 755 /usr/local/etc/terrapi-vault
 CMD install -d -m 755 /usr/local/etc/terrapi-vault/tls
@@ -39,6 +40,10 @@ CMD chmod 755 /usr/local/sbin/vault-broker
 CP rc.d/vault-broker /usr/local/etc/rc.d/vault-broker
 CP zfs/zfskeys       /usr/local/etc/rc.d/zfskeys
 CMD chmod 755 /usr/local/etc/rc.d/vault-broker /usr/local/etc/rc.d/zfskeys
+
+# rc.d exec wrapper (sources the env drop-in with `set -a`, execs the broker).
+CP libexec/vault-broker-run /usr/local/libexec/vault-broker-run
+CMD chmod 755 /usr/local/libexec/vault-broker-run
 
 # Contract-check + security helpers (run on demand / from monitoring).
 CP zfs/check-encryption.sh /usr/local/etc/terrapi-vault-deploy/check-encryption.sh

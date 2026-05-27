@@ -35,10 +35,18 @@ load_rc_config $name
 : ${vault_broker_env:="/usr/local/etc/terrapi-vault/vault-broker.env"}
 : ${vault_broker_log:="/var/log/vault-broker.log"}
 
+: ${vault_broker_runner:="/usr/local/libexec/vault-broker-run"}
+
 pidfile="/var/run/vault-broker.pid"
 procname="/usr/local/sbin/vault-broker"
 
+# daemon(8) runs the wrapper as the vault user; the wrapper sources the env drop-in
+# (with `set -a` so VAULT_* are exported) and execs the broker. We pass the env-file
+# path via env(1) — NO embedded quotes in command_args (rc.subr word-splits it and
+# does not honor inline quotes, which is what broke v0.1.0's `sh -c '...'` form).
 command="/usr/sbin/daemon"
+command_args="-c -f -p ${pidfile} -u ${vault_broker_user} -o ${vault_broker_log} \
+    /usr/bin/env VB_ENV=${vault_broker_env} ${vault_broker_runner}"
 start_precmd="vault_broker_prestart"
 stop_postcmd="vault_broker_poststop"
 
@@ -75,22 +83,20 @@ vault_broker_prestart() {
         return 1
     fi
 
-    # 5. Touch the log so daemon(8) doesn't create it as root.
+    # 5. The exec wrapper must be present (it sources the env + execs the broker).
+    if [ ! -x "${vault_broker_runner}" ]; then
+        warn "vault-broker: missing exec wrapper ${vault_broker_runner}"
+        return 1
+    fi
+
+    # 6. Touch the log so daemon(8) doesn't create it as root.
     if [ ! -f ${vault_broker_log} ]; then
         install -o ${vault_broker_user} -g ${vault_broker_group} -m 640 /dev/null ${vault_broker_log}
     fi
-
-    # 6. Source the env drop-in (secrets pulled from the dataset) and exec the
-    #    broker so secrets stay out of argv. The binary is env-driven (no flags).
-    rc_flags="-c -f -p ${pidfile} -u ${vault_broker_user} -o ${vault_broker_log} \
-        /bin/sh -c '. ${vault_broker_env}; exec ${procname}'"
 }
 
 vault_broker_poststop() {
     rm -f ${pidfile}
 }
-
-# daemon(8) args are assembled in prestart (so the env file is sourced into the child).
-command_args="${rc_flags:--c -f -p ${pidfile} -u ${vault_broker_user} -o ${vault_broker_log} /bin/sh -c '. ${vault_broker_env}; exec ${procname}'}"
 
 run_rc_command "$1"

@@ -3,6 +3,21 @@
 terrapi-vault — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
+## 0.1.1
+
+Startup fixes found in the first medina deploy of 0.1.0:
+- **rustls CryptoProvider** — install `aws_lc_rs` as the process default at `main` start.
+  rustls 0.23 panicked ("Could not automatically determine the process-level
+  CryptoProvider") because both `aws-lc-rs` and `ring` are pulled in transitively
+  (mTLS server + reqwest); now it's chosen explicitly before any TLS use.
+- **rc.d** — `deploy/rc.d/vault-broker` no longer inlines a single-quoted `sh -c` in
+  `command_args` (rc.subr word-splits it → "Unterminated quoted string"). It runs a new
+  `deploy/libexec/vault-broker-run` wrapper that `set -a`-sources the env drop-in (so
+  `VAULT_*` are exported) and execs the broker; the env path is passed via `env(1)`.
+- **deploy** — `server.key` is now `0640 root:vault` (the broker reads it as the `vault`
+  user); `provision.sh` defaults to `15.0-RELEASE` + notes the `ip4=inherit` + WG /32
+  fleet jail pattern; install.sh installs the rc.d wrapper.
+
 ## 0.1.0
 
 First release of the **vault-broker** (Path A), feature-complete for the planned scope.

@@ -93,6 +93,16 @@ fn load_ca(store: Vault, group: &str) -> Option<Unsealed> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // rustls 0.23 can't auto-pick a crypto provider when both aws-lc-rs and ring are
+    // pulled in transitively (rustls server + reqwest) — it panics on first TLS use.
+    // Install aws-lc-rs explicitly, before any TLS (mTLS server, reqwest clients).
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_err()
+    {
+        eprintln!("vault-broker: a rustls CryptoProvider was already installed (continuing)");
+    }
+
     let cfg = BrokerConfig::from_env();
 
     if cfg.allow_insecure_dev {

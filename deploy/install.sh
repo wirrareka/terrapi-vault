@@ -27,8 +27,11 @@ ETC="/usr/local/etc/terrapi-vault"
 
 echo "=== terrapi-vault broker install — group=${GROUP} ==="
 
-# --- step 1: least-privilege + user/dirs ------------------------------------
+# --- step 1: least-privilege + user/dirs + rc.d exec wrapper ----------------
 sh "${HERE}/security/least-privilege.sh"
+# Install the rc.d exec wrapper (sources the env drop-in, execs the broker).
+install -d -m 755 /usr/local/libexec
+install -m 755 "${HERE}/libexec/vault-broker-run" /usr/local/libexec/vault-broker-run
 
 # --- step 2: unlock the encrypted dataset and verify (NEVER run sealed in prod) ---
 echo "--> unlocking encrypted dataset ${DATASET}"
@@ -68,6 +71,12 @@ fi
 echo "    REQUIRED: ${ETC}/tls/{server.pem,server.key,fleet-root-ca.pem} from infra."
 [ -f "${ETC}/tls/server.pem" ] && [ -f "${ETC}/tls/fleet-root-ca.pem" ] || \
     echo "    WARN: TLS material missing — the broker refuses to start in prod without it."
+# The broker reads VAULT_TLS_KEY as the `vault` user → the key MUST be vault-readable.
+# root-owned + group-readable (0640 root:vault): vault reads, cannot overwrite.
+if [ -f "${ETC}/tls/server.key" ]; then
+    chown root:vault "${ETC}/tls/server.key"; chmod 0640 "${ETC}/tls/server.key"
+fi
+[ -f "${ETC}/tls/server.pem" ] && chmod 0644 "${ETC}/tls/server.pem" || true
 
 # --- step 5: enable services (zfskeys BEFORE vault_broker via rc REQUIRE) ----
 sysrc zfskeys_enable=YES

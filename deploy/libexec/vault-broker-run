@@ -1,0 +1,17 @@
+#!/bin/sh
+# vault-broker-run — rc.d exec wrapper. daemon(8) runs this as the `vault` user.
+#
+# Sources the env drop-in with `set -a` so every VAULT_* is EXPORTED into the
+# broker's environment (the env file assigns without `export`), then execs the
+# broker. Kept as a separate script so the rc.d `command_args` needs no embedded
+# quotes (rc.subr word-splits command_args and does NOT honor inline quotes —
+# inlining `sh -c '...'` there breaks with "Unterminated quoted string").
+#
+# The env file path comes from $VB_ENV (set by rc.d via env(1)).
+set -eu
+
+: "${VB_ENV:?VB_ENV not set (rc.d must pass it)}"
+set -a
+. "${VB_ENV}"
+set +a
+exec /usr/local/sbin/vault-broker
