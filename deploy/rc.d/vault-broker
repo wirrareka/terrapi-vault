@@ -19,7 +19,7 @@
 # Optional overrides (defaults shown):
 #   vault_broker_runas="vault"
 #   vault_broker_data="/var/db/terrapi-vault"           # on the encrypted dataset
-#   vault_broker_env="/usr/local/etc/terrapi-vault/vault-broker.env"  # mode 0600
+#   vault_broker_envfile="/usr/local/etc/terrapi-vault/vault-broker.env"  # mode 0600
 #   vault_broker_log="/var/log/vault-broker.log"
 
 . /etc/rc.subr
@@ -29,14 +29,15 @@ rcvar="vault_broker_enable"
 load_rc_config $name
 
 : ${vault_broker_enable:="NO"}
-# NOTE: deliberately NOT `${name}_user` / `${name}_group` (i.e. vault_broker_user/group).
-# rc.subr treats those as magic and does its OWN su/chroot privilege-drop — combined with
-# daemon's `-u` that's a DOUBLE drop whose context can't read the env file. We do the
-# single drop via `daemon -u` (the by-hand-proven path), so these are plain vars.
+# NOTE: our config vars deliberately AVOID every rc.subr-magic `${name}_*` name —
+# `${name}_{user,group,env,chroot,chdir,nice,limits,flags,fib,oomprotect}`. rc.subr
+# hijacks those: `_user`/`_group` add a su/chroot drop (→ double-drop vs daemon -u, v0.1.1),
+# and `_env` prepends `env <value> <command>` so a path value gets exec'd ("Permission
+# denied", v0.1.2). Hence runas/rungroup/envfile, not user/group/env. Do NOT rename them back.
 : ${vault_broker_runas:="vault"}
 : ${vault_broker_rungroup:="vault"}
 : ${vault_broker_data:="/var/db/terrapi-vault"}
-: ${vault_broker_env:="/usr/local/etc/terrapi-vault/vault-broker.env"}
+: ${vault_broker_envfile:="/usr/local/etc/terrapi-vault/vault-broker.env"}
 : ${vault_broker_log:="/var/log/vault-broker.log"}
 
 : ${vault_broker_runner:="/usr/local/libexec/vault-broker-run"}
@@ -50,7 +51,7 @@ procname="/usr/local/sbin/vault-broker"
 # does not honor inline quotes, which is what broke v0.1.0's `sh -c '...'` form).
 command="/usr/sbin/daemon"
 command_args="-c -f -p ${pidfile} -u ${vault_broker_runas} -o ${vault_broker_log} \
-    /usr/bin/env VB_ENV=${vault_broker_env} ${vault_broker_runner}"
+    /usr/bin/env VB_ENV=${vault_broker_envfile} ${vault_broker_runner}"
 start_precmd="vault_broker_prestart"
 stop_postcmd="vault_broker_poststop"
 
@@ -74,14 +75,14 @@ vault_broker_prestart() {
     install -d -o ${vault_broker_runas} -g ${vault_broker_rungroup} -m 700 ${vault_broker_data}/secrets
 
     # 3. Env drop-in (secrets sourced from the encrypted dataset). Must be mode-600.
-    if [ ! -f "${vault_broker_env}" ]; then
-        warn "vault-broker: missing env drop-in ${vault_broker_env}"
+    if [ ! -f "${vault_broker_envfile}" ]; then
+        warn "vault-broker: missing env drop-in ${vault_broker_envfile}"
         return 1
     fi
 
     # 4. Roles config must exist — without it every verified cert is 403 (deny-all),
     #    so a missing roles.json is a hard misconfig, not a soft default.
-    roles="$(. ${vault_broker_env} 2>/dev/null; echo "${VAULT_ROLES_CONFIG:-}")"
+    roles="$(. ${vault_broker_envfile} 2>/dev/null; echo "${VAULT_ROLES_CONFIG:-}")"
     if [ -z "${roles}" ] || [ ! -f "${roles}" ]; then
         warn "vault-broker: VAULT_ROLES_CONFIG missing/unset (${roles}) — would 403 every cert"
         return 1

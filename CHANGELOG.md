@@ -3,6 +3,17 @@
 terrapi-vault — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
+## 0.1.3
+
+Deploy-only fix (binary unchanged) — the second rc.subr-magic collision found by `sh -x`
+in the v0.1.2 medina deploy:
+- **`vault_broker_env` collided with rc.subr's magic `${name}_env`** (its "extra
+  environment" list), so rc.subr ran `env <envfile-path> daemon …` → `env` tried to **exec
+  the file path** → `Permission denied`, `service start` failed. Renamed the var →
+  **`vault_broker_envfile`** (the `VB_ENV=` passed to the wrapper was always fine; only the
+  rc.d var NAME was hijacked). Added a note enumerating ALL `${name}_*` magic names to avoid
+  (`user/group/env/chroot/chdir/nice/limits/flags/fib/oomprotect`).
+
 ## 0.1.2
 
 Deploy-only fix (binary unchanged from 0.1.1) — the rc.d `service` start found in the
