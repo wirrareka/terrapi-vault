@@ -1,0 +1,67 @@
+name: FreeBSD build smoke
+
+# Build the vault-broker on the medina FreeBSD builder (the same `runner-fbsd`
+# mechanism kalista uses), NOT vmactions/freebsd-vm. The broker lives in the
+# `services/` workspace and path-deps the root `terrapi-vault` lib crate.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'services/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/freebsd-build.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'services/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/freebsd-build.yml'
+  workflow_dispatch:
+
+concurrency:
+  # Shared persistent FreeBSD VM workdir + target/ — serialise across repos.
+  group: freebsd-release-vm
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: cargo build (FreeBSD, bhyve runner-fbsd)
+    # bhyve runner VM (Linux, self-hosted: medina). The qemu FreeBSD build VM is
+    # reachable via the `runner-fbsd` ssh alias (127.0.0.1:2222, user ci) — no
+    # repo secret needed. VM has: rust cargo cc clang cmake pkgconf gmake rsync git.
+    runs-on: [self-hosted, medina]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync source into the FreeBSD VM
+        run: |
+          set -euo pipefail
+          ssh runner-fbsd 'mkdir -p build/terrapi-vault'
+          # target/ + services/target/ live in the VM (cargo cache persists).
+          rsync -az --delete \
+            --exclude '/target' \
+            --exclude '/services/target' \
+            --exclude '/.git' \
+            -e ssh \
+            ./ runner-fbsd:build/terrapi-vault/
+
+      - name: cargo build --release on the FreeBSD VM
+        run: |
+          set -euo pipefail
+          ssh runner-fbsd '
+            set -eu
+            # Non-interactive ssh on FreeBSD does not source ~/.profile, so
+            # /usr/local/bin (pkg cmake/pkgconf/cc) is not on PATH by default —
+            # cargo build scripts (aws-lc-rs, bundled SQLCipher) need it.
+            export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:"$HOME/.cargo/bin"
+            cd "$HOME/build/terrapi-vault/services"
+            cargo build --release -p vault-broker
+            ls -l target/release/vault-broker
+            file target/release/vault-broker || true
+          '

@@ -1,0 +1,191 @@
+name: Release
+
+# Build the vault-broker release artifact(s) and publish to GitHub Releases on a
+# tag. FreeBSD (the medina production target) is built on the `runner-fbsd`
+# builder (NOT vmactions); Linux is built natively on medina.
+#
+# Artifacts (per target):
+#   vault-broker-<version>-<target>.tar.gz        — binary + deploy/ + LICENSE-*
+#   vault-broker-<version>-<target>.tar.gz.sha256
+#
+# Release assets do NOT count against the Actions artifact quota (we never use
+# upload-artifact), so this mirrors kalista's quota-bypass pattern.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0). Required for manual runs."
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    name: Create GitHub Release
+    runs-on: [self-hosted, medina]
+    permissions:
+      contents: write
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Release notes
+        run: |
+          VERSION="${{ inputs.tag || github.ref_name }}"
+          if [ -f CHANGELOG.md ]; then
+            awk -v ver="${VERSION#v}" '
+              $0 ~ "^## " ver { found=1; print; next }
+              /^## [0-9]/ && found { exit }
+              found { print }
+            ' CHANGELOG.md > release-notes.md
+          fi
+          [ -s release-notes.md ] || echo "Release ${VERSION}" > release-notes.md
+      - name: Create or update the Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+
+  freebsd:
+    name: Build FreeBSD binary
+    runs-on: [self-hosted, medina]
+    needs: create-release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 180
+    concurrency:
+      group: freebsd-release-vm
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Sync source into the FreeBSD VM
+        run: |
+          set -euo pipefail
+          ssh runner-fbsd 'mkdir -p build/terrapi-vault'
+          rsync -az --delete \
+            --exclude '/target' \
+            --exclude '/services/target' \
+            --exclude '/.git' \
+            -e ssh \
+            ./ runner-fbsd:build/terrapi-vault/
+
+      - name: Build + package on the FreeBSD VM
+        env:
+          VERSION: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Prefix is expanded by THIS runner (VERSION→tag); the single-quoted
+          # remainder runs verbatim on the FreeBSD VM.
+          ssh runner-fbsd "VERSION='${VERSION}'; "'
+            set -eu
+            : "${VERSION:?VERSION not set on VM session}"
+            export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:"$HOME/.cargo/bin"
+            cd "$HOME/build/terrapi-vault/services"
+            cargo build --release -p vault-broker
+            ls -l target/release/vault-broker
+            file target/release/vault-broker || true
+            cd "$HOME/build/terrapi-vault"
+            TARGET="x86_64-unknown-freebsd"
+            STAGING="vault-broker-${VERSION}-${TARGET}"
+            rm -rf "$STAGING" "${STAGING}.tar.gz" "${STAGING}.tar.gz.sha256"
+            mkdir -p "$STAGING"
+            cp -v services/target/release/vault-broker "$STAGING/vault-broker"
+            [ -s "$STAGING/vault-broker" ] || { echo "::error::staged binary missing/empty"; exit 1; }
+            cp LICENSE-APACHE LICENSE-MIT README.md "$STAGING/" || true
+            # Ship the whole deploy/ module alongside the binary (rc.d, install.sh,
+            # zfs, security, env/roles samples) so the host has everything.
+            cp -R deploy "$STAGING/deploy"
+            echo "--- staging ---"; ls -l "$STAGING"; du -sh "$STAGING"
+            tar -czf "${STAGING}.tar.gz" "$STAGING"
+            sha256sum "${STAGING}.tar.gz" > "${STAGING}.tar.gz.sha256"
+            sz=$(gzip -dc "${STAGING}.tar.gz" | wc -c)
+            echo "unpacked tar size: ${sz} bytes"
+            [ "$sz" -gt 3000000 ] || { echo "::error::FreeBSD tarball too small (${sz}B) — binary missing"; exit 1; }
+          '
+
+      - name: Pull tarball back from the VM
+        env:
+          VERSION: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          STAGING="vault-broker-${VERSION}-x86_64-unknown-freebsd"
+          rsync -az -e ssh \
+            "runner-fbsd:build/terrapi-vault/${STAGING}.tar.gz" \
+            "runner-fbsd:build/terrapi-vault/${STAGING}.tar.gz.sha256" \
+            ./
+
+      - name: Verify packaged tarball on host
+        run: |
+          ls -l vault-broker-*-x86_64-unknown-freebsd.tar.gz
+          sz=$(stat -c%s vault-broker-*-x86_64-unknown-freebsd.tar.gz)
+          echo "host tarball size: ${sz} bytes"
+          [ "$sz" -gt 2000000 ] || { echo "::error::synced FreeBSD tarball too small (${sz}B)"; exit 1; }
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            vault-broker-*-x86_64-unknown-freebsd.tar.gz
+            vault-broker-*-x86_64-unknown-freebsd.tar.gz.sha256
+          fail_on_unmatched_files: true
+
+  linux:
+    name: Build Linux binary
+    runs-on: [self-hosted, medina]
+    needs: create-release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services
+          shared-key: release-linux
+      - name: Build
+        run: cargo build --release -p vault-broker
+        working-directory: services
+      - name: Package
+        run: |
+          VERSION="${{ inputs.tag || github.ref_name }}"
+          TARGET="x86_64-unknown-linux-gnu"
+          STAGING="vault-broker-${VERSION}-${TARGET}"
+          mkdir -p "$STAGING"
+          cp services/target/release/vault-broker "$STAGING/"
+          cp LICENSE-APACHE LICENSE-MIT README.md "$STAGING/" || true
+          cp -R deploy "$STAGING/deploy"
+          tar -czf "${STAGING}.tar.gz" "$STAGING"
+          sha256sum "${STAGING}.tar.gz" > "${STAGING}.tar.gz.sha256"
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            vault-broker-*-x86_64-unknown-linux-gnu.tar.gz
+            vault-broker-*-x86_64-unknown-linux-gnu.tar.gz.sha256
+          fail_on_unmatched_files: true
