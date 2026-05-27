@@ -4,9 +4,9 @@
 //! will, using the production default KDF params only where the cost
 //! is acceptable.
 
-use terrapi_vault::{Error, KdfParams, Vault};
 use std::io::Read;
 use tempfile::TempDir;
+use terrapi_vault::{Error, KdfParams, Vault};
 
 /// Fast params: full Argon2id cost is validated by the unit timing test;
 /// integration tests just need the encryption path.
