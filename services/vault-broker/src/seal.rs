@@ -27,7 +27,11 @@ pub enum UnsealError {
 /// # Errors
 /// `BadPassphrase` if an existing store rejects the passphrase; `Store` on any other
 /// store error.
-pub fn unseal(store_path: &Path, passphrase: &str, params: KdfParams) -> Result<Vault, UnsealError> {
+pub fn unseal(
+    store_path: &Path,
+    passphrase: &str,
+    params: KdfParams,
+) -> Result<Vault, UnsealError> {
     if store_path.exists() {
         match Vault::open(store_path, passphrase) {
             Ok(v) => Ok(v),
@@ -52,7 +56,8 @@ pub fn unseal_dev() -> Result<Vault, UnsealError> {
     // A leftover dev store from a previous run would make `create` fail.
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(terrapi_vault::meta_path_for(&path));
-    Vault::create(&path, "dev-ephemeral", dev_params()).map_err(|e| UnsealError::Store(e.to_string()))
+    Vault::create(&path, "dev-ephemeral", dev_params())
+        .map_err(|e| UnsealError::Store(e.to_string()))
 }
 
 /// Deliberately weak params so a dev boot doesn't pay 64 MiB / 2-pass Argon2id.
@@ -98,7 +103,9 @@ mod tests {
     fn wrong_passphrase_is_rejected() {
         let path = tmp("bad");
         cleanup(&path);
-        unseal(&path, "right-passphrase", dev_params()).unwrap().lock();
+        unseal(&path, "right-passphrase", dev_params())
+            .unwrap()
+            .lock();
         let err = unseal(&path, "WRONG-passphrase", dev_params()).unwrap_err();
         assert!(matches!(err, UnsealError::BadPassphrase));
         cleanup(&path);

@@ -285,7 +285,8 @@ pub fn verify(path: impl AsRef<Path>) -> Result<u64, VerifyError> {
     let mut prev = GENESIS;
     let mut expected: u64 = 0;
     for line in data.lines().filter(|l| !l.trim().is_empty()) {
-        let r: RecordIn = serde_json::from_str(line).map_err(|_| VerifyError::Malformed(expected))?;
+        let r: RecordIn =
+            serde_json::from_str(line).map_err(|_| VerifyError::Malformed(expected))?;
         if r.seq != expected {
             return Err(VerifyError::SeqGap {
                 expected,
@@ -428,7 +429,10 @@ mod tests {
         std::fs::write(&path, format!("{}\n{}\n", lines[0], lines[2])).unwrap();
         assert_eq!(
             verify(&path),
-            Err(VerifyError::SeqGap { expected: 1, got: 2 })
+            Err(VerifyError::SeqGap {
+                expected: 1,
+                got: 2
+            })
         );
         let _ = std::fs::remove_file(&path);
     }

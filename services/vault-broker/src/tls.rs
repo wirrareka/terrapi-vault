@@ -89,7 +89,9 @@ fn build_server_config(tls: &TlsPaths) -> Result<ServerConfig, String> {
 
     let mut roots = RootCertStore::empty();
     for ca in load_certs(&tls.client_ca)? {
-        roots.add(ca).map_err(|e| format!("client CA bundle: {e}"))?;
+        roots
+            .add(ca)
+            .map_err(|e| format!("client CA bundle: {e}"))?;
     }
     let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
         .build()
@@ -120,7 +122,7 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
 
 /// First DNS SAN of a DER-encoded X.509 cert (the daemon identity → role key).
 fn san_from_cert(der: &[u8]) -> Option<String> {
-    use x509_parser::prelude::{GeneralName, FromDer, X509Certificate};
+    use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
     let (_, cert) = X509Certificate::from_der(der).ok()?;
     let san = cert.subject_alternative_name().ok()??;
     san.value.general_names.iter().find_map(|gn| match gn {
@@ -135,9 +137,8 @@ mod tests {
 
     #[test]
     fn extracts_dns_san_from_cert() {
-        let ck =
-            rcgen::generate_simple_self_signed(vec!["demon.eu.proximi.internal".to_string()])
-                .unwrap();
+        let ck = rcgen::generate_simple_self_signed(vec!["demon.eu.proximi.internal".to_string()])
+            .unwrap();
         let san = san_from_cert(ck.cert.der());
         assert_eq!(san.as_deref(), Some("demon.eu.proximi.internal"));
     }

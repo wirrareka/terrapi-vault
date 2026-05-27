@@ -116,7 +116,10 @@ pub fn now_unix() -> u64 {
 pub fn random_id() -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(64);
-    for b in terrapi_vault::random_salt().iter().chain(terrapi_vault::random_salt().iter()) {
+    for b in terrapi_vault::random_salt()
+        .iter()
+        .chain(terrapi_vault::random_salt().iter())
+    {
         let _ = write!(s, "{b:02x}");
     }
     s

@@ -110,10 +110,7 @@ impl SshCa {
     #[must_use]
     pub fn public_openssh(&self) -> String {
         // `to_openssh` on a public key is infallible in practice; fall back to empty.
-        self.key
-            .public_key()
-            .to_openssh()
-            .unwrap_or_default()
+        self.key.public_key().to_openssh().unwrap_or_default()
     }
 
     /// Sign `public_key_openssh` into a short-TTL OpenSSH certificate.
@@ -139,8 +136,9 @@ impl SshCa {
             .map_err(|e| CaError::BadRequest(format!("public_key: {e}")))?;
 
         let serial: u64 = rand::random();
-        let mut builder = Builder::new_with_random_nonce(&mut OsRng, subject, valid_after, valid_before)
-            .map_err(|e| CaError::Ssh(e.to_string()))?;
+        let mut builder =
+            Builder::new_with_random_nonce(&mut OsRng, subject, valid_after, valid_before)
+                .map_err(|e| CaError::Ssh(e.to_string()))?;
         builder
             .serial(serial)
             .map_err(|e| CaError::Ssh(e.to_string()))?;
@@ -155,7 +153,9 @@ impl SshCa {
                 .valid_principal(p.clone())
                 .map_err(|e| CaError::Ssh(e.to_string()))?;
         }
-        let cert = builder.sign(&self.key).map_err(|e| CaError::Ssh(e.to_string()))?;
+        let cert = builder
+            .sign(&self.key)
+            .map_err(|e| CaError::Ssh(e.to_string()))?;
         let openssh = cert.to_openssh().map_err(|e| CaError::Ssh(e.to_string()))?;
         Ok(Signed {
             openssh,
@@ -211,7 +211,8 @@ pub fn list_revoked(vault: &Vault) -> Result<Vec<u64>, CaError> {
             let mut stmt = c.prepare("SELECT serial FROM ssh_revoked ORDER BY serial")?;
             let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
             #[allow(clippy::cast_sign_loss)]
-            rows.map(|r| r.map(|v| v as u64)).collect::<rusqlite::Result<Vec<u64>>>()
+            rows.map(|r| r.map(|v| v as u64))
+                .collect::<rusqlite::Result<Vec<u64>>>()
         })
         .map_err(|e| CaError::Store(e.to_string()))
 }

@@ -33,7 +33,13 @@ async fn sweep_once(state: &AppState) {
 
     for sid in &swept.ended_sessions {
         state.unbind_session(sid);
-        emit(state, "session.expire", "session", Some(sid.clone()), Outcome::Success);
+        emit(
+            state,
+            "session.expire",
+            "session",
+            Some(sid.clone()),
+            Outcome::Success,
+        );
     }
 
     // Record any expired SSH cert serials in the CA revocation list.
@@ -42,12 +48,28 @@ async fn sweep_once(state: &AppState) {
     // Delete the backend users owned by expired cred leases (SSH-cert leases have none).
     let torn = creds::teardown(&state.engines, &state.cred_handles, &swept.revoked_leases).await;
     for t in torn {
-        let outcome = if t.outcome_ok { Outcome::Success } else { Outcome::Failure };
-        emit(state, "creds.revoke", "creds", Some(format!("role={}", t.role)), outcome);
+        let outcome = if t.outcome_ok {
+            Outcome::Success
+        } else {
+            Outcome::Failure
+        };
+        emit(
+            state,
+            "creds.revoke",
+            "creds",
+            Some(format!("role={}", t.role)),
+            outcome,
+        );
     }
 
     for lid in &swept.revoked_leases {
-        emit(state, "lease.expire", "lease", Some(lid.clone()), Outcome::Success);
+        emit(
+            state,
+            "lease.expire",
+            "lease",
+            Some(lid.clone()),
+            Outcome::Success,
+        );
     }
 }
 

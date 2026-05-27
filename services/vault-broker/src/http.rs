@@ -9,7 +9,6 @@ use crate::dto::{
     KmsWrapRequest, KmsWrapResponse, LeaseRenewRequest, LeaseRenewResponse, LeaseRevokeRequest,
     SealStatus, SessionEndResponse, SessionOpenRequest, SessionOpenResponse, SshSignRequest,
 };
-use base64::Engine as _;
 use crate::state::{
     now_unix, AppState, CREDS_DEFAULT_TTL_SECS, DEFAULT_SESSION_IDLE_SECS,
     DEFAULT_SESSION_TTL_SECS, SSH_CERT_TTL_INTERACTIVE_SECS,
@@ -18,6 +17,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
 use ssh_key::certificate::CertType;
 use vault_transport::audit::{Actor, ActorKind, AuditEvent, Outcome, Target};
 use vault_transport::ResidencyGroup;
@@ -96,8 +96,14 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/{group}/ssh/sign", post(ssh_sign))
         .route("/v1/{group}/{tenant_id}/creds/{role}", post(creds))
         .route("/v1/{group}/{tenant_id}/kms/{key_id}/wrap", post(kms_wrap))
-        .route("/v1/{group}/{tenant_id}/kms/{key_id}/unwrap", post(kms_unwrap))
-        .route("/v1/{group}/{tenant_id}/kms/{key_id}/rotate", post(kms_rotate))
+        .route(
+            "/v1/{group}/{tenant_id}/kms/{key_id}/unwrap",
+            post(kms_unwrap),
+        )
+        .route(
+            "/v1/{group}/{tenant_id}/kms/{key_id}/rotate",
+            post(kms_rotate),
+        )
         .route("/v1/sys/session", post(session_open))
         .route("/v1/sys/session/{id}", delete(session_end))
         .route("/v1/sys/store-snapshot", post(store_snapshot))
@@ -112,7 +118,9 @@ async fn healthz() -> &'static str {
 
 /// Loopback-only metrics router (`8201`): Prometheus text, no auth (WG/loopback bound).
 pub fn metrics_router(state: AppState) -> Router {
-    Router::new().route("/metrics", get(metrics)).with_state(state)
+    Router::new()
+        .route("/metrics", get(metrics))
+        .with_state(state)
 }
 
 async fn metrics(State(state): State<AppState>) -> String {
@@ -185,16 +193,28 @@ async fn ssh_revoked(
     require_cap(&principal, Capability::SshCa)?;
     check_group(&state, &group)?;
     let Some(store) = state.store.clone() else {
-        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "sealed", "broker is sealed"));
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sealed",
+            "broker is sealed",
+        ));
     };
     let revoked_serials = {
         let v = store.lock().expect("store lock");
         crate::ssh_ca::list_revoked(&v)
     }
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "store_error", &e.to_string()))?;
+    .map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "store_error",
+            &e.to_string(),
+        )
+    })?;
     Ok(Json(crate::dto::SshRevokedResponse { revoked_serials }))
 }
 
+// Validation + session-bound lease + sign + audit in one place; reads linearly.
+#[allow(clippy::too_many_lines)]
 async fn ssh_sign(
     State(state): State<AppState>,
     principal: Principal,
@@ -205,7 +225,11 @@ async fn ssh_sign(
     check_group(&state, &group)?;
     require_unsealed(&state)?;
     let Some(ca) = state.ssh_ca.clone() else {
-        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "sealed", "broker is sealed"));
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sealed",
+            "broker is sealed",
+        ));
     };
 
     // Host certs are group-scoped: they must not carry a tenant. User certs may.
@@ -262,15 +286,27 @@ async fn ssh_sign(
         principal.san,
         req.tenant_id.as_deref().unwrap_or("-")
     );
-    let signed = match ca.sign(&req.public_key, cert_type, &req.principals, &key_id, now, valid_before)
-    {
+    let signed = match ca.sign(
+        &req.public_key,
+        cert_type,
+        &req.principals,
+        &key_id,
+        now,
+        valid_before,
+    ) {
         Ok(s) => s,
         Err(e) => {
             let mut eng = state.leases.lock().expect("lease lock");
             let _ = eng.revoke(&lease_id);
             return Err(match e {
-                crate::ssh_ca::CaError::BadRequest(m) => err(StatusCode::BAD_REQUEST, "bad_request", &m),
-                other => err(StatusCode::INTERNAL_SERVER_ERROR, "sign_failed", &other.to_string()),
+                crate::ssh_ca::CaError::BadRequest(m) => {
+                    err(StatusCode::BAD_REQUEST, "bad_request", &m)
+                }
+                other => err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "sign_failed",
+                    &other.to_string(),
+                ),
             });
         }
     };
@@ -308,10 +344,18 @@ async fn store_snapshot(
     require_cap(&principal, Capability::Snapshot)?;
     require_unsealed(&state)?;
     let Some(store) = state.store.clone() else {
-        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "sealed", "broker is sealed"));
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sealed",
+            "broker is sealed",
+        ));
     };
     if let Err(e) = std::fs::create_dir_all(&state.cfg.snapshot_dir) {
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "store_error", &e.to_string()));
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "store_error",
+            &e.to_string(),
+        ));
     }
     let snap_path = state.cfg.snapshot_dir.join(format!(
         "vault-store-{}-{}.sqlcipher",
@@ -325,10 +369,21 @@ async fn store_snapshot(
         let v = store.lock().expect("store lock");
         v.with_connection(|c| c.execute("VACUUM INTO ?1", [snap_str.as_str()]).map(|_| ()))
     }
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "snapshot_failed", &e.to_string()))?;
+    .map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "snapshot_failed",
+            &e.to_string(),
+        )
+    })?;
 
-    let data = std::fs::read(&snap_path)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "store_error", &e.to_string()))?;
+    let data = std::fs::read(&snap_path).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "store_error",
+            &e.to_string(),
+        )
+    })?;
     let sha256 = {
         use sha2::{Digest, Sha256};
         use std::fmt::Write as _;
@@ -442,13 +497,17 @@ async fn creds(
         ));
     };
 
-    state.cred_handles.lock().expect("cred handles lock").insert(
-        lease_id.clone(),
-        crate::creds::CredHandle {
-            role: role.clone(),
-            username: issued.username.clone(),
-        },
-    );
+    state
+        .cred_handles
+        .lock()
+        .expect("cred handles lock")
+        .insert(
+            lease_id.clone(),
+            crate::creds::CredHandle {
+                role: role.clone(),
+                username: issued.username.clone(),
+            },
+        );
 
     state.emit(&AuditEvent::vault(
         AppState::now_ts(),
@@ -509,7 +568,11 @@ fn kms_preflight(
         ));
     }
     state.store.clone().ok_or_else(|| {
-        err(StatusCode::SERVICE_UNAVAILABLE, "sealed", "broker is sealed")
+        err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sealed",
+            "broker is sealed",
+        )
     })
 }
 
@@ -535,7 +598,13 @@ async fn kms_wrap(
     let store = kms_preflight(&state, &principal, &group, &tenant_id, &key_id)?;
     let dek = base64::engine::general_purpose::STANDARD
         .decode(req.dek.as_bytes())
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad_dek", "dek must be valid base64"))?;
+        .map_err(|_| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "bad_dek",
+                "dek must be valid base64",
+            )
+        })?;
     let wrapped = {
         let v = store.lock().expect("store lock");
         crate::kms::wrap(&v, &group, &tenant_id, &key_id, &dek)
@@ -570,7 +639,13 @@ async fn kms_unwrap(
     let store = kms_preflight(&state, &principal, &group, &tenant_id, &key_id)?;
     let wrapped = base64::engine::general_purpose::STANDARD
         .decode(req.wrapped.as_bytes())
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad_wrapped", "wrapped must be valid base64"))?;
+        .map_err(|_| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "bad_wrapped",
+                "wrapped must be valid base64",
+            )
+        })?;
     let dek = {
         let v = store.lock().expect("store lock");
         crate::kms::unwrap(&v, &group, &tenant_id, &key_id, &wrapped)
@@ -665,7 +740,11 @@ async fn tear_down_creds(state: &AppState, principal: &Principal, revoked: &[Str
                 kind: "creds".into(),
                 id: Some(format!("role={}", t.role)),
             },
-            if t.outcome_ok { Outcome::Success } else { Outcome::Failure },
+            if t.outcome_ok {
+                Outcome::Success
+            } else {
+                Outcome::Failure
+            },
             None,
         ));
     }

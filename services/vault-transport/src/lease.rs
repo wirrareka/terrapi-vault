@@ -247,7 +247,9 @@ impl<F: FnMut() -> String> LeaseEngine<F> {
             .filter(|l| !l.revoked && now >= l.expires_at)
             .map(|l| l.id.clone())
             .collect();
-        swept.revoked_leases.extend(self.revoke_each(&expired_leases));
+        swept
+            .revoked_leases
+            .extend(self.revoke_each(&expired_leases));
 
         swept
     }
@@ -369,7 +371,7 @@ mod tests {
     fn sweep_expires_idle_session() {
         let mut e = LeaseEngine::new(seq_gen());
         let s = e.open_session(0, 28_800, 1_800); // 8h hard, 30m idle
-        // no activity → idle deadline 1800
+                                                  // no activity → idle deadline 1800
         assert!(e.sweep(1_799).is_empty());
         let swept = e.sweep(1_800);
         assert_eq!(swept.ended_sessions, vec![s]);

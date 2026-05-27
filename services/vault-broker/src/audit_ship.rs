@@ -111,7 +111,15 @@ async fn ship_backlog(task: &ShipTask) {
         return;
     }
     let n = items.len();
-    match bulk_ship(&task.client, &task.base_url, &task.user, &task.password, &items).await {
+    match bulk_ship(
+        &task.client,
+        &task.base_url,
+        &task.user,
+        &task.password,
+        &items,
+    )
+    .await
+    {
         Ok(()) => write_cursor(&task.cursor_path, new_offset),
         Err(e) => eprintln!("vault-broker: audit ship failed ({n} events): {e}"),
     }
@@ -243,8 +251,14 @@ mod tests {
 
     #[test]
     fn index_for_derives_year_month() {
-        assert_eq!(index_for("eu", "2026-05-27T10:00:00.000Z"), "audit-events-eu-2026.05");
-        assert_eq!(index_for("uae", "2026-12-01T00:00:00Z"), "audit-events-uae-2026.12");
+        assert_eq!(
+            index_for("eu", "2026-05-27T10:00:00.000Z"),
+            "audit-events-eu-2026.05"
+        );
+        assert_eq!(
+            index_for("uae", "2026-12-01T00:00:00Z"),
+            "audit-events-uae-2026.12"
+        );
     }
 
     #[test]
@@ -267,7 +281,8 @@ mod tests {
 
     #[test]
     fn cursor_roundtrip() {
-        let p = std::env::temp_dir().join(format!("vault-ship-cursor-{}.shipped", std::process::id()));
+        let p =
+            std::env::temp_dir().join(format!("vault-ship-cursor-{}.shipped", std::process::id()));
         let _ = std::fs::remove_file(&p);
         assert_eq!(read_cursor(&p), 0); // missing → 0
         write_cursor(&p, 4096);
@@ -284,21 +299,47 @@ mod tests {
             return;
         };
         let user = std::env::var("VAULT_AUDIT_OS_TEST_USER").unwrap_or_else(|_| "admin".into());
-        let pass = std::env::var("VAULT_AUDIT_OS_TEST_PASSWORD").expect("VAULT_AUDIT_OS_TEST_PASSWORD");
+        let pass =
+            std::env::var("VAULT_AUDIT_OS_TEST_PASSWORD").expect("VAULT_AUDIT_OS_TEST_PASSWORD");
         let base = url.trim_end_matches('/').to_string();
-        let client = reqwest::Client::builder().danger_accept_invalid_certs(true).build().unwrap();
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
         let index = format!("audit-events-it-{}", std::process::id());
         let items = vec![
-            (index.clone(), r#"{"ts":"2026-05-27T00:00:00Z","action":"lease.expire"}"#.to_string()),
-            (index.clone(), r#"{"ts":"2026-05-27T00:00:01Z","action":"creds.revoke"}"#.to_string()),
+            (
+                index.clone(),
+                r#"{"ts":"2026-05-27T00:00:00Z","action":"lease.expire"}"#.to_string(),
+            ),
+            (
+                index.clone(),
+                r#"{"ts":"2026-05-27T00:00:01Z","action":"creds.revoke"}"#.to_string(),
+            ),
         ];
-        bulk_ship(&client, &base, &user, &pass, &items).await.unwrap();
-        client.post(format!("{base}/{index}/_refresh")).basic_auth(&user, Some(&pass)).send().await.unwrap();
+        bulk_ship(&client, &base, &user, &pass, &items)
+            .await
+            .unwrap();
+        client
+            .post(format!("{base}/{index}/_refresh"))
+            .basic_auth(&user, Some(&pass))
+            .send()
+            .await
+            .unwrap();
         let count: serde_json::Value = client
             .get(format!("{base}/{index}/_count"))
             .basic_auth(&user, Some(&pass))
-            .send().await.unwrap().json().await.unwrap();
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         assert_eq!(count["count"], 2);
-        let _ = client.delete(format!("{base}/{index}")).basic_auth(&user, Some(&pass)).send().await;
+        let _ = client
+            .delete(format!("{base}/{index}"))
+            .basic_auth(&user, Some(&pass))
+            .send()
+            .await;
     }
 }

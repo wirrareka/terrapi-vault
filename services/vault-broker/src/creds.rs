@@ -138,7 +138,10 @@ impl MockEngine {
     #[cfg(test)]
     #[must_use]
     pub fn has_user(&self, username: &str) -> bool {
-        self.users.lock().expect("mock users lock").contains(username)
+        self.users
+            .lock()
+            .expect("mock users lock")
+            .contains(username)
     }
 }
 
@@ -171,7 +174,10 @@ mod tests {
     #[tokio::test]
     async fn issue_then_teardown_deletes_the_backend_user() {
         let mut engines = CredEngines::new();
-        engines.register("audit-writer", Box::new(MockEngine::new("audit-writer", 3600)));
+        engines.register(
+            "audit-writer",
+            Box::new(MockEngine::new("audit-writer", 3600)),
+        );
         let handles = Mutex::new(HashMap::new());
 
         let issued = engines

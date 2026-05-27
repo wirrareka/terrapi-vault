@@ -54,7 +54,14 @@ fn gen_kek() -> [u8; 32] {
     kek
 }
 
-fn insert_kek(vault: &Vault, g: &str, t: &str, k: &str, version: u32, kek: &[u8; 32]) -> Result<(), KmsError> {
+fn insert_kek(
+    vault: &Vault,
+    g: &str,
+    t: &str,
+    k: &str,
+    version: u32,
+    kek: &[u8; 32],
+) -> Result<(), KmsError> {
     let now = crate::state::AppState::now_ts();
     vault
         .with_connection(|c| {
@@ -100,7 +107,13 @@ fn current_kek(vault: &Vault, g: &str, t: &str, k: &str) -> Result<(u32, [u8; 32
 }
 
 /// Load a specific KEK version (for unwrapping an older blob).
-fn kek_at(vault: &Vault, g: &str, t: &str, k: &str, version: u32) -> Result<Option<[u8; 32]>, KmsError> {
+fn kek_at(
+    vault: &Vault,
+    g: &str,
+    t: &str,
+    k: &str,
+    version: u32,
+) -> Result<Option<[u8; 32]>, KmsError> {
     ensure_table(vault)?;
     let bytes: Option<Vec<u8>> = vault
         .with_connection(|c| {
@@ -117,9 +130,11 @@ fn kek_at(vault: &Vault, g: &str, t: &str, k: &str, version: u32) -> Result<Opti
         })
         .map_err(|e| KmsError::Store(e.to_string()))?;
     match bytes {
-        Some(b) => Ok(Some(
-            b.try_into().map_err(|_| KmsError::Store("stored KEK has wrong length".into()))?,
-        )),
+        Some(b) => {
+            Ok(Some(b.try_into().map_err(|_| {
+                KmsError::Store("stored KEK has wrong length".into())
+            })?))
+        }
         None => Ok(None),
     }
 }
@@ -208,7 +223,11 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(terrapi_vault::meta_path_for(&path));
-        let params = KdfParams { m_cost_kib: 8 * 1024, t_cost: 1, p_cost: 1 };
+        let params = KdfParams {
+            m_cost_kib: 8 * 1024,
+            t_cost: 1,
+            p_cost: 1,
+        };
         let v = Vault::create(&path, "test", params).unwrap();
         (v, path)
     }
@@ -228,9 +247,23 @@ mod tests {
     fn wrap_then_unwrap_roundtrips() {
         let (v, path) = dev_vault("rt");
         let dek = b"a-32-byte-data-encryption-key!!!";
-        let w = wrap(&v, "eu", "11111111-1111-4111-8111-111111111111", "target-1", dek).unwrap();
+        let w = wrap(
+            &v,
+            "eu",
+            "11111111-1111-4111-8111-111111111111",
+            "target-1",
+            dek,
+        )
+        .unwrap();
         assert_ne!(&w[12..], &dek[..]); // ciphertext != plaintext
-        let got = unwrap(&v, "eu", "11111111-1111-4111-8111-111111111111", "target-1", &w).unwrap();
+        let got = unwrap(
+            &v,
+            "eu",
+            "11111111-1111-4111-8111-111111111111",
+            "target-1",
+            &w,
+        )
+        .unwrap();
         assert_eq!(got, dek);
         cleanup(&path);
     }
@@ -238,9 +271,23 @@ mod tests {
     #[test]
     fn unwrap_under_a_different_key_id_fails() {
         let (v, path) = dev_vault("wrongkey");
-        let w = wrap(&v, "eu", "11111111-1111-4111-8111-111111111111", "target-1", b"secret").unwrap();
+        let w = wrap(
+            &v,
+            "eu",
+            "11111111-1111-4111-8111-111111111111",
+            "target-1",
+            b"secret",
+        )
+        .unwrap();
         // different key_id → different KEK → AEAD auth fails
-        let err = unwrap(&v, "eu", "11111111-1111-4111-8111-111111111111", "target-2", &w).unwrap_err();
+        let err = unwrap(
+            &v,
+            "eu",
+            "11111111-1111-4111-8111-111111111111",
+            "target-2",
+            &w,
+        )
+        .unwrap_err();
         assert!(matches!(err, KmsError::Crypto));
         cleanup(&path);
     }
@@ -248,7 +295,14 @@ mod tests {
     #[test]
     fn tampered_blob_fails() {
         let (v, path) = dev_vault("tamper");
-        let mut w = wrap(&v, "eu", "11111111-1111-4111-8111-111111111111", "t", b"secret").unwrap();
+        let mut w = wrap(
+            &v,
+            "eu",
+            "11111111-1111-4111-8111-111111111111",
+            "t",
+            b"secret",
+        )
+        .unwrap();
         let last = w.len() - 1;
         w[last] ^= 0xff; // flip a tag byte
         assert!(matches!(

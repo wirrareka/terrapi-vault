@@ -135,7 +135,8 @@ mod tests {
             return;
         };
         let user = std::env::var("VAULT_OS_TEST_ADMIN_USER").unwrap_or_else(|_| "admin".into());
-        let pass = std::env::var("VAULT_OS_TEST_ADMIN_PASSWORD").expect("VAULT_OS_TEST_ADMIN_PASSWORD");
+        let pass =
+            std::env::var("VAULT_OS_TEST_ADMIN_PASSWORD").expect("VAULT_OS_TEST_ADMIN_PASSWORD");
         // A built-in role so the security API validates the mapping without extra setup.
         let role = std::env::var("VAULT_OS_TEST_ROLE").unwrap_or_else(|_| "readall".into());
 
@@ -152,7 +153,10 @@ mod tests {
             max_ttl_secs: 3600,
         };
 
-        let issued = engine.issue("11111111-1111-4111-8111-111111111111", 900).await.unwrap();
+        let issued = engine
+            .issue("11111111-1111-4111-8111-111111111111", 900)
+            .await
+            .unwrap();
         // exists
         let exists = client
             .get(engine.user_url(&issued.username))
@@ -160,7 +164,10 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert!(exists.status().is_success(), "user should exist after issue");
+        assert!(
+            exists.status().is_success(),
+            "user should exist after issue"
+        );
 
         engine.revoke(&issued.username).await.unwrap();
         // gone
@@ -170,6 +177,10 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(gone.status(), reqwest::StatusCode::NOT_FOUND, "user should be deleted");
+        assert_eq!(
+            gone.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "user should be deleted"
+        );
     }
 }

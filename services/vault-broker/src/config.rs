@@ -67,10 +67,8 @@ impl BrokerConfig {
             |_| std::env::temp_dir().join("vault-broker-store.sqlcipher"),
             PathBuf::from,
         );
-        let snapshot_dir = std::env::var("VAULT_SNAPSHOT_DIR").map_or_else(
-            |_| std::env::temp_dir(),
-            PathBuf::from,
-        );
+        let snapshot_dir = std::env::var("VAULT_SNAPSHOT_DIR")
+            .map_or_else(|_| std::env::temp_dir(), PathBuf::from);
         let allow_insecure_dev = std::env::var("VAULT_ALLOW_INSECURE_DEV").as_deref() == Ok("1");
         let tls = match (
             std::env::var("VAULT_TLS_CERT"),
@@ -113,13 +111,15 @@ fn load_roles() -> HashMap<String, RolePrincipal> {
         return HashMap::new();
     };
     match std::fs::read_to_string(&path) {
-        Ok(raw) => match serde_json::from_str::<RolesFile>(&raw) {
-            Ok(f) => f.roles,
-            Err(e) => {
-                eprintln!("vault-broker: VAULT_ROLES_CONFIG parse error ({e}); roles empty (deny-all)");
-                HashMap::new()
+        Ok(raw) => {
+            match serde_json::from_str::<RolesFile>(&raw) {
+                Ok(f) => f.roles,
+                Err(e) => {
+                    eprintln!("vault-broker: VAULT_ROLES_CONFIG parse error ({e}); roles empty (deny-all)");
+                    HashMap::new()
+                }
             }
-        },
+        }
         Err(e) => {
             eprintln!("vault-broker: VAULT_ROLES_CONFIG read error ({e}); roles empty (deny-all)");
             HashMap::new()
