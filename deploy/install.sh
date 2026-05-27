@@ -60,12 +60,13 @@ chown vault:vault "${DATA}/unseal.pass"; chmod 600 "${DATA}/unseal.pass"
 
 # --- step 4: config + roles + tls -------------------------------------------
 install -d -m 755 "${ETC}" "${ETC}/tls"
+# env + roles are 0640 root:vault — the broker reads them as the vault user.
 if [ ! -s "${ETC}/vault-broker.env" ]; then
-    install -m 600 -o root -g vault "${HERE}/vault-broker.env.sample" "${ETC}/vault-broker.env"
+    install -m 640 -o root -g vault "${HERE}/vault-broker.env.sample" "${ETC}/vault-broker.env"
     echo "--> wrote ${ETC}/vault-broker.env from sample — EDIT it (group, WG IP, OS URL)."
 fi
 if [ ! -s "${ETC}/roles.json" ]; then
-    install -m 600 -o root -g vault "${HERE}/roles.json.sample" "${ETC}/roles.json"
+    install -m 640 -o root -g vault "${HERE}/roles.json.sample" "${ETC}/roles.json"
     echo "--> wrote ${ETC}/roles.json from sample — confirm the SAN→role/caps map."
 fi
 echo "    REQUIRED: ${ETC}/tls/{server.pem,server.key,fleet-root-ca.pem} from infra."

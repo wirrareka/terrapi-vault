@@ -3,6 +3,20 @@
 terrapi-vault — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
+## 0.1.2
+
+Deploy-only fix (binary unchanged from 0.1.1) — the rc.d `service` start found in the
+v0.1.1 medina deploy:
+- **rc.d double user-drop** — the rc.d config vars were named `vault_broker_user` /
+  `vault_broker_group`, which `rc.subr` treats as **magic** (`${name}_user`) and does its
+  OWN su/chroot drop — on top of `daemon -u vault`. That doubled-dropped context couldn't
+  read the env file (`env: …/vault-broker.env: Permission denied`), so
+  `service vault-broker start` failed (direct `daemon` worked). Renamed to
+  `vault_broker_runas` / `vault_broker_rungroup` (plain vars) so the single `daemon -u`
+  drop is used — now reboot-safe via `service`.
+- **env + roles perms** — `vault-broker.env` and `roles.json` are now `0640 root:vault`
+  (the broker reads them as the `vault` user; `0600 root:vault` denied the read).
+
 ## 0.1.1
 
 Startup fixes found in the first medina deploy of 0.1.0:

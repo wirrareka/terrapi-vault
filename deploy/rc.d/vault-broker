@@ -17,7 +17,7 @@
 #   vault_broker_enable="YES"
 #
 # Optional overrides (defaults shown):
-#   vault_broker_user="vault"
+#   vault_broker_runas="vault"
 #   vault_broker_data="/var/db/terrapi-vault"           # on the encrypted dataset
 #   vault_broker_env="/usr/local/etc/terrapi-vault/vault-broker.env"  # mode 0600
 #   vault_broker_log="/var/log/vault-broker.log"
@@ -29,8 +29,12 @@ rcvar="vault_broker_enable"
 load_rc_config $name
 
 : ${vault_broker_enable:="NO"}
-: ${vault_broker_user:="vault"}
-: ${vault_broker_group:="vault"}
+# NOTE: deliberately NOT `${name}_user` / `${name}_group` (i.e. vault_broker_user/group).
+# rc.subr treats those as magic and does its OWN su/chroot privilege-drop — combined with
+# daemon's `-u` that's a DOUBLE drop whose context can't read the env file. We do the
+# single drop via `daemon -u` (the by-hand-proven path), so these are plain vars.
+: ${vault_broker_runas:="vault"}
+: ${vault_broker_rungroup:="vault"}
 : ${vault_broker_data:="/var/db/terrapi-vault"}
 : ${vault_broker_env:="/usr/local/etc/terrapi-vault/vault-broker.env"}
 : ${vault_broker_log:="/var/log/vault-broker.log"}
@@ -45,7 +49,7 @@ procname="/usr/local/sbin/vault-broker"
 # path via env(1) — NO embedded quotes in command_args (rc.subr word-splits it and
 # does not honor inline quotes, which is what broke v0.1.0's `sh -c '...'` form).
 command="/usr/sbin/daemon"
-command_args="-c -f -p ${pidfile} -u ${vault_broker_user} -o ${vault_broker_log} \
+command_args="-c -f -p ${pidfile} -u ${vault_broker_runas} -o ${vault_broker_log} \
     /usr/bin/env VB_ENV=${vault_broker_env} ${vault_broker_runner}"
 start_precmd="vault_broker_prestart"
 stop_postcmd="vault_broker_poststop"
@@ -65,9 +69,9 @@ vault_broker_prestart() {
     fi
 
     # 2. Data dirs with locked-down perms (idempotent) — live on the encrypted dataset.
-    install -d -o ${vault_broker_user} -g ${vault_broker_group} -m 700 ${vault_broker_data}
-    install -d -o ${vault_broker_user} -g ${vault_broker_group} -m 700 ${vault_broker_data}/snapshots
-    install -d -o ${vault_broker_user} -g ${vault_broker_group} -m 700 ${vault_broker_data}/secrets
+    install -d -o ${vault_broker_runas} -g ${vault_broker_rungroup} -m 700 ${vault_broker_data}
+    install -d -o ${vault_broker_runas} -g ${vault_broker_rungroup} -m 700 ${vault_broker_data}/snapshots
+    install -d -o ${vault_broker_runas} -g ${vault_broker_rungroup} -m 700 ${vault_broker_data}/secrets
 
     # 3. Env drop-in (secrets sourced from the encrypted dataset). Must be mode-600.
     if [ ! -f "${vault_broker_env}" ]; then
@@ -91,7 +95,7 @@ vault_broker_prestart() {
 
     # 6. Touch the log so daemon(8) doesn't create it as root.
     if [ ! -f ${vault_broker_log} ]; then
-        install -o ${vault_broker_user} -g ${vault_broker_group} -m 640 /dev/null ${vault_broker_log}
+        install -o ${vault_broker_runas} -g ${vault_broker_rungroup} -m 640 /dev/null ${vault_broker_log}
     fi
 }
 

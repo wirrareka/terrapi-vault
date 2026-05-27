@@ -53,8 +53,9 @@ CMD chmod 755 /usr/local/etc/terrapi-vault-deploy/check-encryption.sh
 
 # Config + env drop-in are laid down out-of-band by deploy/install.sh (they carry
 # per-instance values + reference dataset secrets). Pre-create with safe perms.
-CMD touch /usr/local/etc/terrapi-vault/vault-broker.env && chmod 600 /usr/local/etc/terrapi-vault/vault-broker.env && chown root:vault /usr/local/etc/terrapi-vault/vault-broker.env
-CMD touch /usr/local/etc/terrapi-vault/roles.json && chmod 600 /usr/local/etc/terrapi-vault/roles.json && chown root:vault /usr/local/etc/terrapi-vault/roles.json
+# 0640 root:vault — the broker reads them as the vault user (0600 would deny the read).
+CMD touch /usr/local/etc/terrapi-vault/vault-broker.env && chown root:vault /usr/local/etc/terrapi-vault/vault-broker.env && chmod 640 /usr/local/etc/terrapi-vault/vault-broker.env
+CMD touch /usr/local/etc/terrapi-vault/roles.json && chown root:vault /usr/local/etc/terrapi-vault/roles.json && chmod 640 /usr/local/etc/terrapi-vault/roles.json
 
 # Enable services.
 SYSRC zfskeys_enable=YES

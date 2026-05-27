@@ -19,8 +19,11 @@ install -d -o vault -g vault -m 0700 /var/db/terrapi-vault          2>/dev/null 
 install -d -o vault -g vault -m 0700 /var/db/terrapi-vault/secrets  2>/dev/null || true
 install -d -o vault -g vault -m 0700 /var/db/terrapi-vault/snapshots 2>/dev/null || true
 [ -f /var/db/terrapi-vault/unseal.pass ] && chown vault:vault /var/db/terrapi-vault/unseal.pass && chmod 0600 /var/db/terrapi-vault/unseal.pass || true
-[ -f /usr/local/etc/terrapi-vault/vault-broker.env ] && chown root:vault /usr/local/etc/terrapi-vault/vault-broker.env && chmod 0600 /usr/local/etc/terrapi-vault/vault-broker.env || true
-[ -f /usr/local/etc/terrapi-vault/roles.json ] && chown root:vault /usr/local/etc/terrapi-vault/roles.json && chmod 0600 /usr/local/etc/terrapi-vault/roles.json || true
+# env + roles: root-owned, group-READABLE (0640) — the broker reads them as the vault
+# user (0600 root:vault would deny the vault read). No literal secrets in either file
+# (the env references dataset paths via $(cat ...); roles is just SAN→{role,caps}).
+[ -f /usr/local/etc/terrapi-vault/vault-broker.env ] && chown root:vault /usr/local/etc/terrapi-vault/vault-broker.env && chmod 0640 /usr/local/etc/terrapi-vault/vault-broker.env || true
+[ -f /usr/local/etc/terrapi-vault/roles.json ] && chown root:vault /usr/local/etc/terrapi-vault/roles.json && chmod 0640 /usr/local/etc/terrapi-vault/roles.json || true
 # server.key: root-owned, group-READABLE (0640) — the broker reads it as the vault user
 # but must not be able to overwrite it. (0600 root:vault would deny the vault read.)
 [ -f /usr/local/etc/terrapi-vault/tls/server.key ] && chown root:vault /usr/local/etc/terrapi-vault/tls/server.key && chmod 0640 /usr/local/etc/terrapi-vault/tls/server.key || true
