@@ -15,6 +15,7 @@ mod auth;
 mod config;
 mod creds;
 mod dto;
+mod hardening;
 mod http;
 mod kms;
 mod opensearch;

@@ -6,13 +6,75 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 use vault_transport::ResidencyGroup;
+
+/// Hardening defaults. Bodies are small JSON (a public key, a base64 DEK), so 64 KiB is
+/// already generous; the timeout/concurrency/rate caps are sized for a handful of trusted
+/// daemon principals over WireGuard, not public traffic. All overridable via env so infra
+/// can tune per host without a rebuild (none are required at deploy).
+pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 15;
+pub const DEFAULT_MAX_CONCURRENCY: usize = 256;
+pub const DEFAULT_RATE_PER_SEC: f64 = 50.0;
+pub const DEFAULT_RATE_BURST: f64 = 100.0;
+
+/// Per-instance hardening limits (body size, request timeout, concurrency, per-principal
+/// rate). Applied as middleware in `http::router`.
+#[derive(Debug, Clone, Copy)]
+pub struct Hardening {
+    pub max_body_bytes: usize,
+    pub request_timeout: Duration,
+    pub max_concurrency: usize,
+    /// Sustained per-principal (per mTLS SAN) request rate, tokens/second.
+    pub rate_per_sec: f64,
+    /// Per-principal burst capacity (token-bucket depth).
+    pub rate_burst: f64,
+}
+
+impl Default for Hardening {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
+            max_concurrency: DEFAULT_MAX_CONCURRENCY,
+            rate_per_sec: DEFAULT_RATE_PER_SEC,
+            rate_burst: DEFAULT_RATE_BURST,
+        }
+    }
+}
+
+impl Hardening {
+    /// Read overrides from `VAULT_MAX_BODY_BYTES` / `VAULT_REQUEST_TIMEOUT_SECS` /
+    /// `VAULT_MAX_CONCURRENCY` / `VAULT_RATE_PER_SEC` / `VAULT_RATE_BURST`; each falls back
+    /// to its default when unset or unparseable.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            max_body_bytes: env_parse("VAULT_MAX_BODY_BYTES").unwrap_or(d.max_body_bytes),
+            request_timeout: env_parse("VAULT_REQUEST_TIMEOUT_SECS")
+                .map_or(d.request_timeout, Duration::from_secs),
+            max_concurrency: env_parse("VAULT_MAX_CONCURRENCY")
+                .filter(|n| *n > 0)
+                .unwrap_or(d.max_concurrency),
+            rate_per_sec: env_parse("VAULT_RATE_PER_SEC").unwrap_or(d.rate_per_sec),
+            rate_burst: env_parse("VAULT_RATE_BURST").unwrap_or(d.rate_burst),
+        }
+    }
+}
+
+/// Parse an env var into `T`, or `None` if unset/empty/unparseable.
+fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
+    std::env::var(key).ok().and_then(|s| s.parse().ok())
+}
 
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
     pub bind: SocketAddr,
     pub residency_group: ResidencyGroup,
     pub node: String,
+    pub hardening: Hardening,
     pub audit_path: PathBuf,
     /// At-rest encrypted store (SQLCipher DB) holding the SSH CA key (and, later, the
     /// lease ledger). Created on first unseal; opened with the operator passphrase. See `seal`.
@@ -87,6 +149,7 @@ impl BrokerConfig {
             bind,
             residency_group: group,
             node,
+            hardening: Hardening::from_env(),
             audit_path,
             store_path,
             snapshot_dir,

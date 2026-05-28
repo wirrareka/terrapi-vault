@@ -118,6 +118,11 @@ fn is_uuid_v4_lower(s: &str) -> bool {
 }
 
 pub fn router(state: AppState) -> Router {
+    use crate::hardening as hard;
+    use axum::extract::DefaultBodyLimit;
+    use axum::middleware::{from_fn, from_fn_with_state};
+
+    let max_body = state.harden.limits.max_body_bytes;
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/sys/seal-status", get(seal_status))
@@ -139,6 +144,15 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sys/store-snapshot", post(store_snapshot))
         .route("/v1/sys/leases/renew", post(lease_renew))
         .route("/v1/sys/leases/revoke", post(lease_revoke))
+        // Per-route so the metrics middleware runs *after* routing and sees `MatchedPath`.
+        .route_layer(from_fn_with_state(state.clone(), hard::record_metrics))
+        .fallback(hard::not_found)
+        // Outer → inner: security headers · rate limit · concurrency · timeout · body size.
+        .layer(DefaultBodyLimit::max(max_body))
+        .layer(from_fn_with_state(state.clone(), hard::timeout))
+        .layer(from_fn_with_state(state.clone(), hard::concurrency_limit))
+        .layer(from_fn_with_state(state.clone(), hard::rate_limit))
+        .layer(from_fn(hard::security_headers))
         .with_state(state)
 }
 
@@ -927,13 +941,15 @@ mod tests {
         fn emit(&self, _event: &AuditEvent) {}
     }
 
-    /// A sealed dev broker fixed to the `eu` group. Sealed is fine: the group `404` and the
-    /// body `400` are both decided before any seal/handler logic runs.
-    fn eu_dev_router() -> Router {
+    /// A sealed dev `AppState` fixed to the `eu` group, with the given hardening limits.
+    /// Sealed is fine for these tests: the group `404`, body `400`, and the middleware
+    /// (size/rate/headers/metrics) are all decided before any seal/handler logic runs.
+    fn dev_state(hardening: crate::config::Hardening) -> AppState {
         let cfg = BrokerConfig {
             bind: "127.0.0.1:8200".parse().expect("addr"),
             residency_group: ResidencyGroup::Eu,
             node: "test".into(),
+            hardening,
             audit_path: std::env::temp_dir().join("vault-test-audit.jsonl"),
             store_path: std::env::temp_dir().join("vault-test-store.sqlcipher"),
             snapshot_dir: std::env::temp_dir(),
@@ -941,7 +957,11 @@ mod tests {
             allow_insecure_dev: true,
             tls: None,
         };
-        router(AppState::new(cfg, None, Arc::new(NullSink)))
+        AppState::new(cfg, None, Arc::new(NullSink))
+    }
+
+    fn eu_dev_router() -> Router {
+        router(dev_state(crate::config::Hardening::default()))
     }
 
     fn sign_request(group: &str, body: &str) -> Request<Body> {
@@ -987,5 +1007,115 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---- hardening (#3) ----
+
+    fn get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("x-client-cert-san", "demon-operator.eu.proximi.internal")
+            .body(Body::empty())
+            .expect("request")
+    }
+
+    /// An over-limit body is rejected with `413` before the handler runs (DefaultBodyLimit).
+    #[tokio::test]
+    async fn oversized_body_is_413() {
+        let small = crate::config::Hardening {
+            max_body_bytes: 32,
+            ..Default::default()
+        };
+        let big = "x".repeat(1024);
+        let resp = router(dev_state(small))
+            .oneshot(sign_request("eu", &big))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// An unrouted path gets the uniform JSON `404` fallback.
+    #[tokio::test]
+    async fn unrouted_path_is_404_fallback() {
+        let resp = eu_dev_router()
+            .oneshot(get("/no/such/route"))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Security headers are present on every response (outermost layer), including `healthz`.
+    #[tokio::test]
+    async fn security_headers_present() {
+        let resp = eu_dev_router()
+            .oneshot(get("/healthz"))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-content-type-options")
+                .map(|v| v.to_str().unwrap()),
+            Some("nosniff")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("cache-control")
+                .map(|v| v.to_str().unwrap()),
+            Some("no-store")
+        );
+    }
+
+    /// A principal that exhausts its token bucket is throttled with `429`; refill is off in
+    /// this config (rate 0, burst 2) so the third request within the burst window is denied.
+    #[tokio::test]
+    async fn rate_limit_throttles_after_burst() {
+        let h = crate::config::Hardening {
+            rate_per_sec: 0.0,
+            rate_burst: 2.0,
+            ..Default::default()
+        };
+        let app = router(dev_state(h));
+        assert_eq!(
+            app.clone().oneshot(get("/healthz")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone().oneshot(get("/healthz")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.oneshot(get("/healthz")).await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    /// The request metric is labelled by the matched-route *template*, never the concrete
+    /// tenant-bearing path — so tenant ids never leak into `:8201` metrics.
+    #[tokio::test]
+    async fn metrics_label_by_route_template_not_tenant_path() {
+        let state = dev_state(crate::config::Hardening::default());
+        let app = router(state.clone());
+        // A real (tenant-bearing) creds path — sealed so it 503s, but it routes + meters.
+        let tenant_uri = "/v1/eu/11111111-1111-4111-8111-111111111111/creds/audit-writer";
+        let req = Request::builder()
+            .method("POST")
+            .uri(tenant_uri)
+            .header("content-type", "application/json")
+            .header("x-client-cert-san", "demon-operator.eu.proximi.internal")
+            .body(Body::from("{}"))
+            .expect("request");
+        let _ = app.oneshot(req).await.expect("response");
+
+        let dump = state.metrics.render(state.is_sealed());
+        assert!(
+            dump.contains("route=\"/v1/{group}/{tenant_id}/creds/{role}\""),
+            "metrics should use the route template; got:\n{dump}"
+        );
+        assert!(
+            !dump.contains("11111111-1111-4111-8111-111111111111"),
+            "the concrete tenant id must NOT appear in metrics; got:\n{dump}"
+        );
     }
 }

@@ -387,6 +387,15 @@ aether fleet-mode backup keys; preserves their zero-knowledge model (KEK never l
 `install.sh` runbook. Crown jewels (SSH-CA key + KMS KEKs in `store.sqlcipher`, `unseal.pass`)
 on the encrypted dataset. Infra confirmed + ready to run host steps on `medina`.
 
+**Broker hardening — DONE 2026-05-28.** Defensive request middleware in `hardening.rs`,
+applied in `http::router` (outer→inner): conservative security headers · per-route request
+metrics labelled by the `MatchedPath` *template* (tenant ids never reach `:8201`) +
+`vault_http_inflight` gauge · per-principal (per mTLS SAN) token-bucket rate limit (`429`) ·
+global concurrency cap (`503`) · request timeout (`408`) · body-size limit (`413`). All five
+limits are env-tunable (`VAULT_{MAX_BODY_BYTES,REQUEST_TIMEOUT_SECS,MAX_CONCURRENCY,RATE_PER_SEC,RATE_BURST}`)
+with safe defaults — no deploy change required. Zero new crates (axum `DefaultBodyLimit` +
+`middleware::from_fn` + std/tokio). Uniform JSON `404` fallback for unrouted paths.
+
 **Next:** additional `CredEngine` adapters for any *modern* datastore that needs brokered
 creds (RethinkDB is out); broker-master-key KMS-wrap for unattended unseal once a KMS
 exists; `vault-sync` (Svet B).
