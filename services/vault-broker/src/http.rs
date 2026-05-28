@@ -13,8 +13,8 @@ use crate::state::{
     now_unix, AppState, CREDS_DEFAULT_TTL_SECS, DEFAULT_SESSION_IDLE_SECS,
     DEFAULT_SESSION_TTL_SECS, SSH_CERT_TTL_INTERACTIVE_SECS,
 };
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{FromRequestParts, Path, RawPathParams, State};
+use axum::http::{request::Parts, StatusCode};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -51,6 +51,36 @@ fn check_group(state: &AppState, group: &str) -> Result<(), (StatusCode, Json<Er
             "group_mismatch",
             &format!("this broker serves residency_group={want}"),
         ))
+    }
+}
+
+/// Validated `:group` path extractor: the segment must equal this instance's
+/// `residency_group`, else `404` (residency air-gap — a cred for one region must not even
+/// be *addressable* on another region's broker). It is a [`FromRequestParts`] extractor on
+/// purpose: the group decision then happens **during extraction, before the request body is
+/// read**, so a wrong-group request returns `404` regardless of whether its JSON body is
+/// well-formed. (Previously `check_group` ran in the handler body, after the `Json`
+/// extractor, so a malformed body to the wrong group `400`'d before the group `404`.)
+pub struct Group(#[allow(dead_code)] pub String);
+
+impl FromRequestParts<AppState> for Group {
+    type Rejection = (StatusCode, Json<ErrorBody>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        // Re-reading the path params here is cheap and non-consuming: the router stores them
+        // as a request extension, so a handler's own `Path(...)` still sees them too.
+        let params = RawPathParams::from_request_parts(parts, state)
+            .await
+            .map_err(|_| err(StatusCode::NOT_FOUND, "group_mismatch", "missing :group"))?;
+        let group = params
+            .iter()
+            .find_map(|(k, v)| (k == "group").then(|| v.to_owned()))
+            .unwrap_or_default();
+        check_group(state, &group)?;
+        Ok(Group(group))
     }
 }
 
@@ -169,10 +199,9 @@ fn require_unsealed(state: &AppState) -> Result<(), (StatusCode, Json<ErrorBody>
 async fn ssh_ca(
     State(state): State<AppState>,
     principal: Principal,
-    Path(group): Path<String>,
+    _group: Group,
 ) -> ApiResult<crate::dto::SshCaResponse> {
     require_cap(&principal, Capability::SshCa)?;
-    check_group(&state, &group)?;
     let Some(ca) = state.ssh_ca.clone() else {
         return Err(err(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -188,10 +217,9 @@ async fn ssh_ca(
 async fn ssh_revoked(
     State(state): State<AppState>,
     principal: Principal,
-    Path(group): Path<String>,
+    _group: Group,
 ) -> ApiResult<crate::dto::SshRevokedResponse> {
     require_cap(&principal, Capability::SshCa)?;
-    check_group(&state, &group)?;
     let Some(store) = state.store.clone() else {
         return Err(err(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -218,11 +246,10 @@ async fn ssh_revoked(
 async fn ssh_sign(
     State(state): State<AppState>,
     principal: Principal,
-    Path(group): Path<String>,
+    _group: Group,
     Json(req): Json<SshSignRequest>,
 ) -> ApiResult<crate::dto::SshSignResponse> {
     require_cap(&principal, Capability::SshSign)?;
-    check_group(&state, &group)?;
     require_unsealed(&state)?;
     let Some(ca) = state.ssh_ca.clone() else {
         return Err(err(
@@ -434,11 +461,11 @@ fn rfc3339(unix_secs: u64) -> String {
 async fn creds(
     State(state): State<AppState>,
     principal: Principal,
-    Path((group, tenant_id, role)): Path<(String, String, String)>,
+    Path((_group, tenant_id, role)): Path<(String, String, String)>,
+    _group_check: Group,
     Json(req): Json<CredsRequest>,
 ) -> ApiResult<crate::dto::CredsResponse> {
     require_cap(&principal, Capability::Creds)?;
-    check_group(&state, &group)?;
     require_unsealed(&state)?;
     if !is_uuid_v4_lower(&tenant_id) {
         return Err(err(
@@ -541,17 +568,17 @@ fn is_valid_key_id(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// Common validation for the KMS ops: capability, group, unsealed, tenant UUIDv4, key_id.
+/// Common validation for the KMS ops: capability, unsealed, tenant UUIDv4, key_id. The
+/// `:group` segment is validated upstream by the [`Group`] extractor (residency `404`
+/// before the body is read), so it is not re-checked here.
 /// Returns the unsealed store on success.
 fn kms_preflight(
     state: &AppState,
     principal: &Principal,
-    group: &str,
     tenant_id: &str,
     key_id: &str,
 ) -> Result<std::sync::Arc<std::sync::Mutex<terrapi_vault::Vault>>, (StatusCode, Json<ErrorBody>)> {
     require_cap(principal, Capability::Kms)?;
-    check_group(state, group)?;
     require_unsealed(state)?;
     if !is_uuid_v4_lower(tenant_id) {
         return Err(err(
@@ -593,9 +620,10 @@ async fn kms_wrap(
     State(state): State<AppState>,
     principal: Principal,
     Path((group, tenant_id, key_id)): Path<(String, String, String)>,
+    _group_check: Group,
     Json(req): Json<KmsWrapRequest>,
 ) -> ApiResult<KmsWrapResponse> {
-    let store = kms_preflight(&state, &principal, &group, &tenant_id, &key_id)?;
+    let store = kms_preflight(&state, &principal, &tenant_id, &key_id)?;
     let dek = base64::engine::general_purpose::STANDARD
         .decode(req.dek.as_bytes())
         .map_err(|_| {
@@ -634,9 +662,10 @@ async fn kms_unwrap(
     State(state): State<AppState>,
     principal: Principal,
     Path((group, tenant_id, key_id)): Path<(String, String, String)>,
+    _group_check: Group,
     Json(req): Json<KmsUnwrapRequest>,
 ) -> ApiResult<KmsUnwrapResponse> {
-    let store = kms_preflight(&state, &principal, &group, &tenant_id, &key_id)?;
+    let store = kms_preflight(&state, &principal, &tenant_id, &key_id)?;
     let wrapped = base64::engine::general_purpose::STANDARD
         .decode(req.wrapped.as_bytes())
         .map_err(|_| {
@@ -674,8 +703,9 @@ async fn kms_rotate(
     State(state): State<AppState>,
     principal: Principal,
     Path((group, tenant_id, key_id)): Path<(String, String, String)>,
+    _group_check: Group,
 ) -> ApiResult<KmsRotateResponse> {
-    let store = kms_preflight(&state, &principal, &group, &tenant_id, &key_id)?;
+    let store = kms_preflight(&state, &principal, &tenant_id, &key_id)?;
     let version = {
         let v = store.lock().expect("store lock");
         crate::kms::rotate(&v, &group, &tenant_id, &key_id)
@@ -874,6 +904,14 @@ async fn lease_revoke(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::BrokerConfig;
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tower::ServiceExt as _;
+    use vault_transport::audit::{AuditEvent, AuditSink};
+    use vault_transport::ResidencyGroup;
 
     #[test]
     fn uuid_v4_validation() {
@@ -882,5 +920,72 @@ mod tests {
         assert!(!is_uuid_v4_lower("11111111-1111-4111-c111-111111111111")); // bad variant
         assert!(!is_uuid_v4_lower("11111111-1111-4111-8111-11111111111A")); // uppercase
         assert!(!is_uuid_v4_lower("short"));
+    }
+
+    struct NullSink;
+    impl AuditSink for NullSink {
+        fn emit(&self, _event: &AuditEvent) {}
+    }
+
+    /// A sealed dev broker fixed to the `eu` group. Sealed is fine: the group `404` and the
+    /// body `400` are both decided before any seal/handler logic runs.
+    fn eu_dev_router() -> Router {
+        let cfg = BrokerConfig {
+            bind: "127.0.0.1:8200".parse().expect("addr"),
+            residency_group: ResidencyGroup::Eu,
+            node: "test".into(),
+            audit_path: std::env::temp_dir().join("vault-test-audit.jsonl"),
+            store_path: std::env::temp_dir().join("vault-test-store.sqlcipher"),
+            snapshot_dir: std::env::temp_dir(),
+            roles: HashMap::new(),
+            allow_insecure_dev: true,
+            tls: None,
+        };
+        router(AppState::new(cfg, None, Arc::new(NullSink)))
+    }
+
+    fn sign_request(group: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/v1/{group}/ssh/sign"))
+            .header("content-type", "application/json")
+            // dev: unmapped SAN → `dev` principal (all caps), so auth/cap never short-circuits.
+            .header("x-client-cert-san", "demon-operator.eu.proximi.internal")
+            .body(Body::from(body.to_owned()))
+            .expect("request")
+    }
+
+    /// The refinement: a wrong-group request must `404` even when its body is malformed —
+    /// the residency check is order-independent of body parsing. Previously this `400`'d
+    /// because `Json` (the body extractor) ran before the in-handler `check_group`.
+    #[tokio::test]
+    async fn wrong_group_with_invalid_body_is_404_not_400() {
+        let resp = eu_dev_router()
+            .oneshot(sign_request("uae", "{ not valid json"))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Conversely, a *correct*-group request with a malformed body still `400`s — the
+    /// extractor lets a valid group through, then the body fails to parse.
+    #[tokio::test]
+    async fn right_group_with_invalid_body_is_400() {
+        let resp = eu_dev_router()
+            .oneshot(sign_request("eu", "{ not valid json"))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// And a wrong group with a *valid* body is still `404` (unchanged behaviour).
+    #[tokio::test]
+    async fn wrong_group_with_valid_body_is_404() {
+        let body = r#"{"public_key":"ssh-ed25519 AAAA","cert_type":"user","principals":["x"]}"#;
+        let resp = eu_dev_router()
+            .oneshot(sign_request("uae", body))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

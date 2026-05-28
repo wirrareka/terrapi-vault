@@ -286,9 +286,13 @@ still build against the lib.
 - v1 contract published: `spec/broker-openapi.yaml`. Bootstrap: `docs/broker-bootstrap.md`.
 - Smoke-tested: healthz, authed session (ttl 28800/1800), 401 unauth, 501 stubs, B3 event.
 
-**Known refinement:** group check runs after JSON body parse, so a wrong-group request
-with an *invalid* body returns 400 (deserialize) before 404 (group). Valid requests to
-the wrong group correctly 404. Make `group` a validated extractor to order-independent.
+**Refinement — RESOLVED 2026-05-28.** `group` is now a validated `FromRequestParts`
+extractor (`http::Group`) that runs *before* the `Json` body extractor, so a wrong-group
+request returns `404` regardless of body validity (was: invalid body `400`'d first). The
+residency `404` now also precedes the in-handler capability `403` (a cred for one region
+is not even addressable on another's broker — air-gap takes precedence over authz).
+Covered by `http::tests::{wrong_group_with_invalid_body_is_404_not_400,
+right_group_with_invalid_body_is_400, wrong_group_with_valid_body_is_404}`.
 
 **Phase 1b — DONE:** rustls mTLS-over-WG termination (`tls.rs`: client-cert required +
 verified vs the fleet Root CA, peer DNS-SAN → role via `auth::ClientSan`; dev keeps the
