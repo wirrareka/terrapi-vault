@@ -1,21 +1,46 @@
-//! vault-sync — personal multi-device vault sync (memento/probe). Phase 0 skeleton.
+//! vault-sync — personal multi-device vault sync for memento/probe (Svet B).
 //!
-//! Phase 3 fleshes out: VPS-hosted, E2E (server stores only opaque encrypted ops),
-//! device-keypair enrolment via the vault passphrase, row-level oplog (UUIDv7 + HLC,
-//! per-row LWW). Deliberately carries no platform concerns. See planning doc §5.
+//! Server-blind row-level **oplog**: stores only opaque encrypted ops (`{op_id, device_id,
+//! hlc, collection_id, encrypted_payload}`) partitioned by `vault_id`, plus device public
+//! keys and an enrolment verifier. Never holds the vault key or plaintext. Device-keypair
+//! (ed25519) request auth; enrolment via a passphrase-derived secret (Argon2 verifier).
+//! Per-row LWW / CRDT live client-side. Carries NONE of the platform (no OpenSearch, tenants,
+//! residency). See `docs/planning/02-vault-sync-oplog.md`.
 
-use vault_transport::Hlc;
+mod auth;
+mod config;
+mod dto;
+mod http;
+mod state;
+mod store;
 
-fn main() {
-    // Reuses the same at-rest crypto lib as memento/probe — server stays blind to plaintext.
-    let _kdf = terrapi_vault::KdfParams::default();
-    let cursor = Hlc {
-        wall_ms: 0,
-        counter: 0,
-    };
-    println!(
-        "vault-sync {} — skeleton (E2E oplog). start cursor={cursor:?}. \
-         Device enrol + push/pull land in Phase 3.",
+use config::Config;
+use state::AppState;
+use store::Store;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = Config::from_env();
+    eprintln!(
+        "vault-sync {} starting: bind={} db={}",
         env!("CARGO_PKG_VERSION"),
+        cfg.bind,
+        cfg.db_path,
     );
+
+    let store = Store::open(&cfg.db_path)?;
+    let bind = cfg.bind;
+    let state = AppState::new(cfg, store);
+
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    eprintln!("vault-sync listening on {bind}");
+    axum::serve(listener, http::router(state))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+    eprintln!("vault-sync: shutting down");
 }

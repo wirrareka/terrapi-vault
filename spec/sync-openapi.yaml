@@ -1,0 +1,169 @@
+openapi: 3.1.0
+info:
+  title: vault-sync — personal multi-device oplog (Svet B)
+  version: 1.0.0
+  description: >
+    Server-blind row-level oplog for memento/probe. The server stores only opaque encrypted
+    ops partitioned by `vault_id`, device public keys, and an enrolment verifier — never the
+    vault key or plaintext. Per-row LWW / CRDT are client-side. NOT multi-tenant; carries
+    none of the platform (no OpenSearch / tenants / residency). See
+    docs/planning/02-vault-sync-oplog.md. Source of truth for the wire contract.
+
+servers:
+  - url: https://{host}
+    variables: { host: { default: localhost:8300 } }
+
+# Every op-bearing call (push/pull/status) is authenticated by a detached ed25519 signature
+# over the canonical string:  v1\n{METHOD}\n{path?query}\n{vault_id}\n{ts}\n{nonce}\n{sha256_hex(body)}
+# carried in the headers below. account + enroll are *self-signed* by the device key being
+# registered (proves key possession); enroll is additionally gated by the enrolment proof.
+components:
+  parameters:
+    VaultId:
+      name: vault_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    DeviceId:   { name: X-Device-Id,  in: header, required: true, schema: { type: string } }
+    SyncTs:     { name: X-Sync-Ts,    in: header, required: true, schema: { type: integer, description: unix seconds } }
+    SyncNonce:  { name: X-Sync-Nonce, in: header, required: true, schema: { type: string } }
+    SyncSig:    { name: X-Sync-Sig,   in: header, required: true, schema: { type: string, description: base64 ed25519 signature (64 bytes) } }
+  schemas:
+    Hlc:
+      type: object
+      required: [wall_ms, counter]
+      properties:
+        wall_ms: { type: integer, format: int64 }
+        counter: { type: integer, format: int32 }
+    Op:
+      type: object
+      required: [op_id, device_id, hlc, collection_id, encrypted_payload]
+      properties:
+        op_id:             { type: string, description: client ULID/UUIDv7, unique; dedupe/idempotency key }
+        device_id:         { type: string }
+        hlc:               { $ref: '#/components/schemas/Hlc' }
+        collection_id:     { type: string, description: opaque grouping; client MAY HMAC it }
+        encrypted_payload: { type: string, description: base64 AEAD ciphertext; server-opaque }
+    StoredOp:
+      allOf:
+        - { $ref: '#/components/schemas/Op' }
+        - type: object
+          required: [seq]
+          properties:
+            seq: { type: integer, format: int64, description: server-assigned per-vault cursor }
+    EnrollVerifier:
+      type: object
+      required: [salt_b64, params, hash_b64]
+      properties:
+        salt_b64: { type: string, description: base64 account-level enrolment salt }
+        params:   { type: object, description: Argon2id params (m_cost_kib, t_cost, p_cost) }
+        hash_b64: { type: string, description: base64 SHA-256 of the client-side enrolment secret }
+    DeviceRegistration:
+      type: object
+      required: [device_id, pubkey_b64]
+      properties:
+        device_id:  { type: string }
+        pubkey_b64: { type: string, description: base64 ed25519 public key (32 bytes) }
+    ErrorBody:
+      type: object
+      required: [error, detail]
+      properties: { error: { type: string }, detail: { type: string } }
+
+paths:
+  /healthz:
+    get: { summary: Liveness, responses: { '200': { description: ok } } }
+
+  /v1/sync/{vault_id}/account:
+    post:
+      summary: Create the sync account (first device). Self-signed.
+      parameters: [ { $ref: '#/components/parameters/VaultId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enroll, device]
+              properties:
+                enroll: { $ref: '#/components/schemas/EnrollVerifier' }
+                device: { $ref: '#/components/schemas/DeviceRegistration' }
+      responses:
+        '201': { description: created }
+        '401': { description: bad self-signature, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
+        '409': { description: account already exists, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
+
+  /v1/sync/{vault_id}/enroll-challenge:
+    get:
+      summary: Non-secret salt + Argon2 params a new device needs to derive its enrolment proof.
+      parameters: [ { $ref: '#/components/parameters/VaultId' } ]
+      responses:
+        '200':
+          description: challenge
+          content: { application/json: { schema: { type: object, properties: { salt_b64: { type: string }, params: { type: object } } } } }
+        '404': { description: no account, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
+
+  /v1/sync/{vault_id}/enroll:
+    post:
+      summary: Enrol a new device (self-signed by the new key, gated by the enrolment proof).
+      parameters: [ { $ref: '#/components/parameters/VaultId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [proof_b64, device]
+              properties:
+                proof_b64: { type: string, description: base64 client-side enrolment secret }
+                device:    { $ref: '#/components/schemas/DeviceRegistration' }
+      responses:
+        '200': { description: enrolled }
+        '401': { description: bad proof or self-signature, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
+        '404': { description: no account }
+
+  /v1/sync/{vault_id}/push:
+    post:
+      summary: Append ops (device-signed). Idempotent on op_id.
+      parameters: [ { $ref: '#/components/parameters/VaultId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ops]
+              properties: { ops: { type: array, items: { $ref: '#/components/schemas/Op' } } }
+      responses:
+        '200':
+          description: accepted
+          content: { application/json: { schema: { type: object, properties: { accepted: { type: integer }, duplicates: { type: integer }, latest_seq: { type: integer } } } } }
+        '401': { description: unauthenticated }
+        '403': { description: an op.device_id did not match the calling device }
+        '400': { description: malformed body or payload }
+
+  /v1/sync/{vault_id}/pull:
+    get:
+      summary: Ops with seq > since (device-signed). Sign over an empty body.
+      parameters:
+        - { $ref: '#/components/parameters/VaultId' }
+        - { name: since, in: query, schema: { type: integer, default: 0 } }
+        - { name: limit, in: query, schema: { type: integer } }
+        - { $ref: '#/components/parameters/DeviceId' }
+        - { $ref: '#/components/parameters/SyncTs' }
+        - { $ref: '#/components/parameters/SyncNonce' }
+        - { $ref: '#/components/parameters/SyncSig' }
+      responses:
+        '200':
+          description: ops
+          content: { application/json: { schema: { type: object, properties: { ops: { type: array, items: { $ref: '#/components/schemas/StoredOp' } }, latest_seq: { type: integer } } } } }
+        '401': { description: unauthenticated }
+
+  /v1/sync/{vault_id}/status:
+    get:
+      summary: Vault sync status (device-signed). Sign over an empty body.
+      parameters: [ { $ref: '#/components/parameters/VaultId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
+      responses:
+        '200':
+          description: status
+          content: { application/json: { schema: { type: object, properties: { latest_seq: { type: integer }, op_count: { type: integer }, device_count: { type: integer } } } } }
+        '401': { description: unauthenticated }
