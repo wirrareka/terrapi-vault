@@ -11,12 +11,15 @@ use crate::dto::{
 use crate::state::AppState;
 use crate::store::{now_unix, PushError};
 use axum::body::Bytes;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, OriginalUri, Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use serde::Deserialize;
+use tokio::sync::broadcast;
 
 type ErrResp = (StatusCode, Json<ErrorBody>);
 type ApiResult<T> = Result<Json<T>, ErrResp>;
@@ -52,6 +55,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sync/{vault_id}/push", post(push))
         .route("/v1/sync/{vault_id}/pull", get(pull))
         .route("/v1/sync/{vault_id}/status", get(status))
+        .route("/v1/sync/{vault_id}/tail", get(tail))
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
 }
@@ -369,17 +373,38 @@ async fn push(
             "every op.device_id must equal the calling device",
         ));
     }
-    let (accepted, duplicates, latest_seq) = {
+    let (before, (accepted, duplicates, latest_seq)) = {
         let store = state.store.lock().expect("store lock");
-        store.push_ops(&vault_id, &req.ops).map_err(|e| match e {
+        let before = store.latest_seq(&vault_id).map_err(db_err)?;
+        let pushed = store.push_ops(&vault_id, &req.ops).map_err(|e| match e {
             PushError::InvalidPayload => err(
                 StatusCode::BAD_REQUEST,
                 "bad_payload",
                 "an op payload was not valid base64",
             ),
             PushError::Db(d) => db_err(d),
-        })?
+        })?;
+        (before, pushed)
     };
+    // Fan the newly-stored ops out to live-tail subscribers (best-effort).
+    if accepted > 0 {
+        let new_ops = {
+            let store = state.store.lock().expect("store lock");
+            store
+                .pull_ops(
+                    &vault_id,
+                    before,
+                    u32::try_from(accepted).unwrap_or(u32::MAX),
+                )
+                .map_err(db_err)?
+                .0
+        };
+        let messages: Vec<String> = new_ops
+            .iter()
+            .filter_map(|o| serde_json::to_string(o).ok())
+            .collect();
+        state.publish(&vault_id, &messages);
+    }
     Ok(Json(PushResponse {
         accepted,
         duplicates,
@@ -432,6 +457,52 @@ async fn status(
         op_count,
         device_count,
     }))
+}
+
+/// `GET /v1/sync/{vault_id}/tail` — WebSocket live tail. The upgrade request is device-signed
+/// exactly like a GET (empty body); after it verifies, the socket streams each newly-pushed
+/// `StoredOp` as a JSON text frame. A subscriber that falls behind the buffer is sent
+/// `{"resync":true}` and should do a full `pull`.
+async fn tail(
+    State(state): State<AppState>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    Path(vault_id): Path<String>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(rejection) = auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"") {
+        return rejection.into_response();
+    }
+    let rx = state.subscribe(&vault_id);
+    ws.on_upgrade(move |socket| tail_loop(socket, rx))
+}
+
+async fn tail_loop(mut socket: WebSocket, mut rx: broadcast::Receiver<String>) {
+    loop {
+        tokio::select! {
+            // Detect client close / error so the task ends and the receiver is dropped.
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                    _ => {}
+                }
+            }
+            event = rx.recv() => {
+                match event {
+                    Ok(json) => {
+                        if socket.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let _ = socket.send(Message::Text("{\"resync\":true}".into())).await;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -656,5 +727,35 @@ mod tests {
         let req2 = signed("GET", &status_uri, b"", &dev_a, "A", "dup-nonce");
         let (s2, _) = send(&st, req2).await;
         assert_eq!(s2, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn push_notifies_tail_subscribers() {
+        let st = state();
+        let dev_a = SigningKey::generate(&mut OsRng);
+        let acct = format!("/v1/sync/{VID}/account");
+        let _ = send(
+            &st,
+            signed("POST", &acct, &create_body(&dev_a, "A"), &dev_a, "A", "n1"),
+        )
+        .await;
+
+        // Subscribe to the live tail, then push an op.
+        let mut rx = st.subscribe(VID);
+        let push_uri = format!("/v1/sync/{VID}/push");
+        let push = serde_json::to_vec(&PushRequest {
+            ops: vec![op("A", "op-1")],
+        })
+        .unwrap();
+        let (status, _) = send(&st, signed("POST", &push_uri, &push, &dev_a, "A", "n2")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The stored op (with its server seq) was fanned out to the subscriber.
+        let json = rx
+            .try_recv()
+            .expect("subscriber should have received the op");
+        let stored: crate::dto::StoredOp = serde_json::from_str(&json).unwrap();
+        assert_eq!(stored.op.op_id, "op-1");
+        assert_eq!(stored.seq, 1);
     }
 }

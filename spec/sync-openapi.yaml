@@ -167,3 +167,14 @@ paths:
           description: status
           content: { application/json: { schema: { type: object, properties: { latest_seq: { type: integer }, op_count: { type: integer }, device_count: { type: integer } } } } }
         '401': { description: unauthenticated }
+
+  /v1/sync/{vault_id}/tail:
+    get:
+      summary: >
+        WebSocket live tail. The HTTP upgrade is device-signed like a GET (sign over an empty
+        body). After it verifies, the server streams each newly-pushed StoredOp as a JSON text
+        frame; a lagging subscriber receives {"resync":true} and should do a full pull.
+      parameters: [ { $ref: '#/components/parameters/VaultId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
+      responses:
+        '101': { description: switching protocols (WebSocket) }
+        '401': { description: unauthenticated }

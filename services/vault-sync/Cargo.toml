@@ -20,8 +20,10 @@ vault-transport.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
-axum.workspace = true
+# `sync` adds the per-vault broadcast channel that fans pushed ops out to WS tail subscribers.
+tokio = { workspace = true, features = ["sync"] }
+# `ws` adds the live-tail WebSocket endpoint.
+axum = { workspace = true, features = ["ws"] }
 time.workspace = true
 base64.workspace = true
 # Device-signature verification (raw ed25519) + content hashing for the canonical sig string

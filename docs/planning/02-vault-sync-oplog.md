@@ -143,9 +143,20 @@ print-only skeleton):
 - Contract published: `spec/sync-openapi.yaml` (v1.0.0). 12 tests pass; clippy `-D warnings`
   + `cargo fmt --check` clean.
 
+**WS live-tail — DONE 2026-05-29.** `GET /v1/sync/{vault_id}/tail` (axum `ws`). The upgrade
+is device-signed exactly like a GET; after it verifies, the socket streams each newly-pushed
+`StoredOp` as a JSON text frame off a per-vault `tokio::broadcast` channel (capacity 256). A
+subscriber that lags is sent `{"resync":true}` and should do a full `pull`. `push` fans the
+freshly-stored ops out via `AppState::publish`. Covered by `http::tests::
+push_notifies_tail_subscribers`. Added `axum`+`ws` / `tokio`+`sync` features.
+
+**Deploy — DONE 2026-05-29 (lightweight).** `deploy/vault-sync.env.sample` +
+`docs/sync-bootstrap.md` runbook: trust model, TLS-in-front guidance (WG/Tailscale `/32` or a
+Caddy/nginx reverse proxy — the binary speaks plain HTTP), launchd/systemd notes, endpoint
+table, backups. No FreeBSD bastille module (personal, not the broker's platform deploy).
+
 **Deferred / next:**
 - **memento-core client provider** — the new `SyncProvider` that captures DB row changes as
   ops, encrypts payloads (AEAD under a vault-derived key, domain-separated), pushes/pulls, and
   applies incoming ops with per-row LWW by HLC. Cross-repo (memento), coordinated separately.
-- WS `tail`; SQLCipher-at-rest for the server DB (defense-in-depth); CRDT text-merge (Phase 4);
-  a `deploy/` module + TLS termination guidance (vault-sync runs behind TLS).
+- SQLCipher-at-rest for the server DB (defense-in-depth); CRDT text-merge (Phase 4).
