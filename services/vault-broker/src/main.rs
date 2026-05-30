@@ -214,15 +214,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Whether a metrics listener may bind `bind`: loopback always, otherwise only when the named
-/// allow-public env is `1`. A bind that doesn't parse as a `SocketAddr` (e.g. a hostname) is
-/// treated as non-loopback — fail-closed.
+/// Whether a metrics listener may bind `bind` without the explicit allow-public override.
+/// **Safe** (not internet-reachable, so allowed): loopback, plus RFC1918-private / link-local
+/// IPv4 — this is what the on-box-Prometheus convention uses (the broker binds its per-jail WG
+/// `/32`, e.g. `10.200.0.101:8201`; see `coordination/conventions/ports-env.md`). **Refused**
+/// unless `allow_env` is `1`: `0.0.0.0`/`::` (all interfaces — could be public), any routable
+/// public address, and an unparseable bind (fail-closed).
 fn metrics_bind_allowed(bind: &str, allow_env: &str) -> bool {
-    let loopback = bind
-        .parse::<std::net::SocketAddr>()
-        .map(|a| a.ip().is_loopback())
-        .unwrap_or(false);
-    loopback || std::env::var(allow_env).as_deref() == Ok("1")
+    let safe = match bind.parse::<std::net::SocketAddr>() {
+        Ok(addr) => match addr.ip() {
+            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+            std::net::IpAddr::V6(v6) => v6.is_loopback(),
+        },
+        Err(_) => false,
+    };
+    safe || std::env::var(allow_env).as_deref() == Ok("1")
 }
 
 async fn shutdown_signal() {
@@ -235,12 +241,14 @@ mod tests {
     use super::metrics_bind_allowed;
 
     #[test]
-    fn metrics_bind_loopback_allowed_public_refused() {
+    fn metrics_bind_loopback_and_private_allowed_public_refused() {
         const UNSET: &str = "VAULT_METRICS_ALLOW_PUBLIC_TEST_UNSET";
-        assert!(metrics_bind_allowed("127.0.0.1:8201", UNSET));
-        assert!(metrics_bind_allowed("[::1]:8201", UNSET));
-        assert!(!metrics_bind_allowed("0.0.0.0:8201", UNSET)); // public → refused
-        assert!(!metrics_bind_allowed("10.200.0.101:8201", UNSET));
+        assert!(metrics_bind_allowed("127.0.0.1:8201", UNSET)); // loopback
+        assert!(metrics_bind_allowed("[::1]:8201", UNSET)); // v6 loopback
+        assert!(metrics_bind_allowed("10.200.0.101:8201", UNSET)); // WG /32 (RFC1918) — the convention
+        assert!(metrics_bind_allowed("192.168.1.5:8201", UNSET)); // private
+        assert!(!metrics_bind_allowed("0.0.0.0:8201", UNSET)); // all interfaces → refused
+        assert!(!metrics_bind_allowed("1.2.3.4:8201", UNSET)); // routable public → refused
         assert!(!metrics_bind_allowed("not-a-socketaddr", UNSET)); // unparseable → fail-closed
     }
 }

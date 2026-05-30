@@ -80,15 +80,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Whether a metrics listener may bind `bind`: loopback always, otherwise only when the named
-/// allow-public env is `1`. A bind that doesn't parse as a `SocketAddr` is treated as
-/// non-loopback — fail-closed.
+/// Whether a metrics listener may bind `bind` without the explicit allow-public override.
+/// Safe (allowed): loopback + RFC1918-private / link-local IPv4 (a personal host / WG bind) and
+/// IPv6 loopback. Refused unless `allow_env` is `1`: `0.0.0.0`/`::`, any routable-public address,
+/// and an unparseable bind (fail-closed).
 fn metrics_bind_allowed(bind: &str, allow_env: &str) -> bool {
-    let loopback = bind
-        .parse::<std::net::SocketAddr>()
-        .map(|a| a.ip().is_loopback())
-        .unwrap_or(false);
-    loopback || std::env::var(allow_env).as_deref() == Ok("1")
+    let safe = match bind.parse::<std::net::SocketAddr>() {
+        Ok(addr) => match addr.ip() {
+            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+            std::net::IpAddr::V6(v6) => v6.is_loopback(),
+        },
+        Err(_) => false,
+    };
+    safe || std::env::var(allow_env).as_deref() == Ok("1")
 }
 
 async fn shutdown_signal() {
