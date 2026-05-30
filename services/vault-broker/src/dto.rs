@@ -3,11 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize)]
-pub struct ErrorBody {
-    pub error: String,
-    pub detail: String,
-}
+// Shared wire shapes live in the neutral base crate (single source of truth for both services).
+pub use vault_transport::http::{Ack, ErrorBody};
 
 // --- SSH signed-cert CA ---------------------------------------------------------
 
@@ -111,11 +108,6 @@ pub struct LeaseRenewResponse {
 #[derive(Debug, Deserialize)]
 pub struct LeaseRevokeRequest {
     pub lease_id: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Ack {
-    pub ok: bool,
 }
 
 // --- KMS DEK wrap/unwrap --------------------------------------------------------

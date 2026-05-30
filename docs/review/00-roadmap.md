@@ -66,7 +66,7 @@ _Verification: `cargo build/clippy -D warnings/test/fmt` all clean; 51 tests pas
   `version(4 LE) || nonce(24) || ct+tag`; no migration (KMS not yet live). `kms.rs`,
   `Cargo.toml` (×2), `spec/broker-openapi.yaml`. _(chosen: algorithm swap over counter+rotate)_
 
-### P2 — DX / contract / maintainability  (R10/R11/R12 ✅ DONE 2026-05-30; R13/R14 OPEN)
+### P2 — DX / contract / maintainability  (✅ ALL DONE 2026-05-30)
 - **R10. ✅ Typed error contract**: `ErrorBody.error` (sync) and `Error.error` (broker) are now
   enums of every stable code with per-code status/meaning; both note that 5xx/502 details are
   generic. `spec/sync-openapi.yaml`, `spec/broker-openapi.yaml`. _(X-Request-Id correlation
@@ -79,11 +79,14 @@ _Verification: `cargo build/clippy -D warnings/test/fmt` all clean; 51 tests pas
 - **R12. ✅ Pagination + idempotency documented**: `pull` describes `limit` cap + `since`/`latest_seq`
   cursor loop; `push` documents `op_id` idempotency (`accepted+duplicates==len`, no seq consumed
   on dup) and `latest_seq`. `spec/sync-openapi.yaml`.
-- **R13. ⬜ De-dup into vault-transport**: `ErrorBody`/`Ack`/`env_parse`/`now_unix` copy-pasted
-  across both services — promote the pure-serde/std pieces to the shared base (keep axum-coupled
-  `err()` local so vault-transport stays axum-free). _(arch Med)_
-- **R14. ⬜ Close test gaps**: vault-sync auth/replay/WS-tail now have oneshot tests; still missing
-  the broker's prod mTLS branch + a `/tail` end-to-end WS receive test. _(arch Med)_
+- **R13. ✅ De-dup into vault-transport**: new `vault_transport::http` holds the shared
+  `ErrorBody`/`Ack` (serde) + `env_parse` (std); both services re-export them from their `dto.rs`
+  and use `env_parse` in `from_env`. `vault-transport` stays axum/time-free (the axum-coupled
+  `err()` and `time`-based `now_unix` stay per-service). `vault-transport/src/http.rs` (+3 tests),
+  `vault-broker/src/{dto,config}.rs`, `vault-sync/src/{dto,config}.rs`.
+- **R14. ✅ Test gaps closed**: broker `principal_extractor_maps_verified_san_to_role` covers the
+  prod mTLS `ClientSan`→role/403/401 path; vault-sync `tail_websocket_receives_pushed_op` is a real
+  end-to-end WS test (signed upgrade → push fan-out → client receives the frame). `http.rs` (both).
 
 ### P3 — Hardening polish
 - R15. ReplayGuard prune-window strictly wider than accept-window (S8).

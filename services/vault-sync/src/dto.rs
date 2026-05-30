@@ -114,15 +114,5 @@ pub struct StatusResponse {
     pub device_count: u64,
 }
 
-/// Minimal success acknowledgement (account create / enroll).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Ack {
-    pub ok: bool,
-}
-
-/// Uniform JSON error body (mirrors the broker's shape).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ErrorBody {
-    pub error: String,
-    pub detail: String,
-}
+// Shared wire shapes live in the neutral base crate (single source of truth for both services).
+pub use vault_transport::http::{Ack, ErrorBody};

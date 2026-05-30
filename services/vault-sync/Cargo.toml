@@ -37,6 +37,9 @@ sha2.workspace = true
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 rand.workspace = true
 tower.workspace = true
+# Test-only: a real WebSocket client for the end-to-end /tail live-tail test.
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
 
 [lints]
 workspace = true

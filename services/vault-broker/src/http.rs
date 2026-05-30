@@ -959,6 +959,83 @@ mod tests {
         router(dev_state(crate::config::Hardening::default()))
     }
 
+    /// A production `AppState` (no insecure-dev) with a fixed roles map, for exercising the
+    /// mTLS `Principal` extractor's verified-SAN branch.
+    fn prod_state(roles: HashMap<String, crate::auth::RolePrincipal>) -> AppState {
+        let cfg = BrokerConfig {
+            bind: "127.0.0.1:8200".parse().expect("addr"),
+            residency_group: ResidencyGroup::Eu,
+            node: "test".into(),
+            hardening: crate::config::Hardening::default(),
+            audit_path: std::env::temp_dir().join("vault-test-audit.jsonl"),
+            store_path: std::env::temp_dir().join("vault-test-store.sqlcipher"),
+            snapshot_dir: std::env::temp_dir(),
+            roles,
+            allow_insecure_dev: false,
+            tls: None,
+        };
+        AppState::new(cfg, None, Arc::new(NullSink))
+    }
+
+    /// The production auth path: a verified mTLS SAN (injected by the TLS layer as a
+    /// `ClientSan` extension) maps to its registered role + capabilities; a trusted-but-
+    /// unregistered SAN is `403`; and with no verified identity and dev off, `401`.
+    #[tokio::test]
+    async fn principal_extractor_maps_verified_san_to_role() {
+        use crate::auth::{Capability, ClientSan, Principal, RolePrincipal};
+        let mut roles = HashMap::new();
+        roles.insert(
+            "demon-system.eu.proximi.internal".to_string(),
+            RolePrincipal {
+                role: "demon-system".into(),
+                caps: [Capability::SshSign].into_iter().collect(),
+            },
+        );
+        let state = prod_state(roles);
+
+        // Registered SAN → its role + only its caps.
+        let mut parts = Request::builder()
+            .body(Body::empty())
+            .unwrap()
+            .into_parts()
+            .0;
+        parts
+            .extensions
+            .insert(ClientSan("demon-system.eu.proximi.internal".into()));
+        let p = Principal::from_request_parts(&mut parts, &state)
+            .await
+            .expect("registered SAN authorises");
+        assert_eq!(p.role, "demon-system");
+        assert!(p.allows(Capability::SshSign));
+        assert!(!p.allows(Capability::Creds));
+
+        // Trusted (verified) but unregistered SAN → 403.
+        let mut parts = Request::builder()
+            .body(Body::empty())
+            .unwrap()
+            .into_parts()
+            .0;
+        parts
+            .extensions
+            .insert(ClientSan("stranger.eu.proximi.internal".into()));
+        let e = Principal::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::FORBIDDEN);
+
+        // No verified identity and insecure-dev off → 401 (no header fallback in prod).
+        let mut parts = Request::builder()
+            .header("x-client-cert-san", "demon-system.eu.proximi.internal")
+            .body(Body::empty())
+            .unwrap()
+            .into_parts()
+            .0;
+        let e = Principal::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::UNAUTHORIZED);
+    }
+
     fn sign_request(group: &str, body: &str) -> Request<Body> {
         Request::builder()
             .method("POST")

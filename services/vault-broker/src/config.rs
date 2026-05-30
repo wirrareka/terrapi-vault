@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
+use vault_transport::http::env_parse;
 use vault_transport::ResidencyGroup;
 
 /// Hardening defaults. Bodies are small JSON (a public key, a base64 DEK), so 64 KiB is
@@ -62,11 +63,6 @@ impl Hardening {
             rate_burst: env_parse("VAULT_RATE_BURST").unwrap_or(d.rate_burst),
         }
     }
-}
-
-/// Parse an env var into `T`, or `None` if unset/empty/unparseable.
-fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
-    std::env::var(key).ok().and_then(|s| s.parse().ok())
 }
 
 #[derive(Debug, Clone)]

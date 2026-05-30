@@ -11,6 +11,7 @@
 //! stack (axum/tokio/rustls) and the real B3 emitter land in Phase 1.
 
 pub mod audit;
+pub mod http;
 pub mod lease;
 
 use serde::{Deserialize, Serialize};

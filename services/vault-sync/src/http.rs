@@ -952,4 +952,67 @@ mod tests {
         let e: ErrorBody = serde_json::from_slice(&body).unwrap();
         assert_eq!(e.error, "bad_vault_id");
     }
+
+    /// End-to-end live tail over a real WebSocket: an enrolled device opens a (device-signed)
+    /// `/tail` upgrade, then a push fans the new op out and the socket receives it as a text
+    /// frame. Exercises the WS auth + framing path the oneshot tests can't reach.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tail_websocket_receives_pushed_op() {
+        use futures_util::StreamExt as _;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let st = state();
+        let dev_a = SigningKey::generate(&mut OsRng);
+        // Enrol device A directly in the store (the create/enrol HTTP flow is covered elsewhere).
+        let enroll = crate::dto::EnrollVerifier {
+            salt_b64: b64e(b"enrol-salt-16byte"),
+            params: terrapi_vault::KdfParams::default(),
+            hash_b64: b64e(Sha256::digest(SECRET)),
+        };
+        st.store
+            .create_account(VID, &enroll, "A", &dev_a.verifying_key().to_bytes())
+            .unwrap();
+
+        // Start a real server on an ephemeral port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(st.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // Build the device-signed WS upgrade (signed exactly like a GET over an empty body).
+        let path = format!("/v1/sync/{VID}/tail");
+        let ts = now_unix();
+        let canonical =
+            auth::canonical_string("GET", &path, VID, ts, "ws1", &auth::sha256_hex(b""));
+        let sig = b64e(dev_a.sign(canonical.as_bytes()).to_bytes());
+        let mut req = format!("ws://{addr}{path}").into_client_request().unwrap();
+        let h = req.headers_mut();
+        h.insert("x-device-id", "A".parse().unwrap());
+        h.insert("x-sync-ts", ts.to_string().parse().unwrap());
+        h.insert("x-sync-nonce", "ws1".parse().unwrap());
+        h.insert("x-sync-sig", sig.parse().unwrap());
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+
+        // The handshake completed → the handler subscribed. Now fan an op out (as push does).
+        let stored = crate::dto::StoredOp {
+            seq: 1,
+            op: op("A", "op-1"),
+        };
+        st.publish(VID, &[serde_json::to_string(&stored).unwrap()]);
+
+        // The socket receives the op as a JSON text frame.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+            .await
+            .expect("frame within timeout")
+            .expect("a frame")
+            .expect("ok frame");
+        let txt = match msg {
+            Message::Text(t) => t.to_string(),
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        let got: crate::dto::StoredOp = serde_json::from_str(&txt).unwrap();
+        assert_eq!(got.op.op_id, "op-1");
+        assert_eq!(got.seq, 1);
+    }
 }
