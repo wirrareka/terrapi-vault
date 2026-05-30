@@ -11,7 +11,8 @@ use crate::dto::{
 };
 use crate::state::{
     now_unix, AppState, CREDS_DEFAULT_TTL_SECS, DEFAULT_SESSION_IDLE_SECS,
-    DEFAULT_SESSION_TTL_SECS, SSH_CERT_TTL_INTERACTIVE_SECS,
+    DEFAULT_SESSION_TTL_SECS, MAX_SESSION_TTL_SECS, SSH_CERT_MAX_TTL_SECS,
+    SSH_CERT_TTL_INTERACTIVE_SECS,
 };
 use axum::extract::{FromRequestParts, Path, RawPathParams, State};
 use axum::http::{request::Parts, StatusCode};
@@ -318,7 +319,12 @@ async fn ssh_sign(
         ));
     };
 
-    let ttl = req.ttl_secs.unwrap_or(SSH_CERT_TTL_INTERACTIVE_SECS);
+    // Clamp to the hard ceiling: a signed cert outlives lease revoke (KRL is best-effort), so
+    // the requested ttl must not be able to exceed SSH_CERT_MAX_TTL_SECS (short-TTL guarantee).
+    let ttl = req
+        .ttl_secs
+        .unwrap_or(SSH_CERT_TTL_INTERACTIVE_SECS)
+        .clamp(1, SSH_CERT_MAX_TTL_SECS);
     let now = now_unix();
     let valid_before = now.saturating_add(ttl);
 
@@ -798,8 +804,16 @@ async fn session_open(
 ) -> ApiResult<SessionOpenResponse> {
     require_cap(&principal, Capability::Session)?;
     require_unsealed(&state)?;
-    let ttl = req.ttl_secs.unwrap_or(DEFAULT_SESSION_TTL_SECS);
-    let idle = req.idle_timeout_secs.unwrap_or(DEFAULT_SESSION_IDLE_SECS);
+    // Clamp to hard ceilings so a large request value can't extend a session (and every child
+    // SSH/cred lease that inherits its lifetime) past the operator-session cap. Idle ≤ ttl.
+    let ttl = req
+        .ttl_secs
+        .unwrap_or(DEFAULT_SESSION_TTL_SECS)
+        .clamp(1, MAX_SESSION_TTL_SECS);
+    let idle = req
+        .idle_timeout_secs
+        .unwrap_or(DEFAULT_SESSION_IDLE_SECS)
+        .clamp(1, ttl);
     let id = {
         let mut eng = state.leases.lock().expect("lease lock");
         eng.open_session(now_unix(), ttl, idle)

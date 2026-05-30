@@ -132,6 +132,13 @@ impl SshCa {
         if principals.is_empty() {
             return Err(CaError::BadRequest("principals must be non-empty".into()));
         }
+        // Defense in depth: a non-positive validity window (caller bug, or a ttl that underflowed)
+        // must never produce a cert. The handler also clamps ttl to SSH_CERT_MAX_TTL_SECS.
+        if valid_before <= valid_after {
+            return Err(CaError::BadRequest(
+                "valid_before must be after valid_after".into(),
+            ));
+        }
         let subject = PublicKey::from_openssh(public_key_openssh)
             .map_err(|e| CaError::BadRequest(format!("public_key: {e}")))?;
 
@@ -257,6 +264,20 @@ mod tests {
             .sign(&pubk, CertType::User, &[], "k", 0, 100)
             .unwrap_err();
         assert!(matches!(err, CaError::BadRequest(_)));
+    }
+
+    #[test]
+    fn nonpositive_validity_window_rejected() {
+        let ca = SshCa::generate().unwrap();
+        let subject = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let pubk = subject.public_key().to_openssh().unwrap();
+        // valid_before == valid_after and valid_before < valid_after both refused (no 0-ttl cert).
+        for (after, before) in [(1000, 1000), (1000, 900)] {
+            let err = ca
+                .sign(&pubk, CertType::User, &["ops".into()], "k", after, before)
+                .unwrap_err();
+            assert!(matches!(err, CaError::BadRequest(_)));
+        }
     }
 
     #[test]

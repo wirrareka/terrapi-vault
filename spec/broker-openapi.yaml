@@ -177,8 +177,9 @@ components:
         ttl_secs:
           type: [integer, "null"]
           description: >
-            Default 900 (interactive) / 300 (automated & touch-per-op). Clamped to remaining
-            session lifetime. Null → server default for the request context.
+            Default 900 (interactive) / 300 (automated & touch-per-op). **Hard-clamped to
+            SSH_CERT_MAX_TTL_SECS (3600 s)** — a larger request is silently capped (the cert
+            outlives lease revoke, so issuance is bounded here). Null → server default.
         extensions:
           type: object
           additionalProperties: true
@@ -267,8 +268,8 @@ components:
     SessionOpenRequest:
       type: object
       properties:
-        ttl_secs: { type: [integer, "null"], description: "hard cap; default 28800 (8h)" }
-        idle_timeout_secs: { type: [integer, "null"], description: "default 1800 (30m); idle past this cascade-revokes" }
+        ttl_secs: { type: [integer, "null"], description: "default 28800 (8h); hard-clamped to MAX_SESSION_TTL_SECS (28800). A larger value is silently capped (child SSH/cred leases inherit the session lifetime)." }
+        idle_timeout_secs: { type: [integer, "null"], description: "default 1800 (30m); clamped to the (clamped) ttl_secs. Idle past this cascade-revokes." }
     SessionOpenResponse:
       type: object
       required: [session_id, ttl_secs, idle_timeout_secs]

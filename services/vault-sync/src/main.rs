@@ -50,19 +50,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState::new(cfg, store);
 
     // Prometheus metrics on a loopback-only listener (op/device counts are the metadata the
-    // at-rest model guards — never expose them on the public API surface).
+    // at-rest model guards — never expose them on the public API surface). Refuse a non-loopback
+    // bind (fail-closed: disable the listener) unless explicitly opted in.
     let metrics_bind =
         std::env::var("VAULT_SYNC_METRICS_BIND").unwrap_or_else(|_| "127.0.0.1:8301".to_owned());
-    let metrics_state = state.clone();
-    tokio::spawn(async move {
-        match tokio::net::TcpListener::bind(&metrics_bind).await {
-            Ok(l) => {
-                eprintln!("vault-sync: metrics on http://{metrics_bind}/metrics");
-                let _ = axum::serve(l, http::metrics_router(metrics_state)).await;
+    if metrics_bind_allowed(&metrics_bind, "VAULT_SYNC_METRICS_ALLOW_PUBLIC") {
+        let metrics_state = state.clone();
+        tokio::spawn(async move {
+            match tokio::net::TcpListener::bind(&metrics_bind).await {
+                Ok(l) => {
+                    eprintln!("vault-sync: metrics on http://{metrics_bind}/metrics");
+                    let _ = axum::serve(l, http::metrics_router(metrics_state)).await;
+                }
+                Err(e) => eprintln!("vault-sync: metrics listener disabled ({e})"),
             }
-            Err(e) => eprintln!("vault-sync: metrics listener disabled ({e})"),
-        }
-    });
+        });
+    } else {
+        eprintln!(
+            "vault-sync: metrics listener DISABLED — {metrics_bind} is not loopback; /metrics \
+             exposes op/device counts. Bind 127.0.0.1, or set VAULT_SYNC_METRICS_ALLOW_PUBLIC=1."
+        );
+    }
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!("vault-sync listening on {bind}");
@@ -70,6 +78,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Whether a metrics listener may bind `bind`: loopback always, otherwise only when the named
+/// allow-public env is `1`. A bind that doesn't parse as a `SocketAddr` is treated as
+/// non-loopback — fail-closed.
+fn metrics_bind_allowed(bind: &str, allow_env: &str) -> bool {
+    let loopback = bind
+        .parse::<std::net::SocketAddr>()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(false);
+    loopback || std::env::var(allow_env).as_deref() == Ok("1")
 }
 
 async fn shutdown_signal() {

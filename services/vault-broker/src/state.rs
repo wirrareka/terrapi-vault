@@ -149,8 +149,16 @@ impl Metrics {
 /// operator session 8 h hard cap, 30 min idle.
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 8 * 60 * 60;
 pub const DEFAULT_SESSION_IDLE_SECS: u64 = 30 * 60;
+/// Hard ceilings a caller's requested `ttl_secs`/`idle_timeout_secs` are clamped to — the
+/// short-TTL guarantee must not be defeatable by a large request value. 8 h is the
+/// demon-confirmed operator-session cap; idle is bounded to the (clamped) session TTL.
+pub const MAX_SESSION_TTL_SECS: u64 = 8 * 60 * 60;
 /// SSH cert defaults (demon-confirmed): 900 s interactive / 300 s automated.
 pub const SSH_CERT_TTL_INTERACTIVE_SECS: u64 = 900;
+/// Hard ceiling on a signed SSH cert's validity, regardless of the requested `ttl_secs`. The
+/// cert stays cryptographically valid until `valid_before` even after lease revoke (the KRL is
+/// best-effort), so this bound is what actually keeps issuance short-lived. 1 h is generous.
+pub const SSH_CERT_MAX_TTL_SECS: u64 = 60 * 60;
 /// Automated/touch-per-op default; selected by the caller via `ttl_secs` for now.
 #[allow(dead_code)]
 pub const SSH_CERT_TTL_AUTOMATED_SECS: u64 = 300;
