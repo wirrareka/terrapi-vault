@@ -21,10 +21,26 @@ pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// serialise on the single writer.
 pub const DEFAULT_READERS: usize = 4;
 
+/// The SQLCipher passphrase for the server DB, kept out of any `Debug` output (`Config`
+/// derives `Debug`). When present, every store connection is opened with `PRAGMA key` so the
+/// DB — and its WAL — are encrypted at rest, protecting the **metadata** (op/device counts,
+/// timing, sizes, cleartext `collection_id`, device pubkeys) a stolen disk would otherwise
+/// expose. The content is already E2E-encrypted regardless. See `docs/planning/02-...` §threat.
+#[derive(Clone)]
+pub struct DbKey(pub String);
+
+impl std::fmt::Debug for DbKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DbKey(***redacted***)")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: SocketAddr,
     pub db_path: String,
+    /// `Some` → SQLCipher-encrypt the DB at rest with this passphrase; `None` → plain SQLite.
+    pub db_key: Option<DbKey>,
     pub max_body_bytes: usize,
     pub max_pull: u32,
     pub max_concurrency: usize,
@@ -40,6 +56,7 @@ impl Config {
         let bind = env_parse("VAULT_SYNC_BIND")
             .unwrap_or_else(|| "127.0.0.1:8300".parse().expect("valid default addr"));
         let db_path = std::env::var("VAULT_SYNC_DB").unwrap_or_else(|_| "vault-sync.db".to_owned());
+        let db_key = load_db_key();
         let max_body_bytes =
             env_parse("VAULT_SYNC_MAX_BODY_BYTES").unwrap_or(DEFAULT_MAX_BODY_BYTES);
         let max_pull = env_parse("VAULT_SYNC_MAX_PULL")
@@ -58,11 +75,28 @@ impl Config {
         Self {
             bind,
             db_path,
+            db_key,
             max_body_bytes,
             max_pull,
             max_concurrency,
             request_timeout,
             readers,
         }
+    }
+}
+
+/// The SQLCipher passphrase from `VAULT_SYNC_DB_KEY`, or `VAULT_SYNC_DB_KEY_FILE` (a mode-600
+/// file — preferred so the secret is not in the process environment). Env wins; trailing
+/// newline trimmed. `None` (neither set) → plain SQLite at rest.
+fn load_db_key() -> Option<DbKey> {
+    if let Ok(k) = std::env::var("VAULT_SYNC_DB_KEY") {
+        if !k.is_empty() {
+            return Some(DbKey(k));
+        }
+    }
+    let path = std::env::var("VAULT_SYNC_DB_KEY_FILE").ok()?;
+    match std::fs::read_to_string(&path) {
+        Ok(s) if !s.trim().is_empty() => Some(DbKey(s.trim_end_matches(['\n', '\r']).to_owned())),
+        _ => None,
     }
 }

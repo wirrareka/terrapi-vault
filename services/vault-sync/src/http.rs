@@ -674,6 +674,7 @@ mod tests {
         let cfg = Config {
             bind: "127.0.0.1:8300".parse().unwrap(),
             db_path: String::new(),
+            db_key: None,
             max_body_bytes: 1 << 20,
             max_pull: 500,
             max_concurrency: 64,

@@ -10,6 +10,11 @@ for the design and `spec/sync-openapi.yaml` for the wire contract.
 - **Server-blind.** The server stores only: `vault_id`, an enrolment verifier (Argon2-secret
   hash), device ed25519 public keys, and **opaque encrypted ops**. It never sees the vault
   passphrase, the vault key, or note plaintext.
+- **At-rest encryption (recommended).** Content is E2E-encrypted, but the DB *metadata*
+  (op/device counts, timing, op sizes, cleartext `collection_id`, device pubkeys) is not — so
+  set `VAULT_SYNC_DB_KEY_FILE` (or `VAULT_SYNC_DB_KEY`) and the whole DB + WAL are
+  SQLCipher-encrypted, protecting that metadata if the disk/backup is stolen. Set it **before
+  first run** and back the key up **separately** from the DB.
 - **Device auth is app-layer.** Every `push`/`pull`/`status`/`tail` is signed by the calling
   device's ed25519 key over a canonical string (method + path + vault id + ts + nonce + body
   hash). `account`/`enroll` are self-signed by the key being registered; **both** are gated by

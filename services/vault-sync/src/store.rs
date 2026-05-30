@@ -1,6 +1,7 @@
-//! Server-blind op store (plain SQLite via the lib's `rusqlite` re-export). Holds only:
-//! the per-vault enrolment verifier, device public keys, and opaque encrypted ops. Never
-//! the vault key or plaintext. `seq` is a per-`vault_id` monotonic cursor for `pull`.
+//! Server-blind op store (SQLite via the lib's `rusqlite` re-export; optionally
+//! SQLCipher-encrypted at rest — see [`Store::open`]'s `key`). Holds only: the per-vault
+//! enrolment verifier, device public keys, and opaque encrypted ops. Never the vault key or
+//! plaintext. `seq` is a per-`vault_id` monotonic cursor for `pull`.
 
 use crate::dto::{EnrollVerifier, Op, StoredOp};
 use base64::Engine as _;
@@ -17,6 +18,16 @@ pub fn now_unix() -> i64 {
 
 fn b64() -> base64::engine::general_purpose::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
+}
+
+/// Apply the SQLCipher passphrase to a freshly-opened connection. **Must** run before any other
+/// statement — SQLCipher keys the database on first use. No-op when `key` is `None` (plain
+/// SQLite). The salt lives in the DB header, so no sidecar is needed.
+fn apply_key(conn: &Connection, key: Option<&str>) -> rusqlite::Result<()> {
+    if let Some(k) = key {
+        conn.pragma_update(None, "key", k)?;
+    }
+    Ok(())
 }
 
 /// The enrolment record a new device needs (salt + Argon2 params) plus the server's verifier
@@ -39,16 +50,20 @@ pub struct Store {
 
 impl Store {
     /// Open (creating if needed) the SQLite database at `path` with a pool of `readers`
-    /// read-only connections beside the writer.
+    /// read-only connections beside the writer. When `key` is `Some`, every connection is
+    /// SQLCipher-encrypted at rest with that passphrase (DB + WAL); `None` → plain SQLite.
     ///
     /// # Errors
-    /// Propagates any `rusqlite` open/DDL error.
-    pub fn open(path: &str, readers: usize) -> rusqlite::Result<Self> {
+    /// Propagates any `rusqlite` open/DDL error — including a wrong `key` on an existing
+    /// encrypted DB (the schema read fails with "file is not a database").
+    pub fn open(path: &str, readers: usize, key: Option<&str>) -> rusqlite::Result<Self> {
         let writer = Connection::open(path)?;
+        apply_key(&writer, key)?; // MUST precede any other statement
         Self::init(&writer)?; // sets WAL (persisted) + schema
         let mut pool = Vec::with_capacity(readers);
         for _ in 0..readers {
             let c = Connection::open(path)?;
+            apply_key(&c, key)?;
             // Inherit WAL from the file; forbid writes on this handle; wait out brief contention.
             c.execute_batch(
                 "PRAGMA foreign_keys = ON; PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;",
@@ -475,7 +490,7 @@ mod tests {
         let p = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
         {
-            let s = Store::open(&p, 3).unwrap();
+            let s = Store::open(&p, 3, None).unwrap();
             assert_eq!(s.readers.len(), 3);
             let (acc, _, _) = s.push_ops("v1", &[op("a", 1), op("b", 2)]).unwrap();
             assert_eq!(acc, 2);
@@ -490,6 +505,40 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{p}{suffix}"));
         }
+    }
+
+    #[test]
+    fn encrypted_store_roundtrips_and_rejects_wrong_key() {
+        const KEY: &str = "correct horse battery staple";
+        let path = std::env::temp_dir().join(format!("vault-sync-enc-{}.db", std::process::id()));
+        let p = path.to_string_lossy().to_string();
+        let clean = |p: &str| {
+            for s in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{p}{s}"));
+            }
+        };
+        clean(&p);
+
+        // Create encrypted, write an op.
+        {
+            let s = Store::open(&p, 1, Some(KEY)).unwrap();
+            assert_eq!(s.push_ops("v1", &[op("a", 1)]).unwrap().0, 1);
+        }
+        // Reopen with the right key → the data is there.
+        {
+            let s = Store::open(&p, 1, Some(KEY)).unwrap();
+            assert_eq!(s.latest_seq("v1").unwrap(), 1);
+        }
+        // Wrong key, and no key, both fail to open an encrypted DB.
+        assert!(Store::open(&p, 0, Some("wrong key")).is_err());
+        assert!(Store::open(&p, 0, None).is_err());
+        // The on-disk file is genuinely encrypted: no plaintext SQLite header.
+        let raw = std::fs::read(&p).unwrap();
+        assert!(
+            !raw.starts_with(b"SQLite format 3\0"),
+            "encrypted DB must not carry a plaintext sqlite header"
+        );
+        clean(&p);
     }
 
     #[test]

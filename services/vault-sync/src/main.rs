@@ -23,14 +23,28 @@ use store::Store;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::from_env();
+    let at_rest = if cfg.db_key.is_some() {
+        "encrypted (SQLCipher)"
+    } else {
+        "PLAINTEXT — set VAULT_SYNC_DB_KEY[_FILE] to encrypt metadata at rest"
+    };
     eprintln!(
-        "vault-sync {} starting: bind={} db={}",
+        "vault-sync {} starting: bind={} db={} at-rest={}",
         env!("CARGO_PKG_VERSION"),
         cfg.bind,
         cfg.db_path,
+        at_rest,
     );
 
-    let store = Store::open(&cfg.db_path, cfg.readers)?;
+    let key = cfg.db_key.as_ref().map(|k| k.0.as_str());
+    let store = Store::open(&cfg.db_path, cfg.readers, key).map_err(|e| {
+        let hint = if key.is_some() {
+            " — wrong VAULT_SYNC_DB_KEY, or the DB exists and is not SQLCipher-encrypted?"
+        } else {
+            ""
+        };
+        format!("vault-sync: cannot open DB at {}: {e}{hint}", cfg.db_path)
+    })?;
     let bind = cfg.bind;
     let state = AppState::new(cfg, store);
 

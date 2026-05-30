@@ -12,8 +12,9 @@ name = "vault-sync"
 path = "src/main.rs"
 
 [dependencies]
-# At-rest lib: reused for its `rusqlite` re-export (one sqlite in the tree). The server DB
-# holds only opaque, already-E2E-encrypted ops, so it is plain sqlite (no PRAGMA key).
+# At-rest lib: reused for its `rusqlite` re-export (one SQLCipher-enabled sqlite in the tree).
+# Op CONTENT is already E2E-encrypted, so the DB is plain by default; set VAULT_SYNC_DB_KEY[_FILE]
+# to additionally SQLCipher-encrypt the DB+WAL at rest (protects metadata — see store.rs apply_key).
 terrapi-vault.workspace = true
 # Shared `Hlc` ordering primitive (also used by the broker lease tree).
 vault-transport.workspace = true

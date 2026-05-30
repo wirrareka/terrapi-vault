@@ -159,7 +159,8 @@ table, backups. No FreeBSD bastille module (personal, not the broker's platform 
 - **memento-core client provider** — the new `SyncProvider` that captures DB row changes as
   ops, encrypts payloads (AEAD under a vault-derived key, domain-separated), pushes/pulls, and
   applies incoming ops with per-row LWW by HLC. Cross-repo (memento), coordinated separately.
-- SQLCipher-at-rest for the server DB (defense-in-depth); CRDT text-merge (Phase 4).
+- ~~SQLCipher-at-rest for the server DB~~ — **DONE 2026-05-30** (opt-in `VAULT_SYNC_DB_KEY[_FILE]`,
+  keys DB+WAL via `PRAGMA key`). CRDT text-merge remains Phase 4.
 
 ## Threat model — what the server learns (metadata exposure)
 
@@ -188,7 +189,9 @@ revisit:
 - **Size** — pad `encrypted_payload` to fixed-size buckets to blunt size fingerprinting.
 - **Timing** — op `created_at` + `hlc.wall_ms` reveal activity; batching/jitter on the client
   reduces it. No server change needed (server only timestamps receipt).
-- **At-rest** — SQLCipher-encrypt the server DB (deferred above) so a stolen disk yields no
-  metadata either.
+- **At-rest** — ✅ **DONE (2026-05-30)**: the server DB is SQLCipher-encryptable at rest. Set
+  `VAULT_SYNC_DB_KEY` / `VAULT_SYNC_DB_KEY_FILE` and every connection (DB **and** WAL) is keyed
+  via `PRAGMA key`, so a stolen disk/backup yields neither content nor the metadata above. Opt-in
+  for back-compat; recommended for any persistent deploy. (`store.rs` `apply_key`, `config.rs`.)
 
 (Source: review finding S9, `docs/review/security.md`.)
