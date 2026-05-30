@@ -19,7 +19,14 @@ use std::sync::Mutex;
 /// timestamp is outside `[now - SKEW, now + SKEW]` is rejected (bounds replay windows).
 pub const MAX_SKEW_SECS: i64 = 300;
 
-/// Hard cap on live nonces held by the replay guard. Within the 300 s window a single
+/// How long a `(device, nonce)` is remembered. It must be **strictly wider** than the accept
+/// window: a captured request carries a fixed `ts`, so it stays skew-acceptable anywhere in
+/// `[ts-SKEW, ts+SKEW]` — up to `2·SKEW` after it was first recorded (worst case: first seen at
+/// `ts-SKEW`, replayed at `ts+SKEW`). Pruning at exactly `SKEW` would forget the nonce while a
+/// replay could still pass `check_skew`; `2·SKEW` closes that gap.
+pub const NONCE_RETENTION_SECS: i64 = 2 * MAX_SKEW_SECS;
+
+/// Hard cap on live nonces held by the replay guard. Within the retention window a single
 /// person's devices generate far fewer than this; the cap is a backstop so a flood of unique
 /// nonces cannot grow the guard without bound. At the cap new nonces are refused (fail-closed)
 /// until the window drains.
@@ -118,7 +125,7 @@ impl ReplayGuard {
     pub fn check_and_record(&self, device_id: &str, nonce: &str, now: i64) -> bool {
         let key = format!("{device_id}\n{nonce}");
         let mut seen = self.seen.lock().expect("replay lock");
-        seen.retain(|_, ts| now - *ts <= MAX_SKEW_SECS);
+        seen.retain(|_, ts| now - *ts <= NONCE_RETENTION_SECS);
         if seen.contains_key(&key) {
             return false;
         }
@@ -234,8 +241,10 @@ mod tests {
         assert!(g.check_and_record("dev-a", "n1", 1000));
         assert!(!g.check_and_record("dev-a", "n1", 1001)); // replay
         assert!(g.check_and_record("dev-a", "n2", 1001)); // new nonce ok
-                                                          // After the window the old nonce is pruned and may be reused (ts itself would be
-                                                          // rejected separately by the handler's skew check).
-        assert!(g.check_and_record("dev-a", "n1", 1000 + MAX_SKEW_SECS + 1));
+                                                          // Still remembered one accept-window later (the gap R15 closes): a same-ts replay
+                                                          // could still pass check_skew here, so the nonce must NOT be forgotten yet.
+        assert!(!g.check_and_record("dev-a", "n1", 1000 + MAX_SKEW_SECS + 1));
+        // Only after the full retention window (2·SKEW) is it pruned and reusable.
+        assert!(g.check_and_record("dev-a", "n1", 1000 + NONCE_RETENTION_SECS + 1));
     }
 }

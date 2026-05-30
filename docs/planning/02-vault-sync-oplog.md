@@ -160,3 +160,35 @@ table, backups. No FreeBSD bastille module (personal, not the broker's platform 
   ops, encrypts payloads (AEAD under a vault-derived key, domain-separated), pushes/pulls, and
   applies incoming ops with per-row LWW by HLC. Cross-repo (memento), coordinated separately.
 - SQLCipher-at-rest for the server DB (defense-in-depth); CRDT text-merge (Phase 4).
+
+## Threat model — what the server learns (metadata exposure)
+
+vault-sync is **content** server-blind: the vault key never reaches the server and
+`encrypted_payload` is never decrypted (the server stores it as an opaque blob). But a
+server-blind oplog is **not** metadata-blind. An honest-but-curious or compromised server, or
+anyone who can read its DB, observes:
+
+| Observable | Where | Leak |
+|---|---|---|
+| op count / rate, push timing | `ops` rows, `created_at` | activity pattern: when/how much you edit |
+| device count + per-op `device_id` | `devices`, `ops.device_id` | how many devices, which authored what |
+| `hlc.wall_ms` | `ops` | client wall-clock at edit time (timezone/skew hints) |
+| op payload **size** | `ops.payload` length | coarse size of each change (no content) |
+| `collection_id` (cleartext) | `ops.collection_id` | which table/collection changed, unless the client HMACs it (a **MAY** today, not enforced) |
+| `vault_id` ↔ device pubkeys | `accounts`/`devices` | links a vault to its device key set |
+
+**Not** observable: note/field plaintext, the vault passphrase or key, the enrolment secret
+(only `SHA-256` of it is stored), row contents.
+
+Accepted for the personal/single-user scope (the server is the owner's own host, TLS-fronted,
+not multi-tenant, not under the residency air-gap). If vault-sync ever serves others' data,
+revisit:
+- **`collection_id`** — make HMAC-blinding **mandatory** (keyed by a vault-derived key) so the
+  server can't see which collections change. Today it is a client `MAY`.
+- **Size** — pad `encrypted_payload` to fixed-size buckets to blunt size fingerprinting.
+- **Timing** — op `created_at` + `hlc.wall_ms` reveal activity; batching/jitter on the client
+  reduces it. No server change needed (server only timestamps receipt).
+- **At-rest** — SQLCipher-encrypt the server DB (deferred above) so a stolen disk yields no
+  metadata either.
+
+(Source: review finding S9, `docs/review/security.md`.)

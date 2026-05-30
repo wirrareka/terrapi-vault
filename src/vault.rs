@@ -180,9 +180,11 @@ impl Vault {
         let salt = meta.salt()?;
 
         // Confirm the caller actually knows the current passphrase before
-        // we touch the cipher key.
+        // we touch the cipher key. Compare in constant time so the check does
+        // not leak how many leading key bytes matched via timing (no extra
+        // crate — a fixed-length XOR-accumulate over the 32-byte keys).
         let old_key = derive_key(old_passphrase, &salt, meta.kdf_params)?;
-        if old_key.expose_secret().0 != self.key.expose_secret().0 {
+        if !constant_time_eq(&old_key.expose_secret().0, &self.key.expose_secret().0) {
             return Err(Error::WrongPassphrase);
         }
 
@@ -320,6 +322,16 @@ fn map_cipher_err(e: rusqlite::Error) -> Error {
     Error::Db(e)
 }
 
+/// Constant-time equality of two 32-byte keys: always inspects every byte (XOR-accumulate),
+/// so comparison time does not reveal how many leading bytes matched. No external crate.
+fn constant_time_eq(a: &[u8; crate::KEY_LEN], b: &[u8; crate::KEY_LEN]) -> bool {
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Create the `vault_schema` bookkeeping table and stamp version 1.
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -425,6 +437,18 @@ mod tests {
             v.rotate_key("bogus", "new").unwrap_err(),
             Error::WrongPassphrase
         ));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_keys() {
+        let a = [9u8; crate::KEY_LEN];
+        let mut b = a;
+        assert!(constant_time_eq(&a, &b));
+        b[crate::KEY_LEN - 1] ^= 0x01; // flip the last byte
+        assert!(!constant_time_eq(&a, &b));
+        b = a;
+        b[0] ^= 0x80; // flip the first byte
+        assert!(!constant_time_eq(&a, &b));
     }
 
     #[test]
