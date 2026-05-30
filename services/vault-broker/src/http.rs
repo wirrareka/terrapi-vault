@@ -174,11 +174,13 @@ pub fn router(state: AppState) -> Router {
         .layer(from_fn_with_state(state.clone(), hard::concurrency_limit))
         .layer(from_fn_with_state(state.clone(), hard::rate_limit))
         .layer(from_fn(hard::security_headers))
+        // Outermost: stamp every response (incl. rejects) with a correlation id.
+        .layer(from_fn(hard::request_id))
         .with_state(state)
 }
 
-async fn healthz() -> &'static str {
-    "ok"
+async fn healthz() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
 }
 
 /// Loopback-only metrics router (`8201`): Prometheus text, no auth (WG/loopback bound).

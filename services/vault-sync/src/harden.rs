@@ -6,20 +6,57 @@
 use crate::dto::ErrorBody;
 use crate::state::AppState;
 use axum::extract::{MatchedPath, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 fn reject(status: StatusCode, error: &str, detail: &str) -> Response {
-    (
+    let mut resp = (
         status,
         Json(ErrorBody {
             error: error.to_owned(),
             detail: detail.to_owned(),
         }),
     )
-        .into_response()
+        .into_response();
+    // Transient rejections advertise when to retry.
+    if matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::REQUEST_TIMEOUT
+    ) {
+        resp.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            HeaderValue::from_static("1"),
+        );
+    }
+    resp
+}
+
+/// Per-process request counter for generated correlation ids (no runtime RNG dep; the value is
+/// only for log/response correlation within a run).
+static REQ_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Echo the caller's `X-Request-Id` (bounded, ASCII) or generate one, so a client can correlate
+/// its request with the server's response. Outermost layer, so even rejects carry it.
+pub async fn request_id(req: Request, next: Next) -> Response {
+    let id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty() && s.len() <= 128 && s.is_ascii())
+        .map_or_else(
+            || format!("req-{:016x}", REQ_COUNTER.fetch_add(1, Ordering::Relaxed)),
+            str::to_owned,
+        );
+    let mut resp = next.run(req).await;
+    if let Ok(hv) = HeaderValue::from_str(&id) {
+        resp.headers_mut().insert("x-request-id", hv);
+    }
+    resp
 }
 
 /// Global concurrency cap → `503` when all permits are in use. The permit is held only for the

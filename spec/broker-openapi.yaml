@@ -23,6 +23,25 @@ info:
     op the role isn't granted returns `403` (least privilege). Prometheus metrics are served
     on a separate loopback listener (`127.0.0.1:8201/metrics`), never on this mTLS surface.
 
+    Three auth outcomes a client can distinguish by the `error` code: `401 missing_identity`
+    (no verified mTLS SAN), `403 unregistered_principal` (cert trusted but its SAN is not a
+    registered role — "register my SAN"), `403 forbidden` (registered but lacks the
+    capability for this route — "grant my role a capability"). Required capability per route:
+
+    | capability | routes |
+    |---|---|
+    | `ssh-ca`   | `GET /v1/{group}/ssh/ca`, `GET /v1/{group}/ssh/revoked` |
+    | `ssh-sign` | `POST /v1/{group}/ssh/sign` |
+    | `creds`    | `POST /v1/{group}/{tenant_id}/creds/{role}` |
+    | `kms`      | `POST /v1/{group}/{tenant_id}/kms/{key_id}/{wrap,unwrap,rotate}` |
+    | `session`  | `POST /v1/sys/session`, `DELETE /v1/sys/session/{id}` |
+    | `leases`   | `POST /v1/sys/leases/{renew,revoke}` |
+    | `snapshot` | `POST /v1/sys/store-snapshot` |
+
+    **Conventions.** Every response carries `X-Request-Id` (echoed from the request or
+    generated) for correlation. Transient rejections (`408`/`429`/`503`) carry `Retry-After`.
+    `GET /healthz` returns `{ "status": "ok", "version": "<crate-version>" }`.
+
     **Namespace.** Leased service-admin creds live under `<group>/<tenant_id>/<role>`,
     where `tenant_id` is the Vulture `organization_id` (lowercase UUIDv4). Host/operator
     SSH CA material is **group-scoped**, not tenant-scoped.
@@ -342,10 +361,13 @@ paths:
     get:
       tags: [system]
       operationId: healthz
-      summary: Liveness (unauthenticated).
+      summary: Liveness + version (unauthenticated).
       security: []
       x-implementation-status: implemented
-      responses: { "200": { description: ok } }
+      responses:
+        "200":
+          description: ok
+          content: { application/json: { schema: { type: object, required: [status, version], properties: { status: { type: string, enum: [ok] }, version: { type: string } } } } }
 
   /v1/sys/seal-status:
     get:

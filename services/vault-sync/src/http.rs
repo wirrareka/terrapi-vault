@@ -135,7 +135,7 @@ impl FromRequestParts<AppState> for VaultId {
 pub fn router(state: AppState) -> Router {
     let max_body = state.cfg.max_body_bytes;
     Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz))
         .route("/v1/sync/{vault_id}/account", post(create_account))
         .route(
             "/v1/sync/{vault_id}/enroll-challenge",
@@ -161,7 +161,13 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             crate::harden::concurrency_limit,
         ))
+        // Outermost: stamp every response (incl. rejects) with a correlation id.
+        .layer(axum::middleware::from_fn(crate::harden::request_id))
         .with_state(state)
+}
+
+async fn healthz() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
 }
 
 /// Loopback-only metrics router (Prometheus text). Exposed on a separate listener — never on

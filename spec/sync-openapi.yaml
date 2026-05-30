@@ -156,7 +156,12 @@ components:
 
 paths:
   /healthz:
-    get: { summary: Liveness, responses: { '200': { description: ok } } }
+    get:
+      summary: Liveness + version.
+      responses:
+        '200':
+          description: ok
+          content: { application/json: { schema: { type: object, required: [status, version], properties: { status: { type: string, enum: [ok] }, version: { type: string } } } } }
 
   /v1/sync/{vault_id}/account:
     post:

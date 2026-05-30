@@ -13,7 +13,7 @@ use crate::config::Hardening;
 use crate::dto::ErrorBody;
 use crate::state::AppState;
 use axum::extract::{MatchedPath, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -84,14 +84,44 @@ impl HardenState {
 }
 
 fn reject(status: StatusCode, error: &str, detail: &str) -> Response {
-    (
+    let mut resp = (
         status,
         Json(ErrorBody {
             error: error.to_owned(),
             detail: detail.to_owned(),
         }),
     )
-        .into_response()
+        .into_response();
+    // Transient rejections advertise when to retry (clients/proxies honour Retry-After).
+    if matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::REQUEST_TIMEOUT
+    ) {
+        resp.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            HeaderValue::from_static("1"),
+        );
+    }
+    resp
+}
+
+/// Echo the caller's `X-Request-Id` (bounded, ASCII) back on the response, or generate one when
+/// absent, so a client can correlate its request with this broker's response. Outermost layer,
+/// so even rejected requests carry the id.
+pub async fn request_id(req: Request, next: Next) -> Response {
+    let id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty() && s.len() <= 128 && s.is_ascii())
+        .map_or_else(crate::state::random_id, str::to_owned);
+    let mut resp = next.run(req).await;
+    if let Ok(hv) = HeaderValue::from_str(&id) {
+        resp.headers_mut().insert("x-request-id", hv);
+    }
+    resp
 }
 
 /// Uniform JSON `404` for any unrouted path (the router fallback).
