@@ -1049,8 +1049,9 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e.0, StatusCode::FORBIDDEN);
+        assert_eq!(e.1 .0.error, "unregistered_principal");
 
-        // No verified identity and insecure-dev off → 401 (no header fallback in prod).
+        // No verified identity and insecure-dev off → 401 missing_identity (no header fallback).
         let mut parts = Request::builder()
             .header("x-client-cert-san", "demon-system.eu.proximi.internal")
             .body(Body::empty())
@@ -1061,6 +1062,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(e.1 .0.error, "missing_identity");
     }
 
     fn sign_request(group: &str, body: &str) -> Request<Body> {

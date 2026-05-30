@@ -209,6 +209,13 @@ fn signed_headers(h: &HeaderMap) -> Result<SignedHeaders, ErrResp> {
             )
         })?
         .to_owned();
+    if nonce.len() > auth::MAX_NONCE_LEN {
+        return Err(err(
+            StatusCode::UNAUTHORIZED,
+            "bad_nonce",
+            "X-Sync-Nonce is too long",
+        ));
+    }
     let sig = get_str("x-sync-sig")
         .and_then(auth::parse_sig_b64)
         .ok_or_else(|| {

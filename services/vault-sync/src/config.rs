@@ -95,8 +95,26 @@ fn load_db_key() -> Option<DbKey> {
         }
     }
     let path = std::env::var("VAULT_SYNC_DB_KEY_FILE").ok()?;
+    warn_if_group_or_world_readable("VAULT_SYNC_DB_KEY_FILE", &path);
     match std::fs::read_to_string(&path) {
         Ok(s) if !s.trim().is_empty() => Some(DbKey(s.trim_end_matches(['\n', '\r']).to_owned())),
         _ => None,
     }
 }
+
+/// Loudly warn (don't silently accept) if a secret file is readable by group/other — the agent
+/// finding was that a world-readable key loaded with no signal. Unix only.
+#[cfg(unix)]
+pub fn warn_if_group_or_world_readable(label: &str, path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            eprintln!(
+                "WARNING: {label} {path} is mode {mode:o} — group/other can read this secret; chmod 600 it."
+            );
+        }
+    }
+}
+#[cfg(not(unix))]
+pub fn warn_if_group_or_world_readable(_label: &str, _path: &str) {}

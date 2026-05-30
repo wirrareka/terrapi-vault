@@ -106,7 +106,9 @@ components:
           enum:
             - group_mismatch     # 404 — :group ≠ this broker's residency group (air-gap)
             - sealed             # 503 — broker is sealed; mutating ops unavailable until unseal
-            - forbidden          # 403 — principal lacks the capability for this op
+            - missing_identity   # 401 — no verified mTLS client identity (SAN) on the request
+            - unregistered_principal # 403 — cert trusted but its SAN is not a registered role
+            - forbidden          # 403 — principal is registered but lacks the capability for this op
             - bad_request        # 400 — malformed request (generic)
             - bad_tenant_id      # 400 — tenant_id is not a lowercase UUIDv4
             - bad_key_id         # 400 — key_id failed validation

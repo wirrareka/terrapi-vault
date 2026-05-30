@@ -131,6 +131,7 @@ components:
             - bad_ts            # 401 — X-Sync-Ts missing/unparseable
             - missing_nonce     # 401 — X-Sync-Nonce header absent
             - bad_sig           # 401 — X-Sync-Sig not base64 ed25519 (64 bytes)
+            - bad_nonce         # 401 — X-Sync-Nonce missing/too long
             - bad_signature     # 401 — signature did not verify
             - stale_request     # 401 — X-Sync-Ts outside the ±300 s skew window
             - replay            # 401 — this (device, nonce) was already used

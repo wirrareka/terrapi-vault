@@ -26,6 +26,10 @@ pub const MAX_SKEW_SECS: i64 = 300;
 /// replay could still pass `check_skew`; `2·SKEW` closes that gap.
 pub const NONCE_RETENTION_SECS: i64 = 2 * MAX_SKEW_SECS;
 
+/// Max accepted `X-Sync-Nonce` length (bytes). A unique token (UUID/ULID) is well under this;
+/// the cap stops an attacker-chosen giant nonce from amplifying the replay guard's memory.
+pub const MAX_NONCE_LEN: usize = 128;
+
 /// Hard cap on live nonces held by the replay guard. Within the retention window a single
 /// person's devices generate far fewer than this; the cap is a backstop so a flood of unique
 /// nonces cannot grow the guard without bound. At the cap new nonces are refused (fail-closed)

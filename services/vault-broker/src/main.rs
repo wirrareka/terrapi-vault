@@ -68,6 +68,7 @@ fn unseal_passphrase() -> Option<String> {
         }
     }
     let path = std::env::var("VAULT_UNSEAL_PASSPHRASE_FILE").ok()?;
+    warn_if_group_or_world_readable("VAULT_UNSEAL_PASSPHRASE_FILE", &path);
     match std::fs::read_to_string(&path) {
         Ok(s) if !s.trim().is_empty() => Some(s.trim_end_matches(['\n', '\r']).to_owned()),
         Ok(_) => None,
@@ -77,6 +78,22 @@ fn unseal_passphrase() -> Option<String> {
         }
     }
 }
+
+/// Loudly warn if a secret file is group/other-readable (it should be mode 600). Unix only.
+#[cfg(unix)]
+fn warn_if_group_or_world_readable(label: &str, path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            eprintln!(
+                "vault-broker: WARNING {label} {path} is mode {mode:o} — group/other can read this secret; chmod 600 it."
+            );
+        }
+    }
+}
+#[cfg(not(unix))]
+fn warn_if_group_or_world_readable(_label: &str, _path: &str) {}
 
 /// Load (or generate on first run) the SSH CA from the just-opened store.
 fn load_ca(store: Vault, group: &str) -> Option<Unsealed> {

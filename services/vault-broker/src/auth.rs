@@ -11,11 +11,25 @@
 //! `X-Client-Cert-SAN` header (plain HTTP, no transport auth) and an unmapped SAN gets a
 //! `dev` principal with all capabilities, so local runs need no roles config.
 
+use crate::dto::ErrorBody;
 use crate::state::AppState;
 use axum::extract::FromRequestParts;
 use axum::http::{request::Parts, StatusCode};
+use axum::Json;
 use serde::Deserialize;
 use std::collections::HashSet;
+
+/// A typed auth rejection (same `{error,detail}` envelope as the rest of the API), so a client
+/// can switch on the machine code.
+fn deny(status: StatusCode, code: &str, detail: &str) -> (StatusCode, Json<ErrorBody>) {
+    (
+        status,
+        Json(ErrorBody {
+            error: code.to_owned(),
+            detail: detail.to_owned(),
+        }),
+    )
+}
 
 /// A broker operation a principal may be granted. Maps to endpoint groups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
@@ -86,7 +100,7 @@ impl Principal {
 }
 
 impl FromRequestParts<AppState> for Principal {
-    type Rejection = (StatusCode, &'static str);
+    type Rejection = (StatusCode, Json<ErrorBody>);
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -95,11 +109,13 @@ impl FromRequestParts<AppState> for Principal {
         // PRODUCTION: SAN from the verified mTLS peer cert (set by `tls` as an extension).
         if let Some(ClientSan(san)) = parts.extensions.get::<ClientSan>().cloned() {
             // A trusted cert whose SAN is not a registered role is authenticated but not
-            // authorised for this broker → 403.
+            // authorised for this broker → 403. A distinct code (`unregistered_principal`) so a
+            // client can tell "register my SAN" from a capability `forbidden` on a route.
             let Some(rp) = state.cfg.roles.get(&san).cloned() else {
-                return Err((
+                return Err(deny(
                     StatusCode::FORBIDDEN,
-                    "client cert SAN is not a registered role",
+                    "unregistered_principal",
+                    "client cert is trusted but its SAN is not a registered broker role",
                 ));
             };
             return Ok(Principal {
@@ -111,9 +127,10 @@ impl FromRequestParts<AppState> for Principal {
 
         // DEV ONLY: header-based identity, and only when insecure dev is enabled.
         if !state.cfg.allow_insecure_dev {
-            return Err((
+            return Err(deny(
                 StatusCode::UNAUTHORIZED,
-                "missing verified client identity (mTLS SAN)",
+                "missing_identity",
+                "no verified client identity (mTLS SAN) on the request",
             ));
         }
         let san = parts
@@ -122,8 +139,9 @@ impl FromRequestParts<AppState> for Principal {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         let Some(san) = san else {
-            return Err((
+            return Err(deny(
                 StatusCode::UNAUTHORIZED,
+                "missing_identity",
                 "missing client identity (mTLS SAN)",
             ));
         };

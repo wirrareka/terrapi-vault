@@ -2,7 +2,7 @@
 //!
 //! The broker is the key authority: a per-target **KEK** is generated once and held in the
 //! at-rest encrypted store (same SQLCipher store as the SSH CA), **never exported**. The
-//! aether agent sends a data-encryption key (DEK) to **wrap** (AES-256-GCM under the KEK)
+//! aether agent sends a data-encryption key (DEK) to **wrap** (XChaCha20-Poly1305 under the KEK)
 //! and stores only the wrapped blob; on restore it **unwraps**. This keeps aether's
 //! zero-knowledge model (the agent holds the plaintext DEK only in RAM, per run) while the
 //! KEK never leaves the broker.
@@ -16,12 +16,20 @@
 //! 96-bit nonce would require a per-KEK wrap counter to stay clear of the ~2^32 birthday bound
 //! (review finding S6).
 
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use terrapi_vault::{random_salt, rusqlite, Vault};
 
 const NONCE_LEN: usize = 24; // XChaCha20-Poly1305 extended nonce
 const VER_LEN: usize = 4; // u32 LE KEK-version prefix on the wrapped blob
+
+/// Additional authenticated data binding a wrapped blob to its exact target tuple. The AEAD tag
+/// then covers `(group, tenant_id, key_id, version)`, so a blob cannot be unwrapped under a
+/// different target even if an attacker could somehow line up a matching KEK — explicit domain
+/// separation on top of the per-target KEK selection.
+fn aad_for(group: &str, tenant_id: &str, key_id: &str, version: u32) -> String {
+    format!("kms.v1\n{group}\n{tenant_id}\n{key_id}\n{version}")
+}
 
 /// 24 random bytes for an XChaCha20-Poly1305 nonce (two 16-byte CSPRNG draws, take 24).
 fn gen_nonce() -> [u8; NONCE_LEN] {
@@ -177,7 +185,8 @@ pub fn rotate(vault: &Vault, group: &str, tenant_id: &str, key_id: &str) -> Resu
     Ok(next)
 }
 
-/// Wrap `dek` under the target's **current** KEK. Returns `version(4 LE) || nonce(12) || ct+tag`.
+/// Wrap `dek` under the target's **current** KEK. Returns `version(4 LE) || nonce(24) || ct+tag`;
+/// the tag also covers the target tuple as AAD (see [`aad_for`]).
 ///
 /// # Errors
 /// `Store` on a DB error; `Crypto` on an AEAD failure.
@@ -191,8 +200,15 @@ pub fn wrap(
     let (version, kek) = current_kek(vault, group, tenant_id, key_id)?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&kek));
     let nonce_bytes = gen_nonce();
+    let aad = aad_for(group, tenant_id, key_id, version);
     let ct = cipher
-        .encrypt(XNonce::from_slice(&nonce_bytes), dek)
+        .encrypt(
+            XNonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: dek,
+                aad: aad.as_bytes(),
+            },
+        )
         .map_err(|_| KmsError::Crypto)?;
     let mut out = Vec::with_capacity(VER_LEN + NONCE_LEN + ct.len());
     out.extend_from_slice(&version.to_le_bytes());
@@ -201,11 +217,12 @@ pub fn wrap(
     Ok(out)
 }
 
-/// Unwrap `wrapped` (`version(4) || nonce(12) || ct+tag`) under that version's KEK.
+/// Unwrap `wrapped` (`version(4) || nonce(24) || ct+tag`) under that version's KEK, checking the
+/// target-tuple AAD.
 ///
 /// # Errors
 /// `BadInput` if too short; `Store` on a DB error; `Crypto` if the version is unknown or
-/// the KEK/nonce/tag don't authenticate (wrong target or tampered blob).
+/// the KEK/nonce/tag/AAD don't authenticate (wrong target or tampered blob).
 pub fn unwrap(
     vault: &Vault,
     group: &str,
@@ -222,8 +239,15 @@ pub fn unwrap(
     };
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&kek));
     let (nonce_bytes, ct) = wrapped[VER_LEN..].split_at(NONCE_LEN);
+    let aad = aad_for(group, tenant_id, key_id, version);
     cipher
-        .decrypt(XNonce::from_slice(nonce_bytes), ct)
+        .decrypt(
+            XNonce::from_slice(nonce_bytes),
+            Payload {
+                msg: ct,
+                aad: aad.as_bytes(),
+            },
+        )
         .map_err(|_| KmsError::Crypto)
 }
 
