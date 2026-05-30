@@ -5,7 +5,7 @@
 
 use crate::dto::ErrorBody;
 use crate::state::AppState;
-use axum::extract::{Request, State};
+use axum::extract::{MatchedPath, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -37,7 +37,29 @@ pub async fn concurrency_limit(
             "server is at capacity; retry shortly",
         );
     };
-    next.run(req).await
+    state.metrics.inflight_add(1);
+    let resp = next.run(req).await;
+    state.metrics.inflight_add(-1);
+    resp
+}
+
+/// Record `vault_sync_http_*` for a served request. Applied as a `route_layer`, so it runs
+/// after routing and the `MatchedPath` template (e.g. `/v1/sync/{vault_id}/push`) is the
+/// (bounded, id-free) label — never the concrete vault id.
+pub async fn record_metrics(
+    State(state): State<AppState>,
+    matched: Option<MatchedPath>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let route = matched.map_or_else(|| "<unmatched>".to_owned(), |m| m.as_str().to_owned());
+    let method = req.method().as_str().to_owned();
+    let start = std::time::Instant::now();
+    let resp = next.run(req).await;
+    state
+        .metrics
+        .record_request(&route, &method, resp.status().as_u16(), start.elapsed());
+    resp
 }
 
 /// Abort a request that runs past the configured budget → `408`. The `/tail` upgrade completes

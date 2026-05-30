@@ -3,6 +3,7 @@
 
 use crate::auth::ReplayGuard;
 use crate::config::Config;
+use crate::metrics::Metrics;
 use crate::ratelimit::RateBucket;
 use crate::store::Store;
 use std::collections::HashMap;
@@ -26,6 +27,8 @@ pub struct AppState {
     pub challenge_rl: Arc<RateBucket>,
     /// Global concurrency permits — bounds requests executing against the serialised store.
     pub sem: Arc<tokio::sync::Semaphore>,
+    /// Prometheus metrics, scraped on the loopback metrics listener.
+    pub metrics: Arc<Metrics>,
     /// Per-`vault_id` broadcast of newly-pushed ops (pre-serialised JSON) to live-tail
     /// WebSocket subscribers. Created lazily on first subscribe; the message is a `StoredOp`.
     tails: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
@@ -41,8 +44,19 @@ impl AppState {
             replay: Arc::new(ReplayGuard::default()),
             challenge_rl: Arc::new(RateBucket::default()),
             sem,
+            metrics: Arc::new(Metrics::default()),
             tails: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Current number of live-tail subscribers across all vaults (for the metrics gauge).
+    #[must_use]
+    pub fn tail_subscriber_count(&self) -> u64 {
+        let tails = self.tails.lock().expect("tails lock");
+        tails
+            .values()
+            .map(|tx| u64::try_from(tx.receiver_count()).unwrap_or(0))
+            .sum()
     }
 
     /// Subscribe to the live tail for `vault_id` (creating its channel on first use).

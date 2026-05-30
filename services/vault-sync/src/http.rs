@@ -146,6 +146,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sync/{vault_id}/pull", get(pull))
         .route("/v1/sync/{vault_id}/status", get(status))
         .route("/v1/sync/{vault_id}/tail", get(tail))
+        // Per-route so metrics run after routing and see the `MatchedPath` template (id-free).
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::harden::record_metrics,
+        ))
         .layer(DefaultBodyLimit::max(max_body))
         // Outer → inner: concurrency cap (503) · request timeout (408) · body limit (413).
         .layer(axum::middleware::from_fn_with_state(
@@ -156,6 +161,19 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             crate::harden::concurrency_limit,
         ))
+        .with_state(state)
+}
+
+/// Loopback-only metrics router (Prometheus text). Exposed on a separate listener — never on
+/// the public API surface — because op/device counts are the metadata the at-rest model guards.
+pub fn metrics_router(state: AppState) -> Router {
+    Router::new()
+        .route(
+            "/metrics",
+            get(|State(s): State<AppState>| async move {
+                s.metrics.render(s.tail_subscriber_count())
+            }),
+        )
         .with_state(state)
 }
 
@@ -546,6 +564,7 @@ async fn push(
         ),
         PushError::Db(d) => db_err(d),
     })?;
+    state.metrics.add_ops(accepted, duplicates);
     // Fan the newly-stored ops out to live-tail subscribers (best-effort).
     if accepted > 0 {
         let messages: Vec<String> = new_ops

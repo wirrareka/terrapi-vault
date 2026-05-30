@@ -12,6 +12,7 @@ mod config;
 mod dto;
 mod harden;
 mod http;
+mod metrics;
 mod ratelimit;
 mod state;
 mod store;
@@ -47,6 +48,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let bind = cfg.bind;
     let state = AppState::new(cfg, store);
+
+    // Prometheus metrics on a loopback-only listener (op/device counts are the metadata the
+    // at-rest model guards — never expose them on the public API surface).
+    let metrics_bind =
+        std::env::var("VAULT_SYNC_METRICS_BIND").unwrap_or_else(|_| "127.0.0.1:8301".to_owned());
+    let metrics_state = state.clone();
+    tokio::spawn(async move {
+        match tokio::net::TcpListener::bind(&metrics_bind).await {
+            Ok(l) => {
+                eprintln!("vault-sync: metrics on http://{metrics_bind}/metrics");
+                let _ = axum::serve(l, http::metrics_router(metrics_state)).await;
+            }
+            Err(e) => eprintln!("vault-sync: metrics listener disabled ({e})"),
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!("vault-sync listening on {bind}");

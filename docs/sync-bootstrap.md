@@ -47,6 +47,9 @@ VAULT_SYNC_BIND=127.0.0.1:8300 VAULT_SYNC_DB=/var/lib/vault-sync/vault-sync.db \
 
 Run it as an unprivileged user, restart-on-failure, with the env file loaded and the DB
 directory writable by that user. `GET /healthz` is a liveness probe (returns `ok`).
+Prometheus metrics are on a **separate loopback listener** (`VAULT_SYNC_METRICS_BIND`, default
+`127.0.0.1:8301`) — `GET /metrics`. Keep it loopback/WG-only (it exposes op/device counts, the
+metadata at-rest encryption protects); never route it through the public TLS proxy.
 
 ## Endpoints (all under `/v1/sync/{vault_id}`)
 
