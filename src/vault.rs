@@ -99,15 +99,30 @@ impl Vault {
         let salt = meta.salt()?;
         let key = derive_key(passphrase, &salt, meta.kdf_params)?;
 
-        let conn = open_keyed(&vault_path, &key)?;
-        verify_key(&conn)?;
-
-        Ok(Self {
-            conn,
-            key,
-            vault_path,
-            meta_path,
-        })
+        // A wrong key surfaces as `WrongPassphrase` from EITHER `open_keyed` (a PRAGMA fails to
+        // read the header) or `verify_key` — catch both, so an interrupted-rotation recovery still
+        // runs rather than the `?` propagating early.
+        match open_and_verify(&vault_path, &key) {
+            Ok(conn) => {
+                // The committed sidecar opened the DB, so any staged sidecar is a stale pre-rekey
+                // orphan (a rotation that crashed *before* rekey) — clean it up, best-effort.
+                let _ = std::fs::remove_file(rekey_staging_path(&meta_path));
+                Ok(Self {
+                    conn,
+                    key,
+                    vault_path,
+                    meta_path,
+                })
+            }
+            // The committed sidecar's salt didn't derive a working key: either a genuine wrong
+            // passphrase, or a `rotate_key` interrupted after `rekey` but before the sidecar commit
+            // — try the staged sidecar (whose salt matches the rekeyed DB).
+            Err(Error::WrongPassphrase) => {
+                recover_interrupted_rekey(&vault_path, &meta_path, passphrase)?
+                    .ok_or(Error::WrongPassphrase)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Open an existing vault at `path` with a raw 32-byte key.
@@ -164,6 +179,18 @@ impl Vault {
         SecretBox::new(Box::new(self.key.expose_secret().clone()))
     }
 
+    /// The two on-disk files that make up this vault: the SQLCipher database and its
+    /// `<path>.meta.json` sidecar.
+    ///
+    /// **They are a single atomic unit — back them up and sync them together.** The sidecar holds
+    /// the salt + KDF params needed to derive the key; copying the database without the matching
+    /// sidecar (or snapshotting the pair mid-[`rotate_key`](Self::rotate_key)) loses the salt and
+    /// renders the vault unrecoverable. A backup/sync layer MUST treat `(db, meta)` as one item.
+    #[must_use]
+    pub fn files(&self) -> (&Path, &Path) {
+        (&self.vault_path, &self.meta_path)
+    }
+
     /// Re-key the vault: change the passphrase in place.
     ///
     /// Verifies `old_passphrase` against the current key, runs SQLCipher
@@ -191,12 +218,19 @@ impl Vault {
         let new_salt = random_salt();
         let new_key = derive_key(new_passphrase, &new_salt, meta.kdf_params)?;
 
+        // Crash-safe rotation. `PRAGMA rekey` re-encrypts the DB in place under the new key, so
+        // the sidecar must follow it; a crash between the two would otherwise brick the vault
+        // (the committed sidecar's salt no longer matches the DB key). Stage the new sidecar
+        // BEFORE rekey, rekey, then atomically commit it. If we crash after rekey but before the
+        // commit, the staged sidecar (whose salt matches the rekeyed DB) survives and `open`
+        // finalizes it — see `recover_interrupted_rekey`.
+        let staged = rekey_staging_path(&self.meta_path);
+        VaultMeta::new(&new_salt, meta.kdf_params).write(&staged)?;
         let literal = new_key.expose_secret().pragma_literal();
         self.conn
-            .pragma_update(None, "rekey", literal)
+            .pragma_update(None, "rekey", literal.as_str())
             .map_err(map_cipher_err)?;
-
-        VaultMeta::new(&new_salt, meta.kdf_params).write(&self.meta_path)?;
+        std::fs::rename(&staged, &self.meta_path)?;
         self.key = new_key;
         Ok(())
     }
@@ -287,7 +321,7 @@ fn open_keyed(path: &Path, key: &SecretBox<DerivedKey>) -> Result<Connection> {
     }
     let literal = key.expose_secret().pragma_literal();
     // `key` accepts the `x'<hex>'` blob literal -> raw key, no inner KDF.
-    conn.pragma_update(None, "key", literal)
+    conn.pragma_update(None, "key", literal.as_str())
         .map_err(map_cipher_err)?;
 
     // Reasonable SQLCipher / SQLite hardening. Keep cipher defaults
@@ -302,6 +336,50 @@ fn open_keyed(path: &Path, key: &SecretBox<DerivedKey>) -> Result<Connection> {
         .map_err(map_cipher_err)?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(map_cipher_err)?;
+    Ok(conn)
+}
+
+/// Where a `rotate_key` stages the new sidecar before committing it: `<meta>.rekeying`.
+fn rekey_staging_path(meta_path: &Path) -> PathBuf {
+    let mut s = meta_path.as_os_str().to_owned();
+    s.push(".rekeying");
+    PathBuf::from(s)
+}
+
+/// Recover a `rotate_key` interrupted after `PRAGMA rekey` but before the sidecar commit: the DB
+/// is keyed with the *staged* sidecar's salt. If a staged sidecar exists and opens the DB with
+/// `passphrase`, finalize it (rename into place) and return the open vault; otherwise `None` (a
+/// genuine wrong passphrase). The staged sidecar is validated by `VaultMeta::read` like any other.
+fn recover_interrupted_rekey(
+    vault_path: &Path,
+    meta_path: &Path,
+    passphrase: &str,
+) -> Result<Option<Vault>> {
+    let staged = rekey_staging_path(meta_path);
+    if !staged.exists() {
+        return Ok(None);
+    }
+    let meta = VaultMeta::read(&staged)?;
+    let salt = meta.salt()?;
+    let key = derive_key(passphrase, &salt, meta.kdf_params)?;
+    let Ok(conn) = open_and_verify(vault_path, &key) else {
+        return Ok(None); // staged sidecar doesn't open it either → genuine wrong passphrase
+    };
+    // The staged sidecar opens the rekeyed DB: commit it as the canonical sidecar.
+    std::fs::rename(&staged, meta_path)?;
+    Ok(Some(Vault {
+        conn,
+        key,
+        vault_path: vault_path.to_path_buf(),
+        meta_path: meta_path.to_path_buf(),
+    }))
+}
+
+/// Open the keyed connection and confirm the key with a cheap read. A wrong key reports
+/// `WrongPassphrase` from either step.
+fn open_and_verify(path: &Path, key: &SecretBox<DerivedKey>) -> Result<Connection> {
+    let conn = open_keyed(path, key)?;
+    verify_key(&conn)?;
     Ok(conn)
 }
 
@@ -443,6 +521,60 @@ mod tests {
         assert!(matches!(
             v.rotate_key("bogus", "new").unwrap_err(),
             Error::WrongPassphrase
+        ));
+    }
+
+    #[test]
+    fn open_recovers_from_interrupted_rotate_no_brick() {
+        use secrecy::ExposeSecret as _;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        {
+            let v = Vault::create(&path, "old", p()).unwrap();
+            v.with_connection(|c| c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (42);"))
+                .unwrap();
+            v.lock();
+        }
+        // Simulate rotate_key crashing AFTER `PRAGMA rekey` but BEFORE committing the staged
+        // sidecar: rekey the DB to a fresh salt + write the staged sidecar, then drop without the
+        // rename (the "crash").
+        let meta_path = meta_path_for(&path);
+        let new_salt = random_salt();
+        {
+            let v = Vault::open(&path, "old").unwrap();
+            let new_key = derive_key("newpw", &new_salt, p()).unwrap();
+            VaultMeta::new(&new_salt, p())
+                .write(&rekey_staging_path(&meta_path))
+                .unwrap();
+            v.conn
+                .pragma_update(
+                    None,
+                    "rekey",
+                    new_key.expose_secret().pragma_literal().as_str(),
+                )
+                .unwrap();
+            // Simulate a crash: leak the connection so it is NEVER closed — the rekeyed pages stay
+            // in the `-wal` on disk (a clean drop would instead checkpoint-and-discard or lose
+            // them), exactly as if the process had died right after `rekey`. Recovery's fresh
+            // connection then replays the WAL.
+            #[allow(clippy::mem_forget)]
+            std::mem::forget(v);
+        }
+        // The committed sidecar (old salt) no longer opens the rekeyed DB; opening with the NEW
+        // passphrase must recover via the staged sidecar and preserve the data — no brick.
+        let v = Vault::open(&path, "newpw").unwrap();
+        let x: i64 = v
+            .with_connection(|c| c.query_row("SELECT x FROM t", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(x, 42);
+        v.lock();
+        // Recovery finalized the staged sidecar: it's gone, the new passphrase opens normally, and
+        // the old passphrase no longer works.
+        assert!(!rekey_staging_path(&meta_path).exists());
+        assert!(Vault::open(&path, "newpw").is_ok());
+        assert!(matches!(
+            Vault::open(&path, "old"),
+            Err(Error::WrongPassphrase)
         ));
     }
 

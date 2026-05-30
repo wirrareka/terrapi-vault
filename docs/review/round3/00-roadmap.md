@@ -37,18 +37,25 @@ _Verified: root lib 42 tests (35+5+2, 3 new), clippy -D warnings + fmt clean; se
 (39+23+21) — the encryption assertion + validations are transparent to the broker/sync vault usage.
 `spec/vault-format.md` documents the new limits._
 
-## R3-P1 — Robustness / correctness
-- **R3-5. `rotate_key` crash-atomicity** (convergent MED): stage the new sidecar before/around
-  `PRAGMA rekey` (rename immediately after) so a crash between rekey and the sidecar write can't
-  brick the vault; document + recommend snapshotting `derived_key()`.
-- **R3-6. `import_note` future-version → `UnsupportedFormat`** not `MetaInvalid` (arch HIGH-1) so
-  memento can distinguish "newer app, upgrade" from "corrupt file."
-- **R3-7. Explicit `OsRng` for salt/nonce + zeroize the transient `pragma_literal` key string**
-  (S3-M2/L1): pin the CSPRNG guarantee in the type; don't leave key-hex in freed heap.
-- **R3-8. `Vault::files()` helper + put the DB+sidecar atomic-unit invariant on the type** (arch
-  MED-6): the biggest *operational* risk is data-loss — a backup/sync that copies the DB but not
-  the `.meta.json` (or snapshots mid-rotation) silently bricks the vault. Make the invariant
-  impossible to miss for a sync author (it currently lives only in module prose).
+## R3-P1 — Robustness / correctness — ✅ DONE 2026-05-31
+- **R3-5. ✅ `rotate_key` crash-safe + recoverable**: the new sidecar is staged at `<meta>.rekeying`
+  BEFORE `PRAGMA rekey`, then atomically renamed after. If a crash lands between rekey and the
+  rename, `open` detects the staged sidecar (whose salt matches the rekeyed DB) and finalizes it —
+  the vault is never bricked. A successful normal open cleans a stale pre-rekey staging file. Also
+  fixed a latent bug surfaced here: `open` now catches `WrongPassphrase` from `open_keyed` (not
+  only `verify_key`), so recovery actually runs. `vault.rs` (+ test
+  `open_recovers_from_interrupted_rotate_no_brick`).
+- **R3-6. ✅** a *newer* `.memento-note` container version is now `Error::UnsupportedFormat`
+  (upgrade) vs. `MetaInvalid` (corrupt). `note_export.rs` (+ updated test).
+- **R3-7. ✅** `random_salt` uses explicit `OsRng`; `pragma_literal` returns a `Zeroizing<String>`
+  so the key-hex is scrubbed from the heap. `kdf.rs`, `vault.rs`. _(The tempdir nonce stays
+  `thread_rng` — it is uniqueness-only, not security material.)_
+- **R3-8. ✅ `Vault::files()`** returns `(db, meta)` with the atomic-unit invariant documented on
+  the type — a backup/sync author can no longer miss that the sidecar must travel with the DB.
+  `vault.rs`.
+
+_Verified: root lib 43 tests (incl. the crash-recovery sim), clippy -D warnings + fmt clean;
+services still green (39+23+21) — all changes transparent downstream._
 
 ## R3-P2 — Polish + tests
 - **R3-9.** Fix the MSRV mismatch: `Cargo.toml rust-version = 1.79` vs the toolchain/README `1.83`

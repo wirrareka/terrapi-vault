@@ -234,9 +234,17 @@ fn read_container(path: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
         return Err(Error::MetaInvalid("not a .memento-note file".into()));
     }
     let container_ver = header[8];
+    // A *newer* container is a typed `UnsupportedFormat` (the app should offer to upgrade), not a
+    // generic `MetaInvalid` — so a caller can tell "written by a newer build" from "corrupt file."
+    if container_ver > CONTAINER_VERSION {
+        return Err(Error::UnsupportedFormat {
+            found: u32::from(container_ver),
+            supported: u32::from(CONTAINER_VERSION),
+        });
+    }
     if container_ver != CONTAINER_VERSION {
         return Err(Error::MetaInvalid(format!(
-            "unsupported .memento-note container version {container_ver}"
+            "unknown .memento-note container version {container_ver}"
         )));
     }
     let meta_len = u32::from_le_bytes([header[9], header[10], header[11], header[12]]) as usize;
@@ -505,9 +513,19 @@ mod tests {
         let d = tmp();
         let f = d.path().join("n.memento-note");
         export_note(&f, "pw", &sample(), p()).unwrap();
-        let mut bytes = std::fs::read(&f).unwrap();
-        bytes[8] = 99; // bogus container version
-        std::fs::write(&f, &bytes).unwrap();
+        let bytes = std::fs::read(&f).unwrap();
+        // A *newer* container version is a typed UnsupportedFormat (app should offer to upgrade).
+        let mut future = bytes.clone();
+        future[8] = 99;
+        std::fs::write(&f, &future).unwrap();
+        assert!(matches!(
+            import_note(&f, "pw").unwrap_err(),
+            Error::UnsupportedFormat { .. }
+        ));
+        // An unknown *non-future* version (0) is a corrupt-file MetaInvalid.
+        let mut bogus = bytes;
+        bogus[8] = 0;
+        std::fs::write(&f, &bogus).unwrap();
         assert!(matches!(
             import_note(&f, "pw").unwrap_err(),
             Error::MetaInvalid(_)

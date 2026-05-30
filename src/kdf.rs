@@ -99,10 +99,14 @@ impl KdfParams {
 }
 
 /// Generate a fresh cryptographically-random 16-byte salt.
+///
+/// Uses `OsRng` explicitly — the salt is a vault's sole per-vault uniqueness source, so the
+/// CSPRNG guarantee is pinned in the type rather than relying on `thread_rng`'s (currently
+/// CSPRNG, but implicit) default.
 #[must_use]
 pub fn random_salt() -> [u8; SALT_LEN] {
     let mut buf = [0u8; SALT_LEN];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rngs::OsRng.fill_bytes(&mut buf);
     buf
 }
 
@@ -144,9 +148,10 @@ impl DerivedKey {
     ///
     /// This is the form passed to `PRAGMA key` / `PRAGMA rekey` so the raw
     /// 32 bytes are used directly as the cipher key (no extra KDF inside
-    /// SQLCipher). The returned `String` is short-lived and overwritten by
-    /// the caller, but treat it as sensitive.
-    pub(crate) fn pragma_literal(&self) -> String {
+    /// SQLCipher). Returned in a [`Zeroizing`](zeroize::Zeroizing) wrapper so the
+    /// key-derived hex is scrubbed from the heap when the caller drops it, rather
+    /// than lingering in freed memory.
+    pub(crate) fn pragma_literal(&self) -> zeroize::Zeroizing<String> {
         let mut hex = String::with_capacity(2 + KEY_LEN * 2 + 1);
         hex.push_str("x'");
         for b in self.0 {
@@ -154,7 +159,7 @@ impl DerivedKey {
             let _ = write!(hex, "{b:02x}");
         }
         hex.push('\'');
-        hex
+        zeroize::Zeroizing::new(hex)
     }
 }
 
