@@ -48,12 +48,24 @@ _Verified: clippy -D warnings + fmt clean; broker 38 tests, sync 23 (4 new)._
 
 _Verified: full tree green — root lib 32 tests, services 83 (broker 39, sync 23, transport 21); clippy -D warnings + fmt clean._
 
-## R2-P2 — DX + dedup + polish
-- **R2-8. Hoist shared Metrics + hardening middleware into `vault-transport`** behind an optional `axum` feature (arch High): kills the two ~90%-identical `Metrics` structs + twin `concurrency_limit`/`timeout`/`record_metrics`/`reject` + copied `is_uuid_v4_lower`/`now_unix`. Keeps the default build axum-free.
-- **R2-9. Broker authz DX** (api H1/H2): a distinct `unregistered_principal` code (vs capability `forbidden`) so a client can tell "register my SAN" from "grant my role a cap"; add `x-required-capability` per broker route + a capability→route table in the spec.
-- **R2-10. Cross-service DX polish** (api Med): `X-Request-Id` on both; `/healthz` → JSON `{status,version}`; document `Retry-After` for 429/503/408; converge `Error`/`ErrorBody` schema names; document the `/metrics` series for operators.
-- **R2-11. Split the two `http.rs` god-modules** (arch Med): extract extractors/auth-glue/`store_op` from the ~1.1k-line files.
-- **R2-12. Lows**: key-file perm check (both services, `& 0o077`); KMS AEAD AAD = target tuple; replay-guard per-vault cap + nonce length cap; fix stale KMS doc comments (`kms.rs:5/180/204`); pre-shape `CredError` variants for the real OpenSearch adapter.
+## R2-P2 — DX + dedup + polish — (R2-8/9/10/12 ✅ DONE 2026-05-30; R2-11 deliberately skipped)
+- **R2-8. ✅ Metrics format deduped**: extracted the shared HTTP-metric core (`requests`/`latency`/
+  `inflight` + the `*_http_*` Prometheus render) into a **std-only** `vault_transport::http::HttpMetrics`
+  (no axum → firewall intact); broker + vault-sync `Metrics` now embed it and add only their domain
+  series (`vault_sealed`/`audit_events` vs `ops_*`/`tail_subscribers`). The format is defined once.
+  _Note:_ the hardening **middleware** (concurrency/timeout/record_metrics/request_id/reject) stays
+  per-service — deduping it needs a state-access trait whose abstraction cost outweighs ~80 shared
+  lines; the High concern (the exposition-format contract) is what's resolved.
+- **R2-9. ✅** distinct `unregistered_principal` (403) vs `missing_identity` (401) vs `forbidden`
+  codes (typed envelope on the mTLS extractor) + a capability→route table in the broker spec.
+- **R2-10. ✅** `X-Request-Id` echo/generate on both; `/healthz` → JSON `{status,version}`;
+  `Retry-After` on 408/429/503; spec + bootstrap documented.
+- **R2-11. ⏭️ Skipped (deliberate)**: splitting the ~1.1k-line `http.rs` modules is churn for marginal
+  benefit (the modules are cohesive; agents rated it "tidy-up, not rescue"). Revisit if a file grows
+  materially or a sub-area gains reuse value.
+- **R2-12. ✅ Lows**: KMS AEAD now binds the target tuple as AAD; key-file perms warned (both); nonce
+  length cap (`bad_nonce`); stale KMS doc comments fixed. _(Replay per-vault cap + `CredError`
+  pre-shaping left as low-value/speculative; single-person scope and no real adapter yet.)_
 
 ## Suggested order
 R2-1 → R2-2 → R2-3 (P0 security, small + high-value) → R2-4/R2-5 (audit durability) →

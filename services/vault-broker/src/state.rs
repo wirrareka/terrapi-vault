@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use terrapi_vault::Vault;
 use vault_transport::audit::{AuditEvent, AuditSink};
+use vault_transport::http::HttpMetrics;
 use vault_transport::lease::LeaseEngine;
 
 /// Default TTL for a leased service-admin cred when the request omits `ttl_secs`.
@@ -20,28 +21,14 @@ pub struct Unsealed {
     pub ssh_ca: SshCa,
 }
 
-/// A served HTTP request, summarised for the `vault_http_*` series. `route` is the matched
-/// path *template* (e.g. `/v1/{group}/{tenant_id}/creds/{role}`), never the concrete path —
-/// so tenant ids never reach the metrics surface and label cardinality stays bounded.
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct ReqKey {
-    route: String,
-    method: String,
-    status: u16,
-}
-
 /// Minimal in-process metrics, exposed as Prometheus text on the loopback `8201` listener.
-/// Per-action audit-event counters are bumped at the single `AppState::emit` site, so every
-/// broker action (`ssh.sign`, `creds.issue`, `lease.expire`, …) is counted for free.
+/// The `vault_http_*` request series + their format come from the shared [`HttpMetrics`]; the
+/// broker adds `vault_sealed` and per-action `vault_audit_events_total` (bumped at the single
+/// `AppState::emit` site, so every broker action — `ssh.sign`, `creds.issue`, … — is counted).
 #[derive(Default)]
 pub struct Metrics {
+    http: HttpMetrics,
     events: Mutex<HashMap<String, u64>>,
-    /// `vault_http_requests_total{route,method,status}`.
-    requests: Mutex<HashMap<ReqKey, u64>>,
-    /// Per-route latency: `route -> (count, sum_millis)` → `_count` + `_sum` series.
-    latency: Mutex<HashMap<String, (u64, u64)>>,
-    /// `vault_http_inflight` — requests currently being served (concurrency middleware).
-    inflight: std::sync::atomic::AtomicI64,
 }
 
 impl Metrics {
@@ -54,30 +41,15 @@ impl Metrics {
             .or_insert(0) += 1;
     }
 
-    /// Record one served request: bump the per-`{route,method,status}` counter and add its
-    /// latency to the per-route sum/count.
+    /// Record one served request (delegates to the shared http core; `route` is the matched
+    /// template, never the concrete tenant-bearing path).
     pub fn record_request(&self, route: &str, method: &str, status: u16, dur: std::time::Duration) {
-        *self
-            .requests
-            .lock()
-            .expect("metrics lock")
-            .entry(ReqKey {
-                route: route.to_owned(),
-                method: method.to_owned(),
-                status,
-            })
-            .or_insert(0) += 1;
-        let ms = u64::try_from(dur.as_millis()).unwrap_or(u64::MAX);
-        let mut lat = self.latency.lock().expect("metrics lock");
-        let e = lat.entry(route.to_owned()).or_insert((0, 0));
-        e.0 += 1;
-        e.1 = e.1.saturating_add(ms);
+        self.http.record_request(route, method, status, dur);
     }
 
     /// Adjust the in-flight gauge (`+1` on entry, `-1` on exit).
     pub fn inflight_add(&self, delta: i64) {
-        self.inflight
-            .fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+        self.http.inflight_add(delta);
     }
 
     /// Render the Prometheus text exposition for `/metrics`. `sealed` is the live gauge.
@@ -96,51 +68,7 @@ impl Metrics {
         for (action, n) in actions {
             let _ = writeln!(out, "vault_audit_events_total{{action=\"{action}\"}} {n}");
         }
-
-        out.push_str("# HELP vault_http_inflight Requests currently being served.\n");
-        out.push_str("# TYPE vault_http_inflight gauge\n");
-        let _ = writeln!(
-            out,
-            "vault_http_inflight {}",
-            self.inflight
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .max(0)
-        );
-
-        out.push_str(
-            "# HELP vault_http_requests_total Served HTTP requests, by route/method/status.\n",
-        );
-        out.push_str("# TYPE vault_http_requests_total counter\n");
-        let reqs = self.requests.lock().expect("metrics lock");
-        let mut rows: Vec<_> = reqs.iter().collect();
-        rows.sort_by(|a, b| {
-            (&a.0.route, &a.0.method, a.0.status).cmp(&(&b.0.route, &b.0.method, b.0.status))
-        });
-        for (k, n) in rows {
-            let _ = writeln!(
-                out,
-                "vault_http_requests_total{{route=\"{}\",method=\"{}\",status=\"{}\"}} {n}",
-                k.route, k.method, k.status
-            );
-        }
-
-        out.push_str(
-            "# HELP vault_http_request_duration_ms Per-route request latency (sum/count).\n",
-        );
-        out.push_str("# TYPE vault_http_request_duration_ms summary\n");
-        let lat = self.latency.lock().expect("metrics lock");
-        let mut lrows: Vec<_> = lat.iter().collect();
-        lrows.sort_by(|a, b| a.0.cmp(b.0));
-        for (route, (count, sum)) in lrows {
-            let _ = writeln!(
-                out,
-                "vault_http_request_duration_ms_count{{route=\"{route}\"}} {count}"
-            );
-            let _ = writeln!(
-                out,
-                "vault_http_request_duration_ms_sum{{route=\"{route}\"}} {sum}"
-            );
-        }
+        out.push_str(&self.http.render("vault"));
         out
     }
 }
