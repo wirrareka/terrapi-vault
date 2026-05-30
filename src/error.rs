@@ -57,4 +57,9 @@ pub enum Error {
     /// An underlying SQLite/SQLCipher error that is not a key failure.
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
+
+    /// The linked SQLite is not SQLCipher (or its cipher is unavailable), so the database would
+    /// be stored **in the clear**. The vault fails closed rather than write plaintext at rest.
+    #[error("at-rest encryption unavailable: the linked SQLite is not SQLCipher")]
+    EncryptionUnavailable,
 }

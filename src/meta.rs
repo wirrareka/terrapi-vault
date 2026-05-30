@@ -20,7 +20,12 @@ pub const FORMAT_VERSION: u32 = 1;
 pub const META_SUFFIX: &str = ".meta.json";
 
 /// Parsed contents of `<vault>.meta.json`.
+///
+/// `deny_unknown_fields`: this is a security sidecar, so an unrecognised field must be a hard
+/// error — never silently dropped. Otherwise an old build could accept (and `validate()` would
+/// pass) a sidecar carrying a future field it doesn't understand.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VaultMeta {
     /// Sidecar format version. See [`FORMAT_VERSION`].
     pub version: u32,
@@ -86,6 +91,9 @@ impl VaultMeta {
                 self.kdf
             )));
         }
+        // Bound the Argon2 cost: the sidecar is unauthenticated, so a tampered params value must
+        // not be able to pin an absurd memory cost (multi-TiB allocation) on the next derive.
+        self.kdf_params.validate()?;
         let _ = self.salt()?;
         Ok(())
     }
@@ -197,6 +205,22 @@ mod tests {
     fn meta_path_appends_suffix() {
         let p = meta_path_for(&PathBuf::from("/tmp/notes.memento"));
         assert_eq!(p, PathBuf::from("/tmp/notes.memento.meta.json"));
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_kdf_params() {
+        // A tampered sidecar pinning an absurd Argon2 memory cost must be refused before any
+        // derive attempts a multi-TiB allocation.
+        let mut m = VaultMeta::new(&[0u8; SALT_LEN], KdfParams::default());
+        m.kdf_params.m_cost_kib = u32::MAX;
+        assert!(matches!(m.validate(), Err(Error::MetaInvalid(_))));
+    }
+
+    #[test]
+    fn deserialize_rejects_unknown_field() {
+        // `deny_unknown_fields`: a future/garbage field is a hard error, never silently dropped.
+        let json = r#"{"version":1,"kdf":"argon2id","kdf_params":{"m_cost_kib":65536,"t_cost":2,"p_cost":1},"salt_hex":"00112233445566778899aabbccddeeff","created_at":"x","surprise":true}"#;
+        assert!(serde_json::from_str::<VaultMeta>(json).is_err());
     }
 
     #[test]

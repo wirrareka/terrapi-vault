@@ -36,6 +36,7 @@ pub const SALT_LEN: usize = 16;
 /// first, then `t_cost`, if you need to retarget the duration; never go
 /// below 19 MiB / 2 passes (the RFC 9106 second-recommended floor).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KdfParams {
     /// Memory cost in kibibytes (KiB). 65536 == 64 MiB.
     pub m_cost_kib: u32,
@@ -43,6 +44,33 @@ pub struct KdfParams {
     pub t_cost: u32,
     /// Parallelism: number of lanes. 1 == single-threaded.
     pub p_cost: u32,
+}
+
+/// Upper bounds on the Argon2 cost a vault may carry. A vault's `kdf_params` come from the
+/// **plaintext, unauthenticated** sidecar (and, for an imported note, from the container) — so a
+/// tampered/hostile value could otherwise pin an absurd memory cost and make the next `open`
+/// attempt a multi-TiB allocation (DoS). The algorithm *minimums* are enforced by `Params::new`;
+/// these are the maximums. 4 GiB / 16 passes / 16 lanes is far above any legitimate vault KDF.
+pub const MAX_M_COST_KIB: u32 = 4 * 1024 * 1024;
+pub const MAX_T_COST: u32 = 16;
+pub const MAX_P_COST: u32 = 16;
+
+impl KdfParams {
+    /// Reject parameters outside the sane upper bounds — a DoS guard for params read from an
+    /// untrusted sidecar or import container.
+    ///
+    /// # Errors
+    /// [`Error::MetaInvalid`] if any cost exceeds its ceiling.
+    pub fn validate(&self) -> Result<()> {
+        if self.m_cost_kib > MAX_M_COST_KIB || self.t_cost > MAX_T_COST || self.p_cost > MAX_P_COST
+        {
+            return Err(Error::MetaInvalid(format!(
+                "argon2 params exceed limits (m_cost_kib={} t_cost={} p_cost={})",
+                self.m_cost_kib, self.t_cost, self.p_cost
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Default for KdfParams {

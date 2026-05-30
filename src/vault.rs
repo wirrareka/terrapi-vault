@@ -278,6 +278,13 @@ impl Vault {
 /// before our first `pragma_update`, so issuing `key` immediately is safe.
 fn open_keyed(path: &Path, key: &SecretBox<DerivedKey>) -> Result<Connection> {
     let conn = Connection::open(path)?;
+    // Fail closed if the linked SQLite isn't SQLCipher: otherwise `PRAGMA key` is a silent no-op
+    // and the vault would be written in the clear. `PRAGMA cipher_version` returns the SQLCipher
+    // build string; on plain SQLite the pragma yields no row (the query errors).
+    let cipher = conn.query_row("PRAGMA cipher_version", [], |r| r.get::<_, String>(0));
+    if !matches!(&cipher, Ok(v) if !v.trim().is_empty()) {
+        return Err(Error::EncryptionUnavailable);
+    }
     let literal = key.expose_secret().pragma_literal();
     // `key` accepts the `x'<hex>'` blob literal -> raw key, no inner KDF.
     conn.pragma_update(None, "key", literal)

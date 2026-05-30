@@ -69,6 +69,10 @@ pub const CONTAINER_VERSION: u8 = 1;
 /// Fixed header size: magic (8) + version (1) + meta_len (4) + db_len (8).
 const HEADER_LEN: usize = 8 + 1 + 4 + 8;
 
+/// Upper bound on a declared sidecar length when reading a container — a `VaultMeta` JSON is well
+/// under this, so a larger declared `meta_len` is a hostile/corrupt header (alloc-DoS guard).
+const MAX_META_LEN: usize = 64 * 1024;
+
 /// A note's portable content, decoupled from any application type.
 ///
 /// The vault crate is intentionally domain-free, so this struct mirrors
@@ -243,6 +247,22 @@ fn read_container(path: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
     let db_len = usize::try_from(db_len)
         .map_err(|_| Error::MetaInvalid("declared database length too large".into()))?;
 
+    // A hostile/corrupt header could declare huge lengths; refuse to pre-allocate gigabytes from
+    // attacker-controlled sizes. The sidecar is tiny, and the declared body must fit the file —
+    // so a truncated/lying header fails fast instead of OOMing before `read_exact` validates.
+    if meta_len > MAX_META_LEN {
+        return Err(Error::MetaInvalid(
+            "declared sidecar length implausibly large".into(),
+        ));
+    }
+    let file_len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let body_len = file_len.saturating_sub(HEADER_LEN as u64);
+    if (meta_len as u64).saturating_add(db_len as u64) > body_len {
+        return Err(Error::MetaInvalid(
+            "declared lengths exceed the .memento-note file size".into(),
+        ));
+    }
+
     let mut meta_json = vec![0u8; meta_len];
     f.read_exact(&mut meta_json)
         .map_err(|_| Error::MetaInvalid("truncated .memento-note sidecar".into()))?;
@@ -352,6 +372,21 @@ mod tests {
         export_note(&f, "correct horse", &n, p()).unwrap();
         let back = import_note(&f, "correct horse").unwrap();
         assert_eq!(back, n);
+    }
+
+    #[test]
+    fn import_rejects_oversized_declared_length_no_oom() {
+        // A hostile 21-byte container declaring a ~2 GiB db_len must fail fast (the declared body
+        // exceeds the file), NOT pre-allocate gigabytes before read_exact.
+        let d = tmp();
+        let f = d.path().join("hostile.memento-note");
+        let mut header = Vec::new();
+        header.extend_from_slice(NOTE_MAGIC); // 8
+        header.push(CONTAINER_VERSION); // 1
+        header.extend_from_slice(&0u32.to_le_bytes()); // meta_len = 0
+        header.extend_from_slice(&0x7FFF_FFFFu64.to_le_bytes()); // db_len ≈ 2 GiB, file is 21 bytes
+        std::fs::write(&f, &header).unwrap();
+        assert!(matches!(import_note(&f, "x"), Err(Error::MetaInvalid(_))));
     }
 
     #[test]

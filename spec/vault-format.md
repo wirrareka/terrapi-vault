@@ -70,7 +70,15 @@ These defaults target ~500 ms derivation on an Apple M-series Mac. The
 **actual** parameters used by a given vault are stored in its sidecar
 (`kdf_params`) and MUST be read from there when opening — never assume the
 defaults. A compatible reader must support arbitrary `(m_cost_kib, t_cost,
-p_cost)` triples within Argon2's valid ranges.
+p_cost)` triples within Argon2's valid ranges, but **MUST reject params above
+the sane upper bounds before deriving** — the sidecar is unauthenticated, so an
+unbounded `m_cost_kib` would otherwise let a tampered sidecar pin a multi-TiB
+allocation on open. This reader rejects `m_cost_kib > 4 GiB`, `t_cost > 16`,
+`p_cost > 16` (`Error::MetaInvalid`). The sidecar JSON is parsed with
+**unknown fields rejected** (a security sidecar must never silently drop a
+field it doesn't understand). Opening also **fails closed** (`Error::Encryption
+Unavailable`) if the linked SQLite is not SQLCipher, so a degraded build can
+never store the database in the clear.
 
 The 32-byte Argon2id output is used **directly** as the SQLCipher raw key
 (see §3); SQLCipher's own internal PBKDF2 key-derivation is **bypassed**.
