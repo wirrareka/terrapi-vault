@@ -56,12 +56,17 @@
 mod error;
 mod kdf;
 mod meta;
+/// The `.memento-note` single-note export format. Behind the default-on `note-export` feature so
+/// a neutral consumer (e.g. `probe`) can drop it with `default-features = false`; memento, which
+/// uses it, gets it by default.
+#[cfg(feature = "note-export")]
 mod note_export;
 mod vault;
 
 pub use error::{Error, Result};
 pub use kdf::{derive_key, random_salt, DerivedKey, KdfParams, KEY_LEN, SALT_LEN};
 pub use meta::{meta_path_for, VaultMeta, FORMAT_VERSION, META_SUFFIX};
+#[cfg(feature = "note-export")]
 pub use note_export::{export_note, import_note, ExportedNote, CONTAINER_VERSION, NOTE_MAGIC};
 pub use vault::Vault;
 

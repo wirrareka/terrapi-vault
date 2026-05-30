@@ -2,7 +2,9 @@
 name = "terrapi-vault"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.79"
+# The deliberate MSRV floor (matches rust-toolchain.toml + the services workspace); the lib is
+# only tested on 1.83, so this is the verified minimum — do not claim a lower, untested version.
+rust-version = "1.83"
 description = "Terrapi shared encrypted-at-rest SQLCipher vault: Argon2id KDF, key rotation, documented on-disk format. Adopted by memento (notes) and probe (API client); vault files are binary-compatible across apps."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/terrapi/terrapi-vault"
@@ -21,6 +23,12 @@ secrecy = "0.10.3"
 thiserror = "1.0.69"
 serde = { version = "1.0.215", features = ["derive"] }
 serde_json = "1.0.133"
+
+[features]
+# `note-export` (the `.memento-note` single-note container) is on by default so memento is
+# unaffected; a neutral consumer (e.g. probe) can drop it with `default-features = false`.
+default = ["note-export"]
+note-export = []
 
 [dev-dependencies]
 tempfile = "3.14.0"

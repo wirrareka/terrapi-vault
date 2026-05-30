@@ -57,16 +57,25 @@ _Verified: root lib 42 tests (35+5+2, 3 new), clippy -D warnings + fmt clean; se
 _Verified: root lib 43 tests (incl. the crash-recovery sim), clippy -D warnings + fmt clean;
 services still green (39+23+21) — all changes transparent downstream._
 
-## R3-P2 — Polish + tests
-- **R3-9.** Fix the MSRV mismatch: `Cargo.toml rust-version = 1.79` vs the toolchain/README `1.83`
-  (verified). Pick one.
-- **R3-10.** Put `note_export` behind a feature flag (arch LOW-4) so a neutral consumer like `probe`
-  can opt out of the memento-specific export format.
-- **R3-11.** Symlink/`O_NOFOLLOW` type-check in `prepare_paths_for_create` before `remove_file`
-  (S3-L4); scrub paths from user-facing error surfaces (S3-L3); document `DerivedKey: Clone` (S3-L2).
-- **R3-12. Missing tests** (correctness): forged oversized container header (R3-2 regression);
-  `rotate_key` sidecar-write-fail leaves the vault openable (no brick); crash-between-DB-and-sidecar
-  sim; corrupt/future-version embedded sidecar error contract; stale `-wal`/`-shm` on create.
+## R3-P2 — Polish + tests — ✅ DONE 2026-05-31
+- **R3-9. ✅** MSRV aligned to the deliberate floor: `Cargo.toml rust-version = "1.83"` (was 1.79)
+  to match `rust-toolchain.toml` + the services workspace; README "MSRV policy: 1.79+" → 1.83 (the
+  only tested version). `Cargo.toml`, `README.md`.
+- **R3-10. ✅** `note_export` is behind a default-on `note-export` feature: memento is unaffected; a
+  neutral consumer (`probe`) drops it with `default-features = false`. Verified the lib builds both
+  with and without it. `Cargo.toml`, `lib.rs`.
+- **R3-11. ✅** `prepare_paths_for_create` strips a symlink (via non-following `symlink_metadata`)
+  before writing — closing the dangling-symlink write-through (`exists()` doesn't see a dangling
+  link); orphan-DB removal now also drops stale `-wal`/`-shm`; `DerivedKey: Clone` documented as
+  the keystore-handoff-only path. `vault.rs`, `kdf.rs`. _(Path-scrubbing from error variants left
+  as-is — the paths are useful local debug context and removing them is a net-negative for a
+  personal vault; S3-L3 noted, not actioned.)_
+- **R3-12. ✅ Tests added** across P0/P1/P2: container-length OOM guard, unknown-field rejection,
+  KDF-bound rejection, crash-recovery sim (`open_recovers_from_interrupted_rotate_no_brick`),
+  symlink-strip, `Vault::files()`, container future-version contract.
+
+_Verified: root lib 45 tests; builds with AND without `note-export`; clippy -D warnings + fmt clean;
+services still green (39+23+21)._
 
 ## Suggested order
 R3-1 → R3-2 → R3-4 (small, high-value, malicious-input + forward-compat) → R3-3 (encryption

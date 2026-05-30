@@ -116,6 +116,11 @@ pub fn random_salt() -> [u8; SALT_LEN] {
 /// scrubbed from memory when the [`Vault`](crate::Vault) is locked or
 /// dropped, and cannot be accidentally logged (`SecretBox` has no `Debug`
 /// that prints the contents).
+///
+/// `Clone` is intentional but exists only for the keystore-handoff path
+/// ([`Vault::derived_key`](crate::Vault::derived_key) → [`Vault::open_with_key`](crate::Vault::open_with_key)):
+/// each clone is itself a zeroizing `DerivedKey`, but every clone is one more live copy of the
+/// key, so do not clone casually — keep the number of copies minimal.
 #[derive(Clone, Zeroize)]
 #[zeroize(drop)]
 pub struct DerivedKey(pub(crate) [u8; KEY_LEN]);

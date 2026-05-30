@@ -437,6 +437,17 @@ fn init_schema(conn: &Connection) -> Result<()> {
 ///   without it, or a sidecar without a DB, is unrecoverable anyway)
 /// - neither     -> clean slate
 fn prepare_paths_for_create(vault_path: &Path, meta_path: &Path) -> Result<()> {
+    // A symlink at either path is never a valid vault file. Strip it first (with the
+    // non-following `symlink_metadata`) so `create` writes a fresh *regular* file rather than
+    // following the link and writing through it — a **dangling** symlink is invisible to
+    // `exists()` below, so without this an attacker-planted link could redirect the new DB.
+    for p in [vault_path, meta_path] {
+        if let Ok(md) = std::fs::symlink_metadata(p) {
+            if md.file_type().is_symlink() {
+                std::fs::remove_file(p)?;
+            }
+        }
+    }
     let v = vault_path.exists();
     let m = meta_path.exists();
     match (v, m) {
@@ -444,6 +455,13 @@ fn prepare_paths_for_create(vault_path: &Path, meta_path: &Path) -> Result<()> {
         (true, false) | (false, true) => {
             if v {
                 std::fs::remove_file(vault_path)?;
+                // Drop the orphan DB's WAL/SHM sidecars too, so the fresh DB doesn't inherit a
+                // stale write-ahead log (which SQLite would try to replay into the new file).
+                for ext in ["-wal", "-shm"] {
+                    let mut p = vault_path.as_os_str().to_owned();
+                    p.push(ext);
+                    let _ = std::fs::remove_file(PathBuf::from(p));
+                }
             }
             if m {
                 std::fs::remove_file(meta_path)?;
@@ -599,6 +617,39 @@ mod tests {
             Vault::create(&path, "pw", p()).unwrap_err(),
             Error::AlreadyExists(_)
         ));
+    }
+
+    #[test]
+    fn files_returns_db_and_meta_paths() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        let v = Vault::create(&path, "pw", p()).unwrap();
+        let (db, meta) = v.files();
+        assert_eq!(db, path.as_path());
+        assert_eq!(meta, meta_path_for(&path).as_path());
+        v.lock();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_strips_a_dangling_symlink_at_the_vault_path() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        let victim = dir.path().join("victim-target"); // does not exist → dangling link
+        symlink(&victim, &path).unwrap();
+        // `create` must strip the link and write a regular file — never follow it and write
+        // through to the (attacker-chosen) target.
+        Vault::create(&path, "pw", p()).unwrap().lock();
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_file());
+        assert!(
+            !victim.exists(),
+            "create must not write through the symlink"
+        );
+        assert!(Vault::open(&path, "pw").is_ok());
     }
 
     #[test]

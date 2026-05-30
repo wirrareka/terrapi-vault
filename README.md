@@ -91,7 +91,9 @@ format so the encryption is independently verifiable.
 
 ## Minimum supported Rust version
 
-Pinned via `rust-toolchain.toml` (1.83.0). MSRV policy: 1.79+.
+**1.83** — the deliberate MSRV floor, pinned via `rust-toolchain.toml` and declared in
+`Cargo.toml` (`rust-version = "1.83"`). The lib is built and tested only on 1.83, so that is the
+verified minimum; do not bump it without reason (memento consumes it as a path dependency).
 
 ## License
 
