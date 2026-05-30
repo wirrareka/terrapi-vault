@@ -17,7 +17,10 @@ const TAIL_CAPACITY: usize = 256;
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<Config>,
-    pub store: Arc<Mutex<Store>>,
+    /// The op store. `Store` manages its own writer/reader connection mutexes internally, so it
+    /// is `Send + Sync` and shared directly (no outer mutex) — handlers drive it via
+    /// `spawn_blocking`, off the async runtime.
+    pub store: Arc<Store>,
     pub replay: Arc<ReplayGuard>,
     /// Token bucket guarding the unauthenticated `enroll-challenge` endpoint.
     pub challenge_rl: Arc<RateBucket>,
@@ -34,7 +37,7 @@ impl AppState {
         let sem = Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrency));
         Self {
             cfg: Arc::new(cfg),
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::new(store),
             replay: Arc::new(ReplayGuard::default()),
             challenge_rl: Arc::new(RateBucket::default()),
             sem,

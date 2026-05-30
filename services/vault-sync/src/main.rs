@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.db_path,
     );
 
-    let store = Store::open(&cfg.db_path)?;
+    let store = Store::open(&cfg.db_path, cfg.readers)?;
     let bind = cfg.bind;
     let state = AppState::new(cfg, store);
 

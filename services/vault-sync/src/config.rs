@@ -15,6 +15,10 @@ pub const DEFAULT_MAX_CONCURRENCY: usize = 64;
 /// Per-request time budget (excess → `408`). The `/tail` WebSocket upgrade returns immediately,
 /// so this does not cap the live socket's lifetime.
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Read-only SQLite connections beside the writer. WAL allows concurrent readers, so
+/// `pull`/`status`/tail-reads fan across these (run in `spawn_blocking`) while writes
+/// serialise on the single writer.
+pub const DEFAULT_READERS: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -24,6 +28,7 @@ pub struct Config {
     pub max_pull: u32,
     pub max_concurrency: usize,
     pub request_timeout: Duration,
+    pub readers: usize,
 }
 
 impl Config {
@@ -57,6 +62,11 @@ impl Config {
                 || Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
                 Duration::from_secs,
             );
+        let readers = std::env::var("VAULT_SYNC_READERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_READERS);
         Self {
             bind,
             db_path,
@@ -64,6 +74,7 @@ impl Config {
             max_pull,
             max_concurrency,
             request_timeout,
+            readers,
         }
     }
 }

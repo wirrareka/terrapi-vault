@@ -42,14 +42,18 @@ Severity uses the worst rating any agent assigned.
 
 _Verification: `cargo build/clippy -D warnings/test/fmt` all clean; 51 tests pass (3 new)._
 
-### P1 — Robustness  (R5/R7/R8 ✅ DONE 2026-05-30; R6/R9 OPEN)
+### P1 — Robustness  (✅ ALL DONE 2026-05-30)
 - **R5. ✅ Internal error strings no longer leak** (C1): broker `internal()`/`backend()` helpers
   log the real rusqlite/backend/IO detail server-side and return a stable code + generic message
   (6 sites: ssh revoked-list, ssh sign, snapshot mkdir/vacuum/read, creds backend, kms store);
   vault-sync `db_err` does the same. `http.rs` (both), `opensearch.rs` untouched here.
-- **R6. ⬜ SQLite off the async runtime**: wrap blocking DB + base64 in `spawn_blocking`; move to
-  a small WAL reader pool so a large `pull` can't starve live-tail. _(perf High)_ — **design choice
-  pending** (single writer + N readers pool vs. `spawn_blocking` over the existing mutex).
+- **R6. ✅ SQLite off the async runtime + WAL reader pool**: `Store` now holds a dedicated writer
+  connection + a pool of `VAULT_SYNC_READERS` (default 4) read-only (`query_only`) connections;
+  writes serialise on the writer, reads (`pull`/`status`/tail fan-out) round-robin across the pool.
+  `AppState.store` is `Arc<Store>` (no outer mutex); every handler drives the store via a
+  `store_op` helper over `spawn_blocking`, so SQLite I/O no longer stalls tokio workers and pooled
+  reads run in parallel. `store.rs`, `state.rs`, `config.rs`, `http.rs`, `main.rs`. New test
+  `file_store_with_reader_pool_reads_after_write`. _(chosen: writer + N-reader pool)_
 - **R7. ✅ Audit shipper bounded**: `read_new_records` reads ≤ `MAX_SHIP_BYTES` (4 MiB) per tick
   and parses only up to the last complete line; `collect_backlog` caps at `MAX_SHIP_ITEMS` (500),
   advancing the cursor partially so a post-outage backlog drains incrementally. `audit_ship.rs`.

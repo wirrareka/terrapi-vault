@@ -9,7 +9,7 @@ use crate::dto::{
     PushRequest, PushResponse, StatusResponse,
 };
 use crate::state::AppState;
-use crate::store::{now_unix, AccountError, PushError};
+use crate::store::{now_unix, AccountError, PushError, Store};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Path, Query, State};
@@ -44,6 +44,28 @@ fn db_err(e: impl std::fmt::Display) -> ErrResp {
         "store_error",
         "internal storage error",
     )
+}
+
+/// Run a blocking store operation off the async runtime. `Store` is `Send + Sync` (each
+/// connection sits behind its own mutex), so it moves into the blocking pool as a cheap `Arc`
+/// clone — keeping SQLite I/O from stalling tokio worker threads and letting pooled reads run
+/// in parallel. A `JoinError` (the blocking task panicked) maps to a generic `500`.
+async fn store_op<T, F>(state: &AppState, f: F) -> Result<T, ErrResp>
+where
+    F: FnOnce(&Store) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let store = state.store.clone();
+    tokio::task::spawn_blocking(move || f(&store))
+        .await
+        .map_err(|e| {
+            eprintln!("vault-sync: blocking store task failed: {e}");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "store_error",
+                "internal storage error",
+            )
+        })
 }
 
 /// Lowercase-UUIDv4 check for `{vault_id}` (no `uuid` crate). Personal vault ids are random
@@ -237,7 +259,7 @@ fn verify_signed(
 }
 
 /// Authenticate a request from an already-enrolled device; returns its `device_id`.
-fn auth_registered(
+async fn auth_registered(
     state: &AppState,
     method: &Method,
     path_and_query: &str,
@@ -247,19 +269,18 @@ fn auth_registered(
 ) -> Result<String, ErrResp> {
     let sh = signed_headers(headers)?;
     check_skew(sh.ts)?;
-    let pubkey = {
-        let store = state.store.lock().expect("store lock");
-        store
-            .device_pubkey(vault_id, &sh.device_id)
-            .map_err(db_err)?
-    }
-    .ok_or_else(|| {
-        err(
-            StatusCode::UNAUTHORIZED,
-            "unknown_device",
-            "device is not enrolled",
-        )
-    })?;
+    let vid = vault_id.to_owned();
+    let did = sh.device_id.clone();
+    let pubkey = store_op(state, move |s| s.device_pubkey(&vid, &did))
+        .await?
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            err(
+                StatusCode::UNAUTHORIZED,
+                "unknown_device",
+                "device is not enrolled",
+            )
+        })?;
     verify_signed(
         state,
         &pubkey,
@@ -293,10 +314,9 @@ async fn enroll_challenge(
             "too many enrolment challenges; slow down",
         ));
     }
-    let rec = {
-        let store = state.store.lock().expect("store lock");
-        store.enroll_record(&vault_id).map_err(db_err)?
-    };
+    let rec = store_op(&state, move |s| s.enroll_record(&vault_id))
+        .await?
+        .map_err(db_err)?;
     let (salt, params, _hash) = rec.ok_or_else(|| {
         err(
             StatusCode::NOT_FOUND,
@@ -359,19 +379,23 @@ async fn create_account(
             "create proof does not match the enrolment verifier",
         ));
     }
-    let created = {
-        let store = state.store.lock().expect("store lock");
-        store
-            .create_account(&vault_id, &req.enroll, &req.device.device_id, &pubkey)
-            .map_err(|e| match e {
-                AccountError::InvalidVerifier => err(
-                    StatusCode::BAD_REQUEST,
-                    "bad_verifier",
-                    "enrolment verifier is malformed (hash must be 32-byte SHA-256)",
-                ),
-                AccountError::Db(d) => db_err(d),
-            })?
-    };
+    let (vid, enroll, did) = (
+        vault_id.clone(),
+        req.enroll.clone(),
+        req.device.device_id.clone(),
+    );
+    let created = store_op(&state, move |s| {
+        s.create_account(&vid, &enroll, &did, &pubkey)
+    })
+    .await?
+    .map_err(|e| match e {
+        AccountError::InvalidVerifier => err(
+            StatusCode::BAD_REQUEST,
+            "bad_verifier",
+            "enrolment verifier is malformed (hash must be 32-byte SHA-256)",
+        ),
+        AccountError::Db(d) => db_err(d),
+    })?;
     if created {
         Ok((StatusCode::CREATED, Json(Ack { ok: true })))
     } else {
@@ -394,10 +418,10 @@ async fn enroll(
     let req: EnrollRequest = serde_json::from_slice(&body)
         .map_err(|e| err(StatusCode::BAD_REQUEST, "bad_body", &e.to_string()))?;
     // Gate on the enrolment proof (server holds only SHA-256 of the secret).
-    let rec = {
-        let store = state.store.lock().expect("store lock");
-        store.enroll_record(&vault_id).map_err(db_err)?
-    };
+    let vid = vault_id.clone();
+    let rec = store_op(&state, move |s| s.enroll_record(&vid))
+        .await?
+        .map_err(db_err)?;
     let (_salt, _params, hash) = rec.ok_or_else(|| {
         err(
             StatusCode::NOT_FOUND,
@@ -426,12 +450,10 @@ async fn enroll(
         &req.device.device_id,
         &req.device.pubkey_b64,
     )?;
-    {
-        let store = state.store.lock().expect("store lock");
-        store
-            .register_device(&vault_id, &req.device.device_id, &pubkey)
-            .map_err(db_err)?;
-    }
+    let (vid2, did) = (vault_id.clone(), req.device.device_id.clone());
+    store_op(&state, move |s| s.register_device(&vid2, &did, &pubkey))
+        .await?
+        .map_err(db_err)?;
     Ok((StatusCode::OK, Json(Ack { ok: true })))
 }
 
@@ -484,7 +506,8 @@ async fn push(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<PushResponse> {
-    let device_id = auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, &body)?;
+    let device_id =
+        auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, &body).await?;
     let req: PushRequest = serde_json::from_slice(&body)
         .map_err(|e| err(StatusCode::BAD_REQUEST, "bad_body", &e.to_string()))?;
     // A device may only author ops under its own id.
@@ -495,32 +518,32 @@ async fn push(
             "every op.device_id must equal the calling device",
         ));
     }
-    let (before, (accepted, duplicates, latest_seq)) = {
-        let store = state.store.lock().expect("store lock");
-        let before = store.latest_seq(&vault_id).map_err(db_err)?;
-        let pushed = store.push_ops(&vault_id, &req.ops).map_err(|e| match e {
-            PushError::InvalidPayload => err(
-                StatusCode::BAD_REQUEST,
-                "bad_payload",
-                "an op payload was not valid base64",
-            ),
-            PushError::Db(d) => db_err(d),
-        })?;
-        (before, pushed)
-    };
+    // One blocking trip: append + read back the newly-stored ops (with their server `seq`) for
+    // the live-tail fan-out, under the single writer so the read can't miss this push.
+    let vid = vault_id.clone();
+    let ops = req.ops;
+    let (accepted, duplicates, latest_seq, new_ops) = store_op(&state, move |s| {
+        let before = s.latest_seq(&vid)?;
+        let (accepted, duplicates, latest_seq) = s.push_ops(&vid, &ops)?;
+        let new_ops = if accepted > 0 {
+            s.pull_ops(&vid, before, u32::try_from(accepted).unwrap_or(u32::MAX))?
+                .0
+        } else {
+            Vec::new()
+        };
+        Ok::<_, PushError>((accepted, duplicates, latest_seq, new_ops))
+    })
+    .await?
+    .map_err(|e| match e {
+        PushError::InvalidPayload => err(
+            StatusCode::BAD_REQUEST,
+            "bad_payload",
+            "an op payload was not valid base64",
+        ),
+        PushError::Db(d) => db_err(d),
+    })?;
     // Fan the newly-stored ops out to live-tail subscribers (best-effort).
     if accepted > 0 {
-        let new_ops = {
-            let store = state.store.lock().expect("store lock");
-            store
-                .pull_ops(
-                    &vault_id,
-                    before,
-                    u32::try_from(accepted).unwrap_or(u32::MAX),
-                )
-                .map_err(db_err)?
-                .0
-        };
         let messages: Vec<String> = new_ops
             .iter()
             .filter_map(|o| serde_json::to_string(o).ok())
@@ -548,17 +571,16 @@ async fn pull(
     Query(q): Query<PullQuery>,
     headers: HeaderMap,
 ) -> ApiResult<PullResponse> {
-    auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"")?;
+    auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"").await?;
     let limit = q
         .limit
         .unwrap_or(state.cfg.max_pull)
         .min(state.cfg.max_pull);
-    let (ops, latest_seq) = {
-        let store = state.store.lock().expect("store lock");
-        store
-            .pull_ops(&vault_id, q.since.unwrap_or(0), limit)
-            .map_err(db_err)?
-    };
+    let since = q.since.unwrap_or(0);
+    let vid = vault_id.clone();
+    let (ops, latest_seq) = store_op(&state, move |s| s.pull_ops(&vid, since, limit))
+        .await?
+        .map_err(db_err)?;
     Ok(Json(PullResponse { ops, latest_seq }))
 }
 
@@ -569,11 +591,11 @@ async fn status(
     VaultId(vault_id): VaultId,
     headers: HeaderMap,
 ) -> ApiResult<StatusResponse> {
-    auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"")?;
-    let (latest_seq, op_count, device_count) = {
-        let store = state.store.lock().expect("store lock");
-        store.status(&vault_id).map_err(db_err)?
-    };
+    auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"").await?;
+    let vid = vault_id.clone();
+    let (latest_seq, op_count, device_count) = store_op(&state, move |s| s.status(&vid))
+        .await?
+        .map_err(db_err)?;
     Ok(Json(StatusResponse {
         latest_seq,
         op_count,
@@ -593,7 +615,9 @@ async fn tail(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if let Err(rejection) = auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"") {
+    if let Err(rejection) =
+        auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"").await
+    {
         return rejection.into_response();
     }
     let rx = state.subscribe(&vault_id);
@@ -654,6 +678,7 @@ mod tests {
             max_pull: 500,
             max_concurrency: 64,
             request_timeout: std::time::Duration::from_secs(30),
+            readers: 0,
         };
         AppState::new(cfg, Store::open_memory().unwrap())
     }

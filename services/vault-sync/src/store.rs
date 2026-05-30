@@ -4,6 +4,8 @@
 
 use crate::dto::{EnrollVerifier, Op, StoredOp};
 use base64::Engine as _;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use terrapi_vault::rusqlite::{self, params, Connection, OptionalExtension};
 use vault_transport::Hlc;
 
@@ -21,35 +23,76 @@ fn b64() -> base64::engine::general_purpose::GeneralPurpose {
 /// hash: `(enroll_salt, params, enroll_hash)`.
 pub type EnrollRecord = (Vec<u8>, terrapi_vault::KdfParams, Vec<u8>);
 
-/// The op store. Wraps one SQLite connection; the caller serialises access (the connection
-/// is `!Sync`, so [`crate::state::AppState`] holds it behind a `Mutex`).
+/// The op store. WAL mode gives one writer + many concurrent readers, so the store keeps a
+/// dedicated writer connection plus a small pool of read-only connections: writes serialise on
+/// the writer; reads (`pull`/`status`/the tail fan-out read) fan across the readers and run in
+/// parallel. Each connection is `Send + !Sync` and sits behind its own `Mutex`, so the whole
+/// `Store` is `Send + Sync` and can be shared as `Arc<Store>` and driven from `spawn_blocking`.
 pub struct Store {
-    conn: Connection,
+    writer: Mutex<Connection>,
+    /// Read-only connections (`PRAGMA query_only`). Empty for the in-memory test store (an
+    /// in-memory DB is per-connection and cannot be shared), where reads fall back to `writer`.
+    readers: Vec<Mutex<Connection>>,
+    /// Round-robin cursor over `readers`.
+    rr: AtomicUsize,
 }
 
 impl Store {
-    /// Open (creating if needed) the SQLite database at `path` and apply the schema.
+    /// Open (creating if needed) the SQLite database at `path` with a pool of `readers`
+    /// read-only connections beside the writer.
     ///
     /// # Errors
     /// Propagates any `rusqlite` open/DDL error.
-    pub fn open(path: &str) -> rusqlite::Result<Self> {
-        let conn = Connection::open(path)?;
-        Self::init(&conn)?;
-        Ok(Self { conn })
+    pub fn open(path: &str, readers: usize) -> rusqlite::Result<Self> {
+        let writer = Connection::open(path)?;
+        Self::init(&writer)?; // sets WAL (persisted) + schema
+        let mut pool = Vec::with_capacity(readers);
+        for _ in 0..readers {
+            let c = Connection::open(path)?;
+            // Inherit WAL from the file; forbid writes on this handle; wait out brief contention.
+            c.execute_batch(
+                "PRAGMA foreign_keys = ON; PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;",
+            )?;
+            pool.push(Mutex::new(c));
+        }
+        Ok(Self {
+            writer: Mutex::new(writer),
+            readers: pool,
+            rr: AtomicUsize::new(0),
+        })
     }
 
-    /// In-memory store for tests.
+    /// In-memory store for tests (single connection; no reader pool — reads use the writer).
     #[cfg(test)]
     pub fn open_memory() -> rusqlite::Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        Self::init(&conn)?;
-        Ok(Self { conn })
+        let writer = Connection::open_in_memory()?;
+        Self::init(&writer)?;
+        Ok(Self {
+            writer: Mutex::new(writer),
+            readers: Vec::new(),
+            rr: AtomicUsize::new(0),
+        })
+    }
+
+    /// Run `f` against a connection for a **read**: a pooled reader (round-robin) if any, else
+    /// the writer (the in-memory test store has no pool).
+    fn with_reader<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        if self.readers.is_empty() {
+            return f(&self.writer.lock().expect("writer lock"));
+        }
+        let idx = self.rr.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        let conn = self.readers[idx].lock().expect("reader lock");
+        f(&conn)
     }
 
     fn init(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;
              CREATE TABLE IF NOT EXISTS accounts (
                  vault_id      TEXT PRIMARY KEY,
                  enroll_salt   BLOB NOT NULL,
@@ -94,7 +137,8 @@ impl Store {
         device_id: &str,
         pubkey: &[u8; 32],
     ) -> Result<bool, AccountError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let conn = self.writer.lock().expect("writer lock");
+        let tx = conn.unchecked_transaction()?;
         if tx
             .prepare("SELECT 1 FROM accounts WHERE vault_id = ?1")?
             .exists([vault_id])?
@@ -132,8 +176,8 @@ impl Store {
     /// The enrolment challenge (salt + params) a new device needs, plus the verifier hash.
     /// `None` if no such account.
     pub fn enroll_record(&self, vault_id: &str) -> rusqlite::Result<Option<EnrollRecord>> {
-        self.conn
-            .query_row(
+        self.with_reader(|c| {
+            c.query_row(
                 "SELECT enroll_salt, enroll_params, enroll_hash FROM accounts WHERE vault_id = ?1",
                 [vault_id],
                 |r| {
@@ -145,6 +189,7 @@ impl Store {
                 },
             )
             .optional()
+        })
     }
 
     /// Register (or replace, for key rotation) a device's public key.
@@ -154,7 +199,8 @@ impl Store {
         device_id: &str,
         pubkey: &[u8; 32],
     ) -> rusqlite::Result<()> {
-        self.conn.execute(
+        let conn = self.writer.lock().expect("writer lock");
+        conn.execute(
             "INSERT OR REPLACE INTO devices (vault_id, device_id, pubkey, enrolled_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![vault_id, device_id, pubkey.as_slice(), now_unix()],
@@ -168,24 +214,26 @@ impl Store {
         vault_id: &str,
         device_id: &str,
     ) -> rusqlite::Result<Option<[u8; 32]>> {
-        let raw: Option<Vec<u8>> = self
-            .conn
-            .query_row(
+        let raw: Option<Vec<u8>> = self.with_reader(|c| {
+            c.query_row(
                 "SELECT pubkey FROM devices WHERE vault_id = ?1 AND device_id = ?2",
                 params![vault_id, device_id],
                 |r| r.get(0),
             )
-            .optional()?;
+            .optional()
+        })?;
         Ok(raw.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()))
     }
 
     /// Highest `seq` stored for `vault_id` (0 if none).
     pub fn latest_seq(&self, vault_id: &str) -> rusqlite::Result<u64> {
-        let seq: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(seq), 0) FROM ops WHERE vault_id = ?1",
-            [vault_id],
-            |r| r.get(0),
-        )?;
+        let seq: i64 = self.with_reader(|c| {
+            c.query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM ops WHERE vault_id = ?1",
+                [vault_id],
+                |r| r.get(0),
+            )
+        })?;
         Ok(u64::try_from(seq).unwrap_or(0))
     }
 
@@ -193,7 +241,8 @@ impl Store {
     /// stored is skipped (counted as a duplicate). Returns `(accepted, duplicates, latest_seq)`.
     /// Malformed base64 in a payload aborts the whole batch with `InvalidPayload`.
     pub fn push_ops(&self, vault_id: &str, ops: &[Op]) -> Result<(u64, u64, u64), PushError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let conn = self.writer.lock().expect("writer lock");
+        let tx = conn.unchecked_transaction()?;
         let mut seq: i64 = tx.query_row(
             "SELECT COALESCE(MAX(seq), 0) FROM ops WHERE vault_id = ?1",
             [vault_id],
@@ -243,50 +292,56 @@ impl Store {
         since: u64,
         limit: u32,
     ) -> rusqlite::Result<(Vec<StoredOp>, u64)> {
-        let mut stmt = self.conn.prepare(
-            "SELECT seq, op_id, device_id, hlc_wall, hlc_counter, collection_id, payload
-               FROM ops
-              WHERE vault_id = ?1 AND seq > ?2
-              ORDER BY seq ASC
-              LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(
-            params![vault_id, i64::try_from(since).unwrap_or(i64::MAX), limit],
-            |r| {
-                let seq: i64 = r.get(0)?;
-                let payload: Vec<u8> = r.get(6)?;
-                Ok(StoredOp {
-                    seq: u64::try_from(seq).unwrap_or(0),
-                    op: Op {
-                        op_id: r.get(1)?,
-                        device_id: r.get(2)?,
-                        hlc: Hlc {
-                            wall_ms: u64::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
-                            counter: u32::try_from(r.get::<_, i64>(4)?.max(0)).unwrap_or(u32::MAX),
+        let ops: Vec<StoredOp> = self.with_reader(|c| {
+            let mut stmt = c.prepare(
+                "SELECT seq, op_id, device_id, hlc_wall, hlc_counter, collection_id, payload
+                   FROM ops
+                  WHERE vault_id = ?1 AND seq > ?2
+                  ORDER BY seq ASC
+                  LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![vault_id, i64::try_from(since).unwrap_or(i64::MAX), limit],
+                |r| {
+                    let seq: i64 = r.get(0)?;
+                    let payload: Vec<u8> = r.get(6)?;
+                    Ok(StoredOp {
+                        seq: u64::try_from(seq).unwrap_or(0),
+                        op: Op {
+                            op_id: r.get(1)?,
+                            device_id: r.get(2)?,
+                            hlc: Hlc {
+                                wall_ms: u64::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
+                                counter: u32::try_from(r.get::<_, i64>(4)?.max(0))
+                                    .unwrap_or(u32::MAX),
+                            },
+                            collection_id: r.get(5)?,
+                            encrypted_payload: b64().encode(payload),
                         },
-                        collection_id: r.get(5)?,
-                        encrypted_payload: b64().encode(payload),
-                    },
-                })
-            },
-        )?;
-        let ops: Vec<StoredOp> = rows.collect::<rusqlite::Result<_>>()?;
+                    })
+                },
+            )?;
+            rows.collect::<rusqlite::Result<_>>()
+        })?;
         let latest = self.latest_seq(vault_id)?;
         Ok((ops, latest))
     }
 
     /// `(latest_seq, op_count, device_count)` for `vault_id`.
     pub fn status(&self, vault_id: &str) -> rusqlite::Result<(u64, u64, u64)> {
-        let op_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM ops WHERE vault_id = ?1",
-            [vault_id],
-            |r| r.get(0),
-        )?;
-        let device_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM devices WHERE vault_id = ?1",
-            [vault_id],
-            |r| r.get(0),
-        )?;
+        let (op_count, device_count): (i64, i64) = self.with_reader(|c| {
+            let op_count = c.query_row(
+                "SELECT COUNT(*) FROM ops WHERE vault_id = ?1",
+                [vault_id],
+                |r| r.get(0),
+            )?;
+            let device_count = c.query_row(
+                "SELECT COUNT(*) FROM devices WHERE vault_id = ?1",
+                [vault_id],
+                |r| r.get(0),
+            )?;
+            Ok((op_count, device_count))
+        })?;
         Ok((
             self.latest_seq(vault_id)?,
             u64::try_from(op_count).unwrap_or(0),
@@ -410,6 +465,31 @@ mod tests {
             hash_b64: b64().encode([7u8; 32]),
         };
         assert!(s.create_account("v1", &good, "dev-a", &[1u8; 32]).unwrap());
+    }
+
+    #[test]
+    fn file_store_with_reader_pool_reads_after_write() {
+        // Exercise the real production path: a writer + a pool of read-only connections over a
+        // WAL file. Writes go to the writer; reads fan across the pool and must see committed data.
+        let path = std::env::temp_dir().join(format!("vault-sync-pool-{}.db", std::process::id()));
+        let p = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+        {
+            let s = Store::open(&p, 3).unwrap();
+            assert_eq!(s.readers.len(), 3);
+            let (acc, _, _) = s.push_ops("v1", &[op("a", 1), op("b", 2)]).unwrap();
+            assert_eq!(acc, 2);
+            // Read back through the pool (round-robin hits different reader connections).
+            for _ in 0..6 {
+                assert_eq!(s.latest_seq("v1").unwrap(), 2);
+                assert_eq!(s.pull_ops("v1", 0, 10).unwrap().0.len(), 2);
+            }
+            let (latest, ops, _) = s.status("v1").unwrap();
+            assert_eq!((latest, ops), (2, 2));
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{p}{suffix}"));
+        }
     }
 
     #[test]
