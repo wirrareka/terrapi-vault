@@ -208,7 +208,7 @@ components:
       type: object
       required: [wrapped, kek_id]
       properties:
-        wrapped: { type: string, description: "base64 nonce(12) || AES-256-GCM ciphertext+tag" }
+        wrapped: { type: string, description: "base64 of version(4 LE) || nonce(24) || XChaCha20-Poly1305 ciphertext+tag (opaque to the client)" }
         kek_id: { type: string, description: "<group>/<tenant_id>/<key_id> — which KEK wrapped it" }
     KmsUnwrapRequest:
       type: object

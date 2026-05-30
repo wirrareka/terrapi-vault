@@ -363,7 +363,7 @@ Sample `docs/dev/roles.example.json` (demon-operator, demon-system, aether-backu
 **KMS wrap/unwrap — DONE:** `kms.rs` — per-target KEK (`<group>/<tenant_id>/<key_id>`)
 generated + held in the at-rest store, never exported, **stable** (not leased), NOT
 session-bound. `POST …/kms/{key_id}/wrap` `{dek}` → `{wrapped,kek_id}` and `…/unwrap`
-`{wrapped}` → `{dek}` (AES-256-GCM envelope; cap `kms`, aether-backup principal). For
+`{wrapped}` → `{dek}` (XChaCha20-Poly1305 envelope, 24-byte nonce; cap `kms`, aether-backup principal). For
 aether fleet-mode backup keys; preserves their zero-knowledge model (KEK never leaves).
 
 **Hardening round — DONE (B gaps):**

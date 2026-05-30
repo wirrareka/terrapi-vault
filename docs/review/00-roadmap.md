@@ -56,9 +56,11 @@ _Verification: `cargo build/clippy -D warnings/test/fmt` all clean; 51 tests pas
 - **R8. ✅ vault-sync timeout + concurrency**: new `harden.rs` (concurrency cap → 503, request
   timeout → 408; WS upgrade returns before the budget so live tails are unaffected), env-tunable
   (`VAULT_SYNC_MAX_CONCURRENCY`/`_REQUEST_TIMEOUT_SECS`). `harden.rs`, `config.rs`, `state.rs`, `http.rs`.
-- **R9. ⬜ KMS nonce safety**: per-KEK wrap counter + auto-rotate, or switch to AES-GCM-SIV /
-  XChaCha20-Poly1305. _(S6)_ — **design choice pending** (counter+rotate keeps the algorithm and
-  needs at-rest counter persistence; algorithm swap changes the wrap-blob format/migration).
+- **R9. ✅ KMS nonce safety**: switched the envelope from AES-256-GCM (96-bit nonce) to
+  **XChaCha20-Poly1305** (192-bit/24-byte nonce) — collision-safe under random nonces at any
+  realistic wrap volume, so the long-lived KEK needs no wrap counter. Blob format is now
+  `version(4 LE) || nonce(24) || ct+tag`; no migration (KMS not yet live). `kms.rs`,
+  `Cargo.toml` (×2), `spec/broker-openapi.yaml`. _(chosen: algorithm swap over counter+rotate)_
 
 ### P2 — DX / contract / maintainability
 - **R10. Typed error contract**: promote `ErrorBody.error` to an enum in both `spec/*.yaml`

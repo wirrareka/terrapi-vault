@@ -8,15 +8,30 @@
 //! KEK never leaves the broker.
 //!
 //! KEK identity = `(group, tenant_id, key_id)` — stable (not leased), so old snapshots stay
-//! decryptable. Wrapped form = `nonce(12) || ciphertext+tag`, base64. See
+//! decryptable. Wrapped form = `version(4 LE) || nonce(24) || ciphertext+tag`, base64. See
 //! coordination `inbox/vault/aether-key-custody.md`.
+//!
+//! AEAD = **XChaCha20-Poly1305**. Its 192-bit (24-byte) random nonce is collision-safe at any
+//! realistic wrap volume, so a single long-lived KEK is fine — unlike AES-256-GCM, whose
+//! 96-bit nonce would require a per-KEK wrap counter to stay clear of the ~2^32 birthday bound
+//! (review finding S6).
 
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use terrapi_vault::{random_salt, rusqlite, Vault};
 
-const NONCE_LEN: usize = 12;
+const NONCE_LEN: usize = 24; // XChaCha20-Poly1305 extended nonce
 const VER_LEN: usize = 4; // u32 LE KEK-version prefix on the wrapped blob
+
+/// 24 random bytes for an XChaCha20-Poly1305 nonce (two 16-byte CSPRNG draws, take 24).
+fn gen_nonce() -> [u8; NONCE_LEN] {
+    let mut n = [0u8; NONCE_LEN];
+    let a = random_salt(); // 16
+    let b = random_salt(); // 16
+    n[..16].copy_from_slice(&a);
+    n[16..].copy_from_slice(&b[..NONCE_LEN - 16]);
+    n
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum KmsError {
@@ -174,13 +189,14 @@ pub fn wrap(
     dek: &[u8],
 ) -> Result<Vec<u8>, KmsError> {
     let (version, kek) = current_kek(vault, group, tenant_id, key_id)?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&kek));
-    let nonce_bytes = random_salt(); // 16 bytes; take 12
-    let nonce = Nonce::from_slice(&nonce_bytes[..NONCE_LEN]);
-    let ct = cipher.encrypt(nonce, dek).map_err(|_| KmsError::Crypto)?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&kek));
+    let nonce_bytes = gen_nonce();
+    let ct = cipher
+        .encrypt(XNonce::from_slice(&nonce_bytes), dek)
+        .map_err(|_| KmsError::Crypto)?;
     let mut out = Vec::with_capacity(VER_LEN + NONCE_LEN + ct.len());
     out.extend_from_slice(&version.to_le_bytes());
-    out.extend_from_slice(&nonce_bytes[..NONCE_LEN]);
+    out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ct);
     Ok(out)
 }
@@ -204,10 +220,10 @@ pub fn unwrap(
     let Some(kek) = kek_at(vault, group, tenant_id, key_id, version)? else {
         return Err(KmsError::Crypto); // unknown version → treat as auth failure
     };
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&kek));
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&kek));
     let (nonce_bytes, ct) = wrapped[VER_LEN..].split_at(NONCE_LEN);
     cipher
-        .decrypt(Nonce::from_slice(nonce_bytes), ct)
+        .decrypt(XNonce::from_slice(nonce_bytes), ct)
         .map_err(|_| KmsError::Crypto)
 }
 
@@ -255,7 +271,7 @@ mod tests {
             dek,
         )
         .unwrap();
-        assert_ne!(&w[12..], &dek[..]); // ciphertext != plaintext
+        assert_ne!(&w[VER_LEN + NONCE_LEN..], &dek[..]); // ciphertext != plaintext
         let got = unwrap(
             &v,
             "eu",
