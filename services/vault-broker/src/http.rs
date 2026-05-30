@@ -34,6 +34,26 @@ fn err(status: StatusCode, error: &str, detail: &str) -> (StatusCode, Json<Error
     )
 }
 
+/// A `5xx` whose underlying detail must NOT reach the client — it can carry rusqlite/SQL
+/// text, filesystem paths, or other internals. The real error is logged server-side; the
+/// client gets the stable machine `code` and a generic detail.
+fn internal(code: &str, context: &str, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorBody>) {
+    eprintln!("vault-broker: {context}: {e}");
+    err(StatusCode::INTERNAL_SERVER_ERROR, code, "internal error")
+}
+
+/// A `502` for an upstream backend (e.g. OpenSearch) failure — same redaction: the backend's
+/// message is logged locally, the client gets a generic detail so backend internals (URLs,
+/// index names, status text) never leak across the trust boundary.
+fn backend(context: &str, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorBody>) {
+    eprintln!("vault-broker: {context}: {e}");
+    err(
+        StatusCode::BAD_GATEWAY,
+        "backend_error",
+        "upstream backend error",
+    )
+}
+
 /// A path `:group` must equal this instance's group, else `404` — a cred for one
 /// region must not even be addressable on another's broker (residency air-gap).
 fn check_group(state: &AppState, group: &str) -> Result<(), (StatusCode, Json<ErrorBody>)> {
@@ -245,13 +265,7 @@ async fn ssh_revoked(
         let v = store.lock().expect("store lock");
         crate::ssh_ca::list_revoked(&v)
     }
-    .map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "store_error",
-            &e.to_string(),
-        )
-    })?;
+    .map_err(|e| internal("store_error", "ssh revoked-list read", e))?;
     Ok(Json(crate::dto::SshRevokedResponse { revoked_serials }))
 }
 
@@ -343,11 +357,7 @@ async fn ssh_sign(
                 crate::ssh_ca::CaError::BadRequest(m) => {
                     err(StatusCode::BAD_REQUEST, "bad_request", &m)
                 }
-                other => err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "sign_failed",
-                    &other.to_string(),
-                ),
+                other => internal("sign_failed", "ssh sign", other),
             });
         }
     };
@@ -392,11 +402,7 @@ async fn store_snapshot(
         ));
     };
     if let Err(e) = std::fs::create_dir_all(&state.cfg.snapshot_dir) {
-        return Err(err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "store_error",
-            &e.to_string(),
-        ));
+        return Err(internal("store_error", "snapshot mkdir", e));
     }
     let snap_path = state.cfg.snapshot_dir.join(format!(
         "vault-store-{}-{}.sqlcipher",
@@ -410,21 +416,10 @@ async fn store_snapshot(
         let v = store.lock().expect("store lock");
         v.with_connection(|c| c.execute("VACUUM INTO ?1", [snap_str.as_str()]).map(|_| ()))
     }
-    .map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "snapshot_failed",
-            &e.to_string(),
-        )
-    })?;
+    .map_err(|e| internal("snapshot_failed", "snapshot vacuum", e))?;
 
-    let data = std::fs::read(&snap_path).map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "store_error",
-            &e.to_string(),
-        )
-    })?;
+    let data =
+        std::fs::read(&snap_path).map_err(|e| internal("store_error", "snapshot read", e))?;
     let sha256 = {
         use sha2::{Digest, Sha256};
         use std::fmt::Write as _;
@@ -517,7 +512,7 @@ async fn creds(
         .expect("engine present (checked above)")
         .issue(&tenant_id, ttl)
         .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, "backend_error", &e.to_string()))?;
+        .map_err(|e| backend("creds issue", e))?;
 
     let issued_lease = {
         let mut eng = state.leases.lock().expect("lease lock");
@@ -626,7 +621,7 @@ fn map_kms_err(e: crate::kms::KmsError) -> (StatusCode, Json<ErrorBody>) {
             "unwrap_failed",
             "blob did not authenticate under this target's key (wrong target or tampered)",
         ),
-        KmsError::Store(m) => err(StatusCode::INTERNAL_SERVER_ERROR, "store_error", &m),
+        KmsError::Store(m) => internal("store_error", "kms store", m),
     }
 }
 

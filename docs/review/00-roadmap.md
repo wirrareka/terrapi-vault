@@ -42,16 +42,23 @@ Severity uses the worst rating any agent assigned.
 
 _Verification: `cargo build/clippy -D warnings/test/fmt` all clean; 51 tests pass (3 new)._
 
-### P1 — Robustness
-- **R5. Stop leaking internal error strings** (C1): map rusqlite/backend errors to a generic
-  client message + stable code; log detail locally. Pairs with R10.
-- **R6. SQLite off the async runtime**: wrap blocking DB + base64 in `spawn_blocking`; move to
-  a small WAL reader pool so a large `pull` can't starve live-tail. _(perf High)_
-- **R7. Bound the audit shipper**: cap bytes/events per `_bulk` tick and drain incrementally so
-  a post-outage backlog can't OOM or wedge the cursor. _(perf High)_
-- **R8. Add timeout + concurrency limits to vault-sync** (mirror `hardening.rs`). _(arch, S2)_
-- **R9. KMS nonce safety**: per-KEK wrap counter + auto-rotate, or switch to AES-GCM-SIV /
-  XChaCha20-Poly1305. _(S6)_
+### P1 — Robustness  (R5/R7/R8 ✅ DONE 2026-05-30; R6/R9 OPEN)
+- **R5. ✅ Internal error strings no longer leak** (C1): broker `internal()`/`backend()` helpers
+  log the real rusqlite/backend/IO detail server-side and return a stable code + generic message
+  (6 sites: ssh revoked-list, ssh sign, snapshot mkdir/vacuum/read, creds backend, kms store);
+  vault-sync `db_err` does the same. `http.rs` (both), `opensearch.rs` untouched here.
+- **R6. ⬜ SQLite off the async runtime**: wrap blocking DB + base64 in `spawn_blocking`; move to
+  a small WAL reader pool so a large `pull` can't starve live-tail. _(perf High)_ — **design choice
+  pending** (single writer + N readers pool vs. `spawn_blocking` over the existing mutex).
+- **R7. ✅ Audit shipper bounded**: `read_new_records` reads ≤ `MAX_SHIP_BYTES` (4 MiB) per tick
+  and parses only up to the last complete line; `collect_backlog` caps at `MAX_SHIP_ITEMS` (500),
+  advancing the cursor partially so a post-outage backlog drains incrementally. `audit_ship.rs`.
+- **R8. ✅ vault-sync timeout + concurrency**: new `harden.rs` (concurrency cap → 503, request
+  timeout → 408; WS upgrade returns before the budget so live tails are unaffected), env-tunable
+  (`VAULT_SYNC_MAX_CONCURRENCY`/`_REQUEST_TIMEOUT_SECS`). `harden.rs`, `config.rs`, `state.rs`, `http.rs`.
+- **R9. ⬜ KMS nonce safety**: per-KEK wrap counter + auto-rotate, or switch to AES-GCM-SIV /
+  XChaCha20-Poly1305. _(S6)_ — **design choice pending** (counter+rotate keeps the algorithm and
+  needs at-rest counter persistence; algorithm swap changes the wrap-blob format/migration).
 
 ### P2 — DX / contract / maintainability
 - **R10. Typed error contract**: promote `ErrorBody.error` to an enum in both `spec/*.yaml`

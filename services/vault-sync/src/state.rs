@@ -21,6 +21,8 @@ pub struct AppState {
     pub replay: Arc<ReplayGuard>,
     /// Token bucket guarding the unauthenticated `enroll-challenge` endpoint.
     pub challenge_rl: Arc<RateBucket>,
+    /// Global concurrency permits — bounds requests executing against the serialised store.
+    pub sem: Arc<tokio::sync::Semaphore>,
     /// Per-`vault_id` broadcast of newly-pushed ops (pre-serialised JSON) to live-tail
     /// WebSocket subscribers. Created lazily on first subscribe; the message is a `StoredOp`.
     tails: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
@@ -29,11 +31,13 @@ pub struct AppState {
 impl AppState {
     #[must_use]
     pub fn new(cfg: Config, store: Store) -> Self {
+        let sem = Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrency));
         Self {
             cfg: Arc::new(cfg),
             store: Arc::new(Mutex::new(store)),
             replay: Arc::new(ReplayGuard::default()),
             challenge_rl: Arc::new(RateBucket::default()),
+            sem,
             tails: Arc::new(Mutex::new(HashMap::new())),
         }
     }

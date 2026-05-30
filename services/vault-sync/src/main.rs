@@ -10,6 +10,7 @@
 mod auth;
 mod config;
 mod dto;
+mod harden;
 mod http;
 mod ratelimit;
 mod state;

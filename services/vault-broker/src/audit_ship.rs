@@ -22,6 +22,15 @@ use vault_transport::audit::{AuditSink, HashChainSink};
 /// How often the shipper tails the chain for new records.
 const SHIP_INTERVAL_SECS: u64 = 5;
 
+/// Max bytes of chain read per tick. Bounds the `_bulk` body + in-memory buffer so a large
+/// post-outage backlog drains incrementally (a tick ships at most this much, advances the
+/// cursor, and the next tick continues) instead of building one unbounded request that could
+/// OOM or be rejected — which would leave the cursor stuck replaying the same giant batch.
+const MAX_SHIP_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Max events shipped per tick (a second bound, for many tiny events under the byte cap).
+const MAX_SHIP_ITEMS: usize = 500;
+
 /// Work handed to the background shipper.
 pub struct ShipTask {
     client: reqwest::Client,
@@ -137,9 +146,14 @@ fn read_new_records(
     // File rotated/truncated below the cursor → re-ship from the start.
     let from = if from > len { 0 } else { from };
     f.seek(SeekFrom::Start(from)).ok()?;
-    let mut buf = String::new();
-    f.read_to_string(&mut buf).ok()?;
-    Some(collect_backlog(&buf, from, group))
+    // Read at most one tick's worth, then parse only up to the last complete line — a newline
+    // is a UTF-8 boundary, so this is safe even if the byte cap fell mid-record. The remainder
+    // (and anything beyond the item cap) ships on a later tick.
+    let mut buf = Vec::new();
+    f.take(MAX_SHIP_BYTES).read_to_end(&mut buf).ok()?;
+    let last_nl = buf.iter().rposition(|&b| b == b'\n')?;
+    let text = std::str::from_utf8(&buf[..=last_nl]).ok()?;
+    Some(collect_backlog(text, from, group))
 }
 
 /// Pure backlog parse: split complete (newline-terminated) lines, extract each record's
@@ -150,6 +164,9 @@ fn collect_backlog(buf: &str, from: u64, group: &str) -> (Vec<(String, String)>,
     for line in buf.split_inclusive('\n') {
         if !line.ends_with('\n') {
             break; // trailing partial line (mid-write) — stop, ship it next time
+        }
+        if items.len() >= MAX_SHIP_ITEMS {
+            break; // per-tick item cap — the cursor advances over `consumed`, rest ships next tick
         }
         consumed += line.len();
         let trimmed = line.trim();
@@ -277,6 +294,24 @@ mod tests {
         // the shipped doc is the inner event, not the chain envelope
         assert!(items[0].1.contains("\"action\":\"a\""));
         assert!(!items[0].1.contains("\"seq\""));
+    }
+
+    #[test]
+    fn collect_backlog_caps_items_per_tick() {
+        // More records than the per-tick cap: only MAX_SHIP_ITEMS ship, and `consumed` covers
+        // exactly those lines so the cursor advances partially and the rest ships next tick.
+        use std::fmt::Write as _;
+        let mut buf = String::new();
+        for i in 0..(MAX_SHIP_ITEMS + 7) {
+            let _ = writeln!(
+                buf,
+                r#"{{"seq":{i},"prev":"00","hash":"aa","event":{{"ts":"2026-05-01T00:00:00Z","action":"a{i}"}}}}"#
+            );
+        }
+        let (items, consumed) = collect_backlog(&buf, 0, "eu");
+        assert_eq!(items.len(), MAX_SHIP_ITEMS);
+        // `consumed` covers only the shipped lines — a real partial advance, less than the whole.
+        assert!(consumed > 0 && consumed < buf.len() as u64);
     }
 
     #[test]

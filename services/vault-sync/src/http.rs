@@ -35,11 +35,14 @@ fn err(status: StatusCode, error: &str, detail: &str) -> ErrResp {
     )
 }
 
+/// A `500` for a storage fault. The rusqlite/SQL detail can leak filesystem paths or schema
+/// internals, so it is logged server-side and the client gets only a stable generic message.
 fn db_err(e: impl std::fmt::Display) -> ErrResp {
+    eprintln!("vault-sync: store error: {e}");
     err(
         StatusCode::INTERNAL_SERVER_ERROR,
         "store_error",
-        &e.to_string(),
+        "internal storage error",
     )
 }
 
@@ -122,6 +125,15 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sync/{vault_id}/status", get(status))
         .route("/v1/sync/{vault_id}/tail", get(tail))
         .layer(DefaultBodyLimit::max(max_body))
+        // Outer → inner: concurrency cap (503) · request timeout (408) · body limit (413).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::harden::timeout,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::harden::concurrency_limit,
+        ))
         .with_state(state)
 }
 
@@ -640,6 +652,8 @@ mod tests {
             db_path: String::new(),
             max_body_bytes: 1 << 20,
             max_pull: 500,
+            max_concurrency: 64,
+            request_timeout: std::time::Duration::from_secs(30),
         };
         AppState::new(cfg, Store::open_memory().unwrap())
     }

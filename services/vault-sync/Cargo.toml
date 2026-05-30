@@ -20,8 +20,9 @@ vault-transport.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-# `sync` adds the per-vault broadcast channel that fans pushed ops out to WS tail subscribers.
-tokio = { workspace = true, features = ["sync"] }
+# `sync` adds the per-vault broadcast channel that fans pushed ops out to WS tail subscribers;
+# `time` backs the per-request timeout (harden::timeout).
+tokio = { workspace = true, features = ["sync", "time"] }
 # `ws` adds the live-tail WebSocket endpoint.
 axum = { workspace = true, features = ["ws"] }
 time.workspace = true
