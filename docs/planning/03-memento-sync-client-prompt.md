@@ -109,3 +109,58 @@ Write integration tests that round-trip ops between two in-process clients throu
 Working oplog sync in memento-core behind the existing settings UI (alongside LocalOnly/Git),
 green `memento-core` tests, and a short design note in the memento repo describing the
 op-capture integration you chose.
+
+---
+
+## ⚠️ Contract updates since this prompt was written (2026-05-30) — read these
+
+The server got a hardening + DX pass. The spec (`spec/sync-openapi.yaml`) is authoritative and
+already reflects all of this; these are the deltas that **change client code** vs. the summary
+above:
+
+1. **`POST /account` now REQUIRES a `proof_b64` field** (breaking vs. above). Body is now
+   `{ enroll, proof_b64, device }`, where `proof_b64 = base64(enroll_secret)` — the **same**
+   value the 2nd device sends to `/enroll`. The server checks `SHA-256(proof_b64) ==
+   enroll.hash_b64` and only then creates the account (guarantees the verifier is genuinely
+   derivable; a garbage verifier that would brick the vault is rejected). Without it you get
+   `400 bad_verifier` / `401 bad_proof`. The first device already knows `enroll_secret`, so just
+   include it.
+
+2. **`vault_id` MUST be a lowercase UUIDv4** (e.g. `uuid::Uuid::new_v4().to_string()`), not any
+   opaque string. A non-UUIDv4 id is rejected with `400 bad_vault_id` at every endpoint, before
+   anything else. Generate it lowercase.
+
+3. **Signing test vector — validate your impl against it.** `spec/sync-openapi.yaml`
+   (`info.description`) now contains a concrete vector: a fixed device seed `[7u8;32]` →
+   `pubkey_b64`, the exact canonical string, `body_sha256_hex`, and the expected `X-Sync-Sig`.
+   Reproduce it in a unit test before touching the network — if it matches, your canonical
+   string + ed25519 signing are correct. The server verifies with `verify_strict`.
+
+4. **base64 is the STANDARD alphabet** (`+`/`/`, padded) everywhere on the wire — pubkeys,
+   sigs, payloads, salts, hashes. Not URL-safe. The body hash is **lowercase hex** SHA-256;
+   empty body → `e3b0c442...b855`.
+
+5. **Typed error codes.** Every error is `{ error, detail }` where `error` is a stable enum
+   (full list in the spec). Switch on `error`, not on `detail` (detail is non-contractual; 5xx
+   details are generic). Useful ones: `bad_vault_id`, `bad_proof`, `replay`, `stale_request`,
+   `unknown_device`, `account_exists`.
+
+6. **Handle these statuses:** `429 rate_limited` on `enroll-challenge` (it's unauthenticated +
+   rate-limited — back off/retry); `503 overloaded` (concurrency cap) and `408 timeout` from the
+   server — both are transient, retry with backoff. `409 account_exists` on a second `/account`.
+
+7. **pull pagination + idempotency (now explicit):** `limit` defaults to and is capped at 500;
+   loop advancing `since` to the last `seq` while the last returned `seq < latest_seq`. `push`
+   is idempotent on `op_id` — `accepted + duplicates == len(ops)`, a duplicate consumes no `seq`
+   and is never re-applied, so retrying a push after a network error is safe.
+
+8. **`/tail` frame shape** is specified as `TailFrame = StoredOp | {"resync":true}` (see the
+   spec schema). Text frames only.
+
+9. **Payload AEAD:** prefer **XChaCha20-Poly1305** (the server's own KMS envelope switched to it
+   for its 192-bit misuse-resistant nonce; same reasoning applies to your per-op nonces). It's
+   client-only so your choice, but XChaCha20 lets you use a random nonce per op without counter
+   bookkeeping.
+
+If you need a contract change, edit `spec/sync-openapi.yaml` + drop a note in
+`coordination/inbox/vault/` — don't diverge silently.
