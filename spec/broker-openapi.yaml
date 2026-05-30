@@ -258,12 +258,11 @@ components:
 
     StoreSnapshotResponse:
       type: object
-      required: [snapshot_path, meta_path, sha256, bytes]
+      required: [snapshot_id, sha256, bytes]
       properties:
-        snapshot_path: { type: string, description: consistent at-rest snapshot (SQLCipher ciphertext, same key as the store) }
-        meta_path: { type: string, description: plaintext meta sidecar (salt + KDF params, no secret) — back up too }
-        sha256: { type: string }
-        bytes: { type: integer, format: int64 }
+        snapshot_id: { type: string, description: "opaque snapshot identifier (filename only, no host path) — the broker keeps the absolute path server-side" }
+        sha256: { type: string, description: SHA-256 (hex) of the snapshot ciphertext }
+        bytes: { type: integer, format: int64, description: snapshot size in bytes }
 
     SessionOpenRequest:
       type: object
@@ -362,8 +361,9 @@ paths:
       summary: Consistent snapshot of vault's own at-rest store (for aether fleet backup).
       description: |
         Online `VACUUM INTO` of the SQLCipher store (ciphertext, same key) under
-        `VAULT_SNAPSHOT_DIR`; returns the snapshot + meta sidecar paths, sha256 and size.
-        The agent ships both as ciphertext (it never sees the key/passphrase). cap `snapshot`.
+        `VAULT_SNAPSHOT_DIR`; returns an opaque `snapshot_id` (filename, no host path), the
+        sha256 and the size. The snapshot is ciphertext (the agent never sees the key/passphrase).
+        cap `snapshot`.
       x-implementation-status: implemented
       x-audit-action: store.snapshot
       responses:

@@ -150,10 +150,9 @@ pub struct KmsRotateResponse {
 
 #[derive(Debug, Serialize)]
 pub struct StoreSnapshotResponse {
-    /// Path of the consistent at-rest snapshot (SQLCipher ciphertext, same key as the store).
-    pub snapshot_path: String,
-    /// Path of the plaintext meta sidecar (salt + KDF params, no secret) — back this up too.
-    pub meta_path: String,
+    /// Opaque snapshot identifier — the filename only, no host directory (review S11). The
+    /// broker holds the real path server-side; the caller never resolves a broker-absolute path.
+    pub snapshot_id: String,
     pub sha256: String,
     pub bytes: u64,
 }

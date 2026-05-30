@@ -88,18 +88,18 @@ _Verification: `cargo build/clippy -D warnings/test/fmt` all clean; 51 tests pas
   prod mTLS `ClientSan`→role/403/401 path; vault-sync `tail_websocket_receives_pushed_op` is a real
   end-to-end WS test (signed upgrade → push fan-out → client receives the frame). `http.rs` (both).
 
-### P3 — Hardening polish  (R15/R16/R18 ✅ DONE 2026-05-30; R17 → coordination)
+### P3 — Hardening polish  (✅ ALL DONE 2026-05-30)
 - **R15. ✅ ReplayGuard retention widened to 2·SKEW** (S8): a captured request stays
   skew-acceptable up to `2·MAX_SKEW_SECS` after first record, so the nonce is now kept that long
   (`NONCE_RETENTION_SECS`) — pruning at `SKEW` left a same-`ts` replay hole. `vault-sync/src/auth.rs`.
 - **R16. ✅ Constant-time key compare in `rotate_key`** (S10): the old-vs-current derived-key
   check is now an XOR-accumulate over all 32 bytes (`constant_time_eq`, no new crate — root lib
   stays neutral). `src/vault.rs` (+ unit test).
-- **R17. → coordination (S11)**: `store-snapshot` returns absolute host paths, but `snapshot_path`
-  is likely the **functional handle aether reads** from the shared dataset, so changing it is an
-  aether-coordinated boundary change, not a unilateral edit. Proposal note sent:
-  `coordination/inbox/aether/vault-snapshot-path-opaque-handle.md` (asks how aether consumes it;
-  opaque `snapshot_id` if bytes-only, else keep/relativize). Contract unchanged pending reply.
+- **R17. ✅ Opaque snapshot handle (S11)**: aether confirmed (2026-05-30) it consumes **no**
+  path from `store-snapshot` (case 2), so `StoreSnapshotResponse` now returns an opaque
+  `snapshot_id` (filename only) + `sha256` + `bytes` — the absolute `snapshot_path`/`meta_path`
+  host paths are gone from the wire (kept server-side for audit/IR only). `http.rs`, `dto.rs`,
+  `spec/broker-openapi.yaml`. Coordinated via `inbox/aether/vault-snapshot-path-opaque-handle.md`.
 - **R18. ✅ Metadata threat-model documented** (S9): new "Threat model — what the server learns"
   section in `docs/planning/02-vault-sync-oplog.md` — enumerates the metadata an
   honest-but-curious server sees (op/device counts, timing, sizes, cleartext `collection_id`) vs.

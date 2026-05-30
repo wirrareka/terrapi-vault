@@ -431,9 +431,12 @@ async fn store_snapshot(
         s
     };
     let bytes = data.len() as u64;
-    let meta_path = terrapi_vault::meta_path_for(&state.cfg.store_path)
-        .to_string_lossy()
-        .to_string();
+    // Return only the opaque filename (no host directory) to the caller — the absolute path is
+    // an internal detail (review S11; aether confirmed it consumes no path, 2026-05-30). The
+    // full path stays in the local audit event below for operator IR.
+    let snapshot_id = snap_path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
 
     state.emit(&AuditEvent::vault(
         AppState::now_ts(),
@@ -450,8 +453,7 @@ async fn store_snapshot(
     ));
 
     Ok(Json(crate::dto::StoreSnapshotResponse {
-        snapshot_path: snap_str,
-        meta_path,
+        snapshot_id,
         sha256,
         bytes,
     }))
