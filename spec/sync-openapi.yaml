@@ -2,21 +2,66 @@ openapi: 3.1.0
 info:
   title: vault-sync — personal multi-device oplog (Svet B)
   version: 1.0.0
-  description: >
+  description: |
     Server-blind row-level oplog for memento/probe. The server stores only opaque encrypted
     ops partitioned by `vault_id`, device public keys, and an enrolment verifier — never the
     vault key or plaintext. Per-row LWW / CRDT are client-side. NOT multi-tenant; carries
     none of the platform (no OpenSearch / tenants / residency). See
     docs/planning/02-vault-sync-oplog.md. Source of truth for the wire contract.
 
+    ## Request signing (read this before implementing a client)
+
+    Every op-bearing call (`push`/`pull`/`status`/`tail`) carries a detached **ed25519**
+    signature by the calling device key. `account`/`enroll` are *self-signed* by the key being
+    registered (proves possession). The signed message is a versioned, newline-joined
+    **canonical string** (no trailing newline):
+
+    ```
+    v1\n{METHOD}\n{PATH_AND_QUERY}\n{vault_id}\n{ts}\n{nonce}\n{body_sha256_hex}
+    ```
+
+    - `METHOD` — uppercase HTTP method (`GET`/`POST`).
+    - `PATH_AND_QUERY` — exact request target incl. query string, e.g.
+      `/v1/sync/<vault_id>/pull?since=0&limit=100` (must byte-match what the server receives).
+    - `ts` — the `X-Sync-Ts` value (unix **seconds**, decimal, no padding).
+    - `nonce` — the `X-Sync-Nonce` value; an opaque unique token (a UUIDv4 is fine).
+    - `body_sha256_hex` — lowercase hex SHA-256 of the **raw request body bytes**. For a GET /
+      empty body this is the SHA-256 of the empty string
+      (`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`).
+
+    Sign `canonical` with the device's ed25519 secret key; send the 64-byte signature as
+    **standard-base64** in `X-Sync-Sig`. The server verifies with `ed25519_dalek::verify_strict`.
+    All base64 on the wire is the **standard** alphabet (`+`/`/`, padded).
+
+    **Replay / skew.** The server rejects a request whose `ts` is outside ±300 s of server time
+    (`401 stale_request`), and remembers each `(device_id, nonce)` within that window — a repeat
+    is `401 replay`. Use a fresh nonce per request.
+
+    ## Signing test vector (verify your implementation against this)
+
+    With device secret-key **seed** = 32 bytes of `0x07`:
+
+    | field | value |
+    |---|---|
+    | `pubkey_b64` | `6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=` |
+    | `METHOD` | `POST` |
+    | `PATH_AND_QUERY` | `/v1/sync/11111111-1111-4111-8111-111111111111/push` |
+    | `vault_id` | `11111111-1111-4111-8111-111111111111` |
+    | `ts` | `1700000000` |
+    | `nonce` | `f47ac10b-58cc-4372-a567-0e02b2c3d479` |
+    | body | `{"ops":[]}` |
+    | `body_sha256_hex` | `b2f0effc1a37cecc88986e93381ca24c017e5b7a288ea14a9462ae9b4c466f0c` |
+    | `X-Sync-Sig` (base64) | `1+iHlUygD0IWdjWTnxHUCVedtJZm8QM/9zKE6ONdLlZsCumGYc1as9cz5fx3InNbysTAJmy0ZO0zqK2HyubKAw==` |
+
+    Canonical string (`\n` = LF, no trailing newline):
+    `v1\nPOST\n/v1/sync/11111111-1111-4111-8111-111111111111/push\n11111111-1111-4111-8111-111111111111\n1700000000\nf47ac10b-58cc-4372-a567-0e02b2c3d479\nb2f0effc1a37cecc88986e93381ca24c017e5b7a288ea14a9462ae9b4c466f0c`
+
 servers:
   - url: https://{host}
     variables: { host: { default: localhost:8300 } }
 
-# Every op-bearing call (push/pull/status) is authenticated by a detached ed25519 signature
-# over the canonical string:  v1\n{METHOD}\n{path?query}\n{vault_id}\n{ts}\n{nonce}\n{sha256_hex(body)}
-# carried in the headers below. account + enroll are *self-signed* by the device key being
-# registered (proves key possession); enroll is additionally gated by the enrolment proof.
+# Request-signing scheme, the canonical string, the test vector, replay/skew rules and the
+# error-code catalog all live in `info.description` above (the client-facing contract).
 components:
   parameters:
     VaultId:
@@ -66,8 +111,47 @@ components:
         pubkey_b64: { type: string, description: base64 ed25519 public key (32 bytes) }
     ErrorBody:
       type: object
+      description: >
+        Uniform error envelope. `error` is a stable machine code (switch on it); `detail` is a
+        human string and may change. 5xx details are intentionally generic (internals are
+        logged server-side, never returned).
       required: [error, detail]
-      properties: { error: { type: string }, detail: { type: string } }
+      properties:
+        error:
+          type: string
+          description: stable machine-readable code
+          enum:
+            - bad_vault_id      # 400 — vault_id is not a lowercase UUIDv4
+            - bad_body          # 400 — request JSON did not parse
+            - bad_verifier      # 400 — enrol verifier malformed (hash not 32-byte base64)
+            - bad_proof         # 400/401 — proof not base64 / did not match the verifier
+            - bad_payload       # 400 — an op.encrypted_payload was not valid base64
+            - device_mismatch   # 400/403 — X-Device-Id ≠ body device, or op.device_id ≠ caller
+            - missing_device    # 401 — X-Device-Id header absent
+            - bad_ts            # 401 — X-Sync-Ts missing/unparseable
+            - missing_nonce     # 401 — X-Sync-Nonce header absent
+            - bad_sig           # 401 — X-Sync-Sig not base64 ed25519 (64 bytes)
+            - bad_signature     # 401 — signature did not verify
+            - stale_request     # 401 — X-Sync-Ts outside the ±300 s skew window
+            - replay            # 401 — this (device, nonce) was already used
+            - unknown_device    # 401 — device is not enrolled
+            - no_account        # 404 — no sync account for this vault
+            - account_exists    # 409 — account already exists
+            - rate_limited      # 429 — enroll-challenge rate limit exceeded
+            - overloaded        # 503 — concurrency cap reached
+            - timeout           # 408 — request exceeded the time budget
+            - store_error       # 500 — internal storage fault (detail is generic)
+        detail: { type: string, description: human-readable, non-contractual }
+    TailFrame:
+      description: >
+        A frame the server pushes over the `/tail` WebSocket. Either a newly-stored op (same
+        shape as a `pull` element) or a resync sentinel sent when a subscriber fell behind the
+        buffer and must do a full `pull`.
+      oneOf:
+        - $ref: '#/components/schemas/StoredOp'
+        - type: object
+          required: [resync]
+          properties: { resync: { type: boolean, enum: [true] } }
 
 paths:
   /healthz:
@@ -136,6 +220,13 @@ paths:
   /v1/sync/{vault_id}/push:
     post:
       summary: Append ops (device-signed). Idempotent on op_id.
+      description: >
+        Each op is assigned a fresh per-`vault_id` `seq` and appended. **Idempotent on `op_id`**:
+        an `op_id` already stored is skipped and counted in `duplicates` (never re-applied and it
+        does not consume a new `seq`), so a client may safely retry a push after a network error.
+        `accepted` + `duplicates` == `len(ops)`. `latest_seq` is the vault's new high-water seq.
+        A device may only author ops under its own `device_id` (else `403 device_mismatch`); a
+        single malformed `encrypted_payload` rejects the whole batch (`400 bad_payload`).
       parameters: [ { $ref: '#/components/parameters/VaultId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
       requestBody:
         required: true
@@ -148,18 +239,24 @@ paths:
       responses:
         '200':
           description: accepted
-          content: { application/json: { schema: { type: object, properties: { accepted: { type: integer }, duplicates: { type: integer }, latest_seq: { type: integer } } } } }
-        '401': { description: unauthenticated }
-        '403': { description: an op.device_id did not match the calling device }
-        '400': { description: malformed body or payload }
+          content: { application/json: { schema: { type: object, required: [accepted, duplicates, latest_seq], properties: { accepted: { type: integer }, duplicates: { type: integer }, latest_seq: { type: integer } } } } }
+        '401': { description: unauthenticated, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
+        '403': { description: an op.device_id did not match the calling device, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
+        '400': { description: malformed body or payload, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
 
   /v1/sync/{vault_id}/pull:
     get:
       summary: Ops with seq > since (device-signed). Sign over an empty body.
+      description: >
+        Returns ops with `seq > since`, ascending, at most `limit`. **Pagination:** `limit`
+        defaults to and is hard-capped at the server's max (default 500); pass `since` = the
+        highest `seq` you have. More remains when the last returned op's `seq` < `latest_seq` —
+        loop, advancing `since` to the last `seq`, until they meet. `latest_seq` is the vault's
+        current high-water seq (so an empty page with `since == latest_seq` means fully caught up).
       parameters:
         - { $ref: '#/components/parameters/VaultId' }
-        - { name: since, in: query, schema: { type: integer, default: 0 } }
-        - { name: limit, in: query, schema: { type: integer } }
+        - { name: since, in: query, schema: { type: integer, default: 0 }, description: return ops with seq strictly greater than this }
+        - { name: limit, in: query, schema: { type: integer }, description: page size; clamped to the server max (default 500) }
         - { $ref: '#/components/parameters/DeviceId' }
         - { $ref: '#/components/parameters/SyncTs' }
         - { $ref: '#/components/parameters/SyncNonce' }
@@ -167,8 +264,9 @@ paths:
       responses:
         '200':
           description: ops
-          content: { application/json: { schema: { type: object, properties: { ops: { type: array, items: { $ref: '#/components/schemas/StoredOp' } }, latest_seq: { type: integer } } } } }
-        '401': { description: unauthenticated }
+          content: { application/json: { schema: { type: object, required: [ops, latest_seq], properties: { ops: { type: array, items: { $ref: '#/components/schemas/StoredOp' } }, latest_seq: { type: integer } } } } }
+        '400': { description: bad_vault_id, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
+        '401': { description: unauthenticated, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
 
   /v1/sync/{vault_id}/status:
     get:
@@ -182,11 +280,18 @@ paths:
 
   /v1/sync/{vault_id}/tail:
     get:
-      summary: >
-        WebSocket live tail. The HTTP upgrade is device-signed like a GET (sign over an empty
-        body). After it verifies, the server streams each newly-pushed StoredOp as a JSON text
-        frame; a lagging subscriber receives {"resync":true} and should do a full pull.
+      summary: WebSocket live tail (device-signed upgrade).
+      description: >
+        The HTTP upgrade is device-signed exactly like a `GET` (sign over an empty body). After
+        it verifies, the server pushes a JSON **text** frame per event: each newly-pushed op as
+        a `StoredOp`, or the sentinel `{"resync":true}` when this subscriber fell behind the
+        server's buffer (≈256 ops) — on receiving it, drop the socket state and do a full `pull`
+        from your last `seq`, then optionally re-`tail`. The server does not read client frames
+        except to detect close. See `TailFrame`.
       parameters: [ { $ref: '#/components/parameters/VaultId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
       responses:
-        '101': { description: switching protocols (WebSocket) }
-        '401': { description: unauthenticated }
+        '101':
+          description: switching protocols; thereafter each WS text frame is a TailFrame
+          content: { application/json: { schema: { $ref: '#/components/schemas/TailFrame' } } }
+        '400': { description: bad_vault_id, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
+        '401': { description: unauthenticated, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }

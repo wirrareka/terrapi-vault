@@ -94,12 +94,41 @@ components:
   schemas:
     Error:
       type: object
+      description: >
+        Uniform error envelope. `error` is a stable machine code (switch on it); `detail` is
+        human-readable and may change. 5xx/502 details are intentionally generic — internal
+        rusqlite/backend/IO text is logged server-side, never returned across the trust boundary.
       required: [error, detail]
       properties:
-        error: { type: string, description: machine-readable code, e.g. group_mismatch, sealed, not_renewable }
-        detail: { type: string, description: human-readable explanation (no secret material) }
+        error:
+          type: string
+          description: stable machine-readable code
+          enum:
+            - group_mismatch     # 404 — :group ≠ this broker's residency group (air-gap)
+            - sealed             # 503 — broker is sealed; mutating ops unavailable until unseal
+            - forbidden          # 403 — principal lacks the capability for this op
+            - bad_request        # 400 — malformed request (generic)
+            - bad_tenant_id      # 400 — tenant_id is not a lowercase UUIDv4
+            - bad_key_id         # 400 — key_id failed validation
+            - bad_dek            # 400 — dek is not valid base64
+            - bad_wrapped        # 400 — wrapped blob is not valid base64 / too short
+            - unwrap_failed      # 400 — blob did not authenticate (wrong target or tampered)
+            - unknown_role       # 404 — no cred engine registered for this role
+            - no_active_session  # 409 — issue a session before creds
+            - no_such_session    # 404 — session id not found
+            - renew_failed       # 409 — lease not renewable
+            - revoke_failed      # 409 — lease/session revoke failed
+            - sign_failed        # 500 — SSH-CA signing fault (detail generic)
+            - snapshot_failed    # 500 — store snapshot fault (detail generic)
+            - store_error        # 500 — at-rest store fault (detail generic)
+            - backend_error      # 502 — upstream backend (OpenSearch) fault (detail generic)
+            - not_found          # 404 — no such route
+            - rate_limited       # 429 — per-principal rate limit exceeded
+            - overloaded         # 503 — global concurrency cap reached
+            - timeout            # 408 — request exceeded the broker time budget
+        detail: { type: string, description: human-readable, non-contractual (no secret material) }
       examples:
-        - { error: group_mismatch, detail: "this broker serves group 'eu'" }
+        - { error: group_mismatch, detail: "this broker serves residency_group=eu" }
 
     RoleName:
       type: string

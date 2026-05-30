@@ -177,6 +177,49 @@ mod tests {
         assert!(!verify_ed25519(&other_pk, msg.as_bytes(), &sig));
     }
 
+    /// Permanent regression guard + the published signing **test vector** (see
+    /// `spec/sync-openapi.yaml`). A fixed seed → deterministic key + signature, so a client
+    /// implementer can confirm their canonical-string construction and ed25519 signing match
+    /// the server bit-for-bit. If this assertion ever changes, the wire contract changed.
+    #[test]
+    fn signing_test_vector_is_stable() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let pubkey_b64 = b64.encode(sk.verifying_key().to_bytes());
+        let vault_id = "11111111-1111-4111-8111-111111111111";
+        let body = br#"{"ops":[]}"#;
+        let body_hash = sha256_hex(body);
+        let canonical = canonical_string(
+            "POST",
+            "/v1/sync/11111111-1111-4111-8111-111111111111/push",
+            vault_id,
+            1_700_000_000,
+            "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+            &body_hash,
+        );
+        let sig = sk.sign(canonical.as_bytes()).to_bytes();
+        let sig_b64 = b64.encode(sig);
+
+        // The fixed expectations published in the spec (seed = [7u8;32]). If any of these
+        // changes, the wire contract changed — bump the spec + the memento client.
+        assert_eq!(
+            body_hash,
+            "b2f0effc1a37cecc88986e93381ca24c017e5b7a288ea14a9462ae9b4c466f0c"
+        );
+        assert_eq!(pubkey_b64, "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=");
+        assert_eq!(
+            sig_b64,
+            "1+iHlUygD0IWdjWTnxHUCVedtJZm8QM/9zKE6ONdLlZsCumGYc1as9cz5fx3InNbysTAJmy0ZO0zqK2HyubKAw=="
+        );
+        // Self-check: the vector verifies under its own key.
+        assert!(verify_ed25519(
+            &sk.verifying_key().to_bytes(),
+            canonical.as_bytes(),
+            &sig
+        ));
+    }
+
     #[test]
     fn enroll_proof_matches_only_for_correct_secret() {
         let secret = b"argon2-derived-enrolment-secret";

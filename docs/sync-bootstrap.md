@@ -15,7 +15,9 @@ for the design and `spec/sync-openapi.yaml` for the wire contract.
   hash). `account`/`enroll` are self-signed by the key being registered; **both** are gated by
   the passphrase-derived enrolment proof (`account` checks `SHA-256(proof) == verifier.hash`,
   so an account is only created with a genuinely derivable verifier). `vault_id` must be a
-  lowercase UUIDv4. `enroll-challenge` is unauthenticated and rate-limited.
+  lowercase UUIDv4. `enroll-challenge` is unauthenticated and rate-limited. The exact canonical
+  string, base64 variant, skew/nonce rules and a **signing test vector** to validate a client
+  implementation are in `spec/sync-openapi.yaml` (`info.description`).
 - **TLS is the transport boundary.** The binary speaks plain HTTP. Put a TLS terminator in
   front (so the enrolment proof and ops travel encrypted in transit). Two good options:
   1. **Private overlay (simplest):** run on a WireGuard / Tailscale `/32` and bind there; the

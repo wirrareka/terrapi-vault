@@ -66,18 +66,24 @@ _Verification: `cargo build/clippy -D warnings/test/fmt` all clean; 51 tests pas
   `version(4 LE) || nonce(24) || ct+tag`; no migration (KMS not yet live). `kms.rs`,
   `Cargo.toml` (×2), `spec/broker-openapi.yaml`. _(chosen: algorithm swap over counter+rotate)_
 
-### P2 — DX / contract / maintainability
-- **R10. Typed error contract**: promote `ErrorBody.error` to an enum in both `spec/*.yaml`
-  with per-status examples; add `X-Request-Id` correlation on both services. _(api-dx High/Med)_
-- **R11. Specify the hard-to-implement bits**: publish the ed25519 canonical-string + a test
-  vector, document skew/nonce-scope/base64-variant, and add the `/tail` WS frame shapes
-  (`StoredOp` vs `{"resync":true}`) to `sync-openapi.yaml`. _(api-dx High)_
-- **R12. Document `pull` pagination** (limit cap + next-cursor) and the `op_id` idempotency /
-  `latest_seq` semantics in the spec. _(api-dx Med)_
-- **R13. De-dup into vault-transport**: `ErrorBody`/`Ack`/`err()`/`env_parse`/`now_unix` are
-  copy-pasted across both services — promote to the shared base. _(arch Med)_
-- **R14. Close test gaps**: vault-sync has 1 oneshot HTTP test; auth/replay/WS-tail and the
-  prod mTLS branch are end-to-end untested. _(arch Med)_
+### P2 — DX / contract / maintainability  (R10/R11/R12 ✅ DONE 2026-05-30; R13/R14 OPEN)
+- **R10. ✅ Typed error contract**: `ErrorBody.error` (sync) and `Error.error` (broker) are now
+  enums of every stable code with per-code status/meaning; both note that 5xx/502 details are
+  generic. `spec/sync-openapi.yaml`, `spec/broker-openapi.yaml`. _(X-Request-Id correlation
+  deferred — small follow-up, folded into R13's shared helpers if/when added.)_
+- **R11. ✅ Hard-to-implement bits specified**: `info.description` now fully documents the
+  ed25519 canonical string, base64 variant, GET/empty-body hashing, ±300 s skew + nonce scope,
+  and ships a **real test vector** (seed `[7;32]` → pubkey/body-hash/canonical/sig) pinned by the
+  `signing_test_vector_is_stable` unit test; `/tail` frames specified via the new `TailFrame`
+  schema (`StoredOp` | `{"resync":true}`). `spec/sync-openapi.yaml`, `auth.rs`.
+- **R12. ✅ Pagination + idempotency documented**: `pull` describes `limit` cap + `since`/`latest_seq`
+  cursor loop; `push` documents `op_id` idempotency (`accepted+duplicates==len`, no seq consumed
+  on dup) and `latest_seq`. `spec/sync-openapi.yaml`.
+- **R13. ⬜ De-dup into vault-transport**: `ErrorBody`/`Ack`/`env_parse`/`now_unix` copy-pasted
+  across both services — promote the pure-serde/std pieces to the shared base (keep axum-coupled
+  `err()` local so vault-transport stays axum-free). _(arch Med)_
+- **R14. ⬜ Close test gaps**: vault-sync auth/replay/WS-tail now have oneshot tests; still missing
+  the broker's prod mTLS branch + a `/tail` end-to-end WS receive test. _(arch Med)_
 
 ### P3 — Hardening polish
 - R15. ReplayGuard prune-window strictly wider than accept-window (S8).
