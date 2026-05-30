@@ -518,14 +518,18 @@ async fn push(
             "every op.device_id must equal the calling device",
         ));
     }
-    // One blocking trip: append + read back the newly-stored ops (with their server `seq`) for
-    // the live-tail fan-out, under the single writer so the read can't miss this push.
+    // One blocking trip: append, then read back exactly this push's newly-stored ops (with
+    // their server `seq`) for the live-tail fan-out. The accepted ops are contiguous and end at
+    // `latest_seq`, so they occupy `(latest_seq - accepted, latest_seq]` — derive the range from
+    // push_ops' own result rather than a separate `latest_seq` read (that read hits a pooled
+    // reader and could be stale under a concurrent same-vault push, re-publishing another push's
+    // ops and/or truncating ours).
     let vid = vault_id.clone();
     let ops = req.ops;
     let (accepted, duplicates, latest_seq, new_ops) = store_op(&state, move |s| {
-        let before = s.latest_seq(&vid)?;
         let (accepted, duplicates, latest_seq) = s.push_ops(&vid, &ops)?;
         let new_ops = if accepted > 0 {
+            let before = latest_seq - accepted; // exclusive lower bound of this push's seqs
             s.pull_ops(&vid, before, u32::try_from(accepted).unwrap_or(u32::MAX))?
                 .0
         } else {
@@ -908,6 +912,52 @@ mod tests {
         let stored: crate::dto::StoredOp = serde_json::from_str(&json).unwrap();
         assert_eq!(stored.op.op_id, "op-1");
         assert_eq!(stored.seq, 1);
+    }
+
+    #[tokio::test]
+    async fn tail_fanout_is_exactly_this_push() {
+        // Guards the fan-out range (`before = latest_seq - accepted`): a push must publish ONLY
+        // its own ops, never ops that already existed before the subscriber joined.
+        let st = state();
+        let dev_a = SigningKey::generate(&mut OsRng);
+        let acct = format!("/v1/sync/{VID}/account");
+        let _ = send(
+            &st,
+            signed("POST", &acct, &create_body(&dev_a, "A"), &dev_a, "A", "n1"),
+        )
+        .await;
+        let push_uri = format!("/v1/sync/{VID}/push");
+        // Pre-seed op-1 (seq 1) BEFORE anyone subscribes.
+        let p1 = serde_json::to_vec(&PushRequest {
+            ops: vec![op("A", "op-1")],
+        })
+        .unwrap();
+        assert_eq!(
+            send(&st, signed("POST", &push_uri, &p1, &dev_a, "A", "n2"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // Subscribe, then push op-2 (seq 2).
+        let mut rx = st.subscribe(VID);
+        let p2 = serde_json::to_vec(&PushRequest {
+            ops: vec![op("A", "op-2")],
+        })
+        .unwrap();
+        assert_eq!(
+            send(&st, signed("POST", &push_uri, &p2, &dev_a, "A", "n3"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // The subscriber receives exactly op-2 (seq 2) — never the pre-seeded op-1 — and nothing more.
+        let stored: crate::dto::StoredOp =
+            serde_json::from_str(&rx.try_recv().expect("the new op")).unwrap();
+        assert_eq!((stored.op.op_id.as_str(), stored.seq), ("op-2", 2));
+        assert!(
+            rx.try_recv().is_err(),
+            "only this push's single op should have been published"
+        );
     }
 
     #[tokio::test]
