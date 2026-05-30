@@ -11,6 +11,7 @@ mod auth;
 mod config;
 mod dto;
 mod http;
+mod ratelimit;
 mod state;
 mod store;
 

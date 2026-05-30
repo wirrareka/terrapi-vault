@@ -3,6 +3,7 @@
 
 use crate::auth::ReplayGuard;
 use crate::config::Config;
+use crate::ratelimit::RateBucket;
 use crate::store::Store;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -18,6 +19,8 @@ pub struct AppState {
     pub cfg: Arc<Config>,
     pub store: Arc<Mutex<Store>>,
     pub replay: Arc<ReplayGuard>,
+    /// Token bucket guarding the unauthenticated `enroll-challenge` endpoint.
+    pub challenge_rl: Arc<RateBucket>,
     /// Per-`vault_id` broadcast of newly-pushed ops (pre-serialised JSON) to live-tail
     /// WebSocket subscribers. Created lazily on first subscribe; the message is a `StoredOp`.
     tails: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
@@ -30,6 +33,7 @@ impl AppState {
             cfg: Arc::new(cfg),
             store: Arc::new(Mutex::new(store)),
             replay: Arc::new(ReplayGuard::default()),
+            challenge_rl: Arc::new(RateBucket::default()),
             tails: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -38,6 +42,9 @@ impl AppState {
     #[must_use]
     pub fn subscribe(&self, vault_id: &str) -> broadcast::Receiver<String> {
         let mut tails = self.tails.lock().expect("tails lock");
+        // Drop channels nobody is listening to any more so the map is bounded by the number of
+        // vaults with a live subscriber — not by every vault_id ever tailed.
+        tails.retain(|_, tx| tx.receiver_count() > 0);
         tails
             .entry(vault_id.to_owned())
             .or_insert_with(|| broadcast::channel(TAIL_CAPACITY).0)

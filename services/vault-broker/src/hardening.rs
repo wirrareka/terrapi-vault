@@ -30,6 +30,12 @@ pub struct HardenState {
     buckets: Mutex<HashMap<String, Bucket>>,
 }
 
+/// Cap on distinct per-principal buckets held at once. Production keys are the few registered
+/// SANs (well under this); the cap only bites on the dev header path, where the key is
+/// caller-controlled. At the cap, idle (fully-refilled) buckets are evicted before a new key
+/// is admitted, so the map cannot grow without bound.
+const MAX_BUCKETS: usize = 4096;
+
 /// A per-principal token bucket: `tokens` refilled at `rate_per_sec`, capped at `rate_burst`.
 struct Bucket {
     tokens: f64,
@@ -51,6 +57,15 @@ impl HardenState {
     fn allow(&self, key: &str) -> bool {
         let now = Instant::now();
         let mut buckets = self.buckets.lock().expect("rate lock");
+        // Before admitting a brand-new principal at capacity, evict idle buckets (those that
+        // have refilled to full), so a flood of distinct keys can't grow the map without bound.
+        if !buckets.contains_key(key) && buckets.len() >= MAX_BUCKETS {
+            let (rate, burst) = (self.limits.rate_per_sec, self.limits.rate_burst);
+            buckets.retain(|_, b| {
+                let refilled = b.tokens + now.duration_since(b.last).as_secs_f64() * rate;
+                refilled < burst
+            });
+        }
         let bucket = buckets.entry(key.to_owned()).or_insert(Bucket {
             tokens: self.limits.rate_burst,
             last: now,

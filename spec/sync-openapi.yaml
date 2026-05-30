@@ -75,7 +75,14 @@ paths:
 
   /v1/sync/{vault_id}/account:
     post:
-      summary: Create the sync account (first device). Self-signed.
+      summary: Create the sync account (first device). Self-signed; proof-gated.
+      description: >
+        `vault_id` must be a lowercase UUIDv4 (else `400 bad_vault_id`). The body carries
+        `proof_b64` — the client-side enrolment secret — and the server checks
+        `SHA-256(proof_b64) == enroll.hash_b64` before creating the account. This guarantees the
+        verifier is genuinely derivable (a later device with the same passphrase can enrol) and
+        rejects a malformed verifier that would otherwise brick the vault. The proof is checked
+        then discarded, never stored.
       parameters: [ { $ref: '#/components/parameters/VaultId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
       requestBody:
         required: true
@@ -83,24 +90,29 @@ paths:
           application/json:
             schema:
               type: object
-              required: [enroll, device]
+              required: [enroll, proof_b64, device]
               properties:
-                enroll: { $ref: '#/components/schemas/EnrollVerifier' }
-                device: { $ref: '#/components/schemas/DeviceRegistration' }
+                enroll:    { $ref: '#/components/schemas/EnrollVerifier' }
+                proof_b64: { type: string, description: base64 client-side enrolment secret (checked against enroll.hash_b64, then discarded) }
+                device:    { $ref: '#/components/schemas/DeviceRegistration' }
       responses:
         '201': { description: created }
-        '401': { description: bad self-signature, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
+        '400': { description: 'bad_vault_id / bad_verifier / bad_proof', content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
+        '401': { description: bad self-signature or proof does not match the verifier, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
         '409': { description: account already exists, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
 
   /v1/sync/{vault_id}/enroll-challenge:
     get:
       summary: Non-secret salt + Argon2 params a new device needs to derive its enrolment proof.
+      description: Unauthenticated and rate-limited (`429 rate_limited` on excess). `vault_id` must be a lowercase UUIDv4.
       parameters: [ { $ref: '#/components/parameters/VaultId' } ]
       responses:
         '200':
           description: challenge
           content: { application/json: { schema: { type: object, properties: { salt_b64: { type: string }, params: { type: object } } } } }
+        '400': { description: bad_vault_id, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
         '404': { description: no account, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
+        '429': { description: rate limited, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
 
   /v1/sync/{vault_id}/enroll:
     post:

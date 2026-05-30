@@ -82,13 +82,18 @@ impl Store {
 
     /// Create the account + register the first device, atomically. Returns `false` (and
     /// changes nothing) if the account already exists.
+    ///
+    /// # Errors
+    /// [`AccountError::InvalidVerifier`] if the enrolment verifier is not valid base64 / the
+    /// wrong length — it is **never** stored malformed (an empty/garbage verifier would
+    /// permanently brick enrolment for this vault); [`AccountError::Db`] on a storage error.
     pub fn create_account(
         &self,
         vault_id: &str,
         enroll: &EnrollVerifier,
         device_id: &str,
         pubkey: &[u8; 32],
-    ) -> rusqlite::Result<bool> {
+    ) -> Result<bool, AccountError> {
         let tx = self.conn.unchecked_transaction()?;
         if tx
             .prepare("SELECT 1 FROM accounts WHERE vault_id = ?1")?
@@ -96,9 +101,19 @@ impl Store {
         {
             return Ok(false);
         }
-        let salt = b64().decode(enroll.salt_b64.as_bytes()).unwrap_or_default();
-        let hash = b64().decode(enroll.hash_b64.as_bytes()).unwrap_or_default();
-        let params_json = serde_json::to_string(&enroll.params).unwrap_or_default();
+        // Strict decode: reject a malformed verifier rather than silently persisting an empty
+        // value. `hash` is SHA-256 of the client's enrolment secret, so it must be 32 bytes.
+        let salt = b64()
+            .decode(enroll.salt_b64.as_bytes())
+            .map_err(|_| AccountError::InvalidVerifier)?;
+        let hash = b64()
+            .decode(enroll.hash_b64.as_bytes())
+            .map_err(|_| AccountError::InvalidVerifier)?;
+        if salt.is_empty() || hash.len() != 32 {
+            return Err(AccountError::InvalidVerifier);
+        }
+        let params_json =
+            serde_json::to_string(&enroll.params).map_err(|_| AccountError::InvalidVerifier)?;
         let now = now_unix();
         tx.execute(
             "INSERT INTO accounts (vault_id, enroll_salt, enroll_params, enroll_hash, created_at)
@@ -289,6 +304,17 @@ pub enum PushError {
     InvalidPayload,
 }
 
+/// Account-creation failure: a storage error, or an enrolment verifier that was not valid
+/// base64 / the wrong length. The verifier is never stored malformed — a garbage verifier
+/// would permanently brick enrolment for the vault.
+#[derive(Debug, thiserror::Error)]
+pub enum AccountError {
+    #[error("storage error: {0}")]
+    Db(#[from] rusqlite::Error),
+    #[error("enrolment verifier is malformed (salt/hash must be base64; hash = 32-byte SHA-256)")]
+    InvalidVerifier,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +379,37 @@ mod tests {
         assert_eq!(s.device_pubkey("v1", "dev-a").unwrap(), Some(pk));
         let (_, _, dev_count) = s.status("v1").unwrap();
         assert_eq!(dev_count, 1);
+    }
+
+    #[test]
+    fn malformed_verifier_is_rejected_not_bricked() {
+        let s = Store::open_memory().unwrap();
+        // A hash that is not valid base64 must be refused, never stored as an empty verifier.
+        let bad = EnrollVerifier {
+            salt_b64: b64().encode(b"salt"),
+            params: terrapi_vault::KdfParams::default(),
+            hash_b64: "not base64!!!".into(),
+        };
+        assert!(matches!(
+            s.create_account("v1", &bad, "dev-a", &[1u8; 32]),
+            Err(AccountError::InvalidVerifier)
+        ));
+        // Wrong-length hash (valid base64, but not 32 bytes) is also refused.
+        let short = EnrollVerifier {
+            hash_b64: b64().encode(b"too-short"),
+            ..bad.clone()
+        };
+        assert!(matches!(
+            s.create_account("v1", &short, "dev-a", &[1u8; 32]),
+            Err(AccountError::InvalidVerifier)
+        ));
+        // The vault is still enrollable afterwards (nothing was committed).
+        let good = EnrollVerifier {
+            salt_b64: b64().encode(b"salt"),
+            params: terrapi_vault::KdfParams::default(),
+            hash_b64: b64().encode([7u8; 32]),
+        };
+        assert!(s.create_account("v1", &good, "dev-a", &[1u8; 32]).unwrap());
     }
 
     #[test]

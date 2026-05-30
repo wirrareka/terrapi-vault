@@ -19,6 +19,12 @@ use std::sync::Mutex;
 /// timestamp is outside `[now - SKEW, now + SKEW]` is rejected (bounds replay windows).
 pub const MAX_SKEW_SECS: i64 = 300;
 
+/// Hard cap on live nonces held by the replay guard. Within the 300 s window a single
+/// person's devices generate far fewer than this; the cap is a backstop so a flood of unique
+/// nonces cannot grow the guard without bound. At the cap new nonces are refused (fail-closed)
+/// until the window drains.
+pub const MAX_SEEN_NONCES: usize = 100_000;
+
 /// Hex SHA-256 of `bytes` (used for the body hash in the canonical string).
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -114,6 +120,10 @@ impl ReplayGuard {
         let mut seen = self.seen.lock().expect("replay lock");
         seen.retain(|_, ts| now - *ts <= MAX_SKEW_SECS);
         if seen.contains_key(&key) {
+            return false;
+        }
+        // Backstop against a unique-nonce flood: refuse once the window holds too many.
+        if seen.len() >= MAX_SEEN_NONCES {
             return false;
         }
         seen.insert(key, now);

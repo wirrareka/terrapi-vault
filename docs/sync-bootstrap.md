@@ -12,8 +12,10 @@ for the design and `spec/sync-openapi.yaml` for the wire contract.
   passphrase, the vault key, or note plaintext.
 - **Device auth is app-layer.** Every `push`/`pull`/`status`/`tail` is signed by the calling
   device's ed25519 key over a canonical string (method + path + vault id + ts + nonce + body
-  hash). `account`/`enroll` are self-signed by the key being registered; `enroll` is gated by
-  the passphrase-derived enrolment proof.
+  hash). `account`/`enroll` are self-signed by the key being registered; **both** are gated by
+  the passphrase-derived enrolment proof (`account` checks `SHA-256(proof) == verifier.hash`,
+  so an account is only created with a genuinely derivable verifier). `vault_id` must be a
+  lowercase UUIDv4. `enroll-challenge` is unauthenticated and rate-limited.
 - **TLS is the transport boundary.** The binary speaks plain HTTP. Put a TLS terminator in
   front (so the enrolment proof and ops travel encrypted in transit). Two good options:
   1. **Private overlay (simplest):** run on a WireGuard / Tailscale `/32` and bind there; the
@@ -43,8 +45,8 @@ directory writable by that user. `GET /healthz` is a liveness probe (returns `ok
 
 | Method | Path                | Auth                          | Purpose |
 |--------|---------------------|-------------------------------|---------|
-| POST   | `/account`          | self-signed                   | first device creates the account |
-| GET    | `/enroll-challenge` | none (salt+params are public) | new device fetches enrolment salt/params |
+| POST   | `/account`          | self-signed + proof           | first device creates the account (proof must match the verifier) |
+| GET    | `/enroll-challenge` | none, rate-limited            | new device fetches enrolment salt/params |
 | POST   | `/enroll`           | self-signed + proof           | new device registers its key |
 | POST   | `/push`             | device-signed                 | append ops (idempotent on `op_id`) |
 | GET    | `/pull?since&limit` | device-signed                 | ops with `seq > since` |

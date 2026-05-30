@@ -57,6 +57,12 @@ pub struct EnrollVerifier {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateAccountRequest {
     pub enroll: EnrollVerifier,
+    /// Base64 of the client-side enrolment secret (same value a later device sends as the
+    /// enrol `proof_b64`). The server checks `SHA-256(proof) == enroll.hash_b64` so the
+    /// account is only created when its verifier is genuinely derivable — this guarantees a
+    /// second device with the same passphrase can enrol, and rejects a garbage verifier that
+    /// would otherwise brick the vault. The proof is checked then discarded, never stored.
+    pub proof_b64: String,
     pub device: DeviceRegistration,
 }
 

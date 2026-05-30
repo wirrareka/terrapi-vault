@@ -107,9 +107,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = BrokerConfig::from_env();
 
     if cfg.allow_insecure_dev {
+        // Insecure dev (plain HTTP, header-only identity, all-caps `dev` principal) must never
+        // be reachable off the local host. Refuse to start if it would bind a routable address.
+        if !cfg.bind.ip().is_loopback() {
+            return Err(format!(
+                "VAULT_ALLOW_INSECURE_DEV=1 with a non-loopback bind ({}) is refused: insecure \
+                 dev has no transport auth and must stay on the local host. Bind 127.0.0.1 for \
+                 dev, or unset the flag and provide mTLS material (VAULT_TLS_*) for production.",
+                cfg.bind
+            )
+            .into());
+        }
         eprintln!(
             "WARNING: VAULT_ALLOW_INSECURE_DEV=1 — serving plain HTTP with header-only \
-             auth. NEVER use this outside local development; production is mTLS-over-WG."
+             auth on {}. NEVER use this outside local development; production is mTLS-over-WG.",
+            cfg.bind
         );
     }
     eprintln!(

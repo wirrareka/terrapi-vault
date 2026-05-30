@@ -9,10 +9,11 @@ use crate::dto::{
     PushRequest, PushResponse, StatusResponse,
 };
 use crate::state::AppState;
-use crate::store::{now_unix, PushError};
+use crate::store::{now_unix, AccountError, PushError};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, OriginalUri, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Path, Query, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -40,6 +41,70 @@ fn db_err(e: impl std::fmt::Display) -> ErrResp {
         "store_error",
         &e.to_string(),
     )
+}
+
+/// Lowercase-UUIDv4 check for `{vault_id}` (no `uuid` crate). Personal vault ids are random
+/// UUIDv4 — rejecting anything else keeps attacker-chosen keys out of the store and the
+/// in-memory replay/tail maps entirely.
+fn is_uuid_v4_lower(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    for (i, &c) in b.iter().enumerate() {
+        match i {
+            8 | 13 | 18 | 23 => {
+                if c != b'-' {
+                    return false;
+                }
+            }
+            14 => {
+                if c != b'4' {
+                    return false;
+                }
+            } // version
+            19 => {
+                if !matches!(c, b'8' | b'9' | b'a' | b'b') {
+                    return false;
+                }
+            } // variant
+            _ => {
+                if !c.is_ascii_digit() && !(b'a'..=b'f').contains(&c) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Path extractor that validates `{vault_id}` is a lowercase UUIDv4 **before** any handler
+/// (or body parse) runs, rejecting a bogus id with `400`. This is the single choke point that
+/// stops malformed ids from creating accounts or seeding the replay/tail maps.
+pub struct VaultId(pub String);
+
+impl FromRequestParts<AppState> for VaultId {
+    type Rejection = ErrResp;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ErrResp> {
+        let Path(vault_id) = Path::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| {
+                err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_vault_id",
+                    "missing vault_id path segment",
+                )
+            })?;
+        if !is_uuid_v4_lower(&vault_id) {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "bad_vault_id",
+                "vault_id must be a lowercase UUIDv4",
+            ));
+        }
+        Ok(VaultId(vault_id))
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -204,8 +269,18 @@ fn paq(uri: &axum::http::Uri) -> String {
 
 async fn enroll_challenge(
     State(state): State<AppState>,
-    Path(vault_id): Path<String>,
+    VaultId(vault_id): VaultId,
 ) -> ApiResult<EnrollChallenge> {
+    // This is the only fully-unauthenticated endpoint and it hands back enrolment salt+params,
+    // so rate-limit it to blunt offline-dictionary harvesting and account-existence probing.
+    // (A TLS-terminating proxy does per-IP limiting in front; this is the in-process backstop.)
+    if !state.challenge_rl.allow() {
+        return Err(err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "too many enrolment challenges; slow down",
+        ));
+    }
     let rec = {
         let store = state.store.lock().expect("store lock");
         store.enroll_record(&vault_id).map_err(db_err)?
@@ -227,7 +302,7 @@ async fn create_account(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    Path(vault_id): Path<String>,
+    VaultId(vault_id): VaultId,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Ack>), ErrResp> {
@@ -244,11 +319,46 @@ async fn create_account(
         &req.device.device_id,
         &req.device.pubkey_b64,
     )?;
+    // Enrollability gate: the creator must prove it can derive the very enrolment secret it is
+    // registering (`SHA-256(proof) == enroll.hash_b64`). This guarantees a second device with
+    // the same passphrase can enrol and rejects a garbage verifier that would brick the vault.
+    let hash = base64::engine::general_purpose::STANDARD
+        .decode(req.enroll.hash_b64.as_bytes())
+        .map_err(|_| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "bad_verifier",
+                "enroll.hash_b64 must be base64",
+            )
+        })?;
+    let proof = base64::engine::general_purpose::STANDARD
+        .decode(req.proof_b64.as_bytes())
+        .map_err(|_| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "bad_proof",
+                "proof_b64 must be base64",
+            )
+        })?;
+    if !auth::verify_enroll_proof(&proof, &hash) {
+        return Err(err(
+            StatusCode::UNAUTHORIZED,
+            "bad_proof",
+            "create proof does not match the enrolment verifier",
+        ));
+    }
     let created = {
         let store = state.store.lock().expect("store lock");
         store
             .create_account(&vault_id, &req.enroll, &req.device.device_id, &pubkey)
-            .map_err(db_err)?
+            .map_err(|e| match e {
+                AccountError::InvalidVerifier => err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_verifier",
+                    "enrolment verifier is malformed (hash must be 32-byte SHA-256)",
+                ),
+                AccountError::Db(d) => db_err(d),
+            })?
     };
     if created {
         Ok((StatusCode::CREATED, Json(Ack { ok: true })))
@@ -265,7 +375,7 @@ async fn enroll(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    Path(vault_id): Path<String>,
+    VaultId(vault_id): VaultId,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Ack>), ErrResp> {
@@ -358,7 +468,7 @@ async fn push(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    Path(vault_id): Path<String>,
+    VaultId(vault_id): VaultId,
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<PushResponse> {
@@ -422,7 +532,7 @@ async fn pull(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    Path(vault_id): Path<String>,
+    VaultId(vault_id): VaultId,
     Query(q): Query<PullQuery>,
     headers: HeaderMap,
 ) -> ApiResult<PullResponse> {
@@ -444,7 +554,7 @@ async fn status(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    Path(vault_id): Path<String>,
+    VaultId(vault_id): VaultId,
     headers: HeaderMap,
 ) -> ApiResult<StatusResponse> {
     auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"")?;
@@ -467,7 +577,7 @@ async fn tail(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    Path(vault_id): Path<String>,
+    VaultId(vault_id): VaultId,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
@@ -577,6 +687,7 @@ mod tests {
         };
         let req = CreateAccountRequest {
             enroll,
+            proof_b64: b64e(SECRET),
             device: crate::dto::DeviceRegistration {
                 device_id: device_id.into(),
                 pubkey_b64: b64e(sk.verifying_key().to_bytes()),
@@ -757,5 +868,49 @@ mod tests {
         let stored: crate::dto::StoredOp = serde_json::from_str(&json).unwrap();
         assert_eq!(stored.op.op_id, "op-1");
         assert_eq!(stored.seq, 1);
+    }
+
+    #[tokio::test]
+    async fn create_with_mismatched_proof_is_401() {
+        let st = state();
+        let dev_a = SigningKey::generate(&mut OsRng);
+        // Verifier hash is SHA-256(SECRET) but the proof is a different secret → 401, and no
+        // account is created (a follow-up correct create then succeeds).
+        let enroll = crate::dto::EnrollVerifier {
+            salt_b64: b64e(b"enrol-salt-16byte"),
+            params: terrapi_vault::KdfParams::default(),
+            hash_b64: b64e(Sha256::digest(SECRET)),
+        };
+        let bad = serde_json::to_vec(&CreateAccountRequest {
+            enroll: enroll.clone(),
+            proof_b64: b64e(b"the-wrong-secret"),
+            device: crate::dto::DeviceRegistration {
+                device_id: "A".into(),
+                pubkey_b64: b64e(dev_a.verifying_key().to_bytes()),
+            },
+        })
+        .unwrap();
+        let acct = format!("/v1/sync/{VID}/account");
+        let (status, _) = send(&st, signed("POST", &acct, &bad, &dev_a, "A", "n1")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // A correct create still works (the bad attempt committed nothing).
+        let good = create_body(&dev_a, "A");
+        let (status, _) = send(&st, signed("POST", &acct, &good, &dev_a, "A", "n2")).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn non_uuid_vault_id_is_400() {
+        let st = state();
+        // A bogus (non-UUIDv4) vault id is rejected at the extractor, before any store touch.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/sync/not-a-uuid/enroll-challenge")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send(&st, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let e: ErrorBody = serde_json::from_slice(&body).unwrap();
+        assert_eq!(e.error, "bad_vault_id");
     }
 }

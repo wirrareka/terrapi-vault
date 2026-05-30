@@ -42,6 +42,17 @@ impl OpenSearchEngine {
             .and_then(|s| s.parse().ok())
             .unwrap_or(28_800);
         let insecure = std::env::var("VAULT_OS_INSECURE_TLS").as_deref() == Ok("1");
+        // Disabling OpenSearch TLS verification exposes the privileged admin credential to a
+        // MITM, so it is honoured only in insecure-dev. In production it is refused (the engine
+        // then stays disabled → creds `404`, fail-closed) rather than silently trusting any cert.
+        if insecure && std::env::var("VAULT_ALLOW_INSECURE_DEV").as_deref() != Ok("1") {
+            return Err(
+                "VAULT_OS_INSECURE_TLS=1 disables OpenSearch TLS verification and is \
+                        refused outside VAULT_ALLOW_INSECURE_DEV=1; use a CA-trusted OpenSearch \
+                        endpoint in production"
+                    .to_string(),
+            );
+        }
 
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(insecure)
