@@ -28,7 +28,8 @@ per-group WireGuard mesh. Mirrors `quanto/identity/deploy/` conventions.
 
 ## What infra provides (kalista/identity pattern)
 - WG IP `10.200.0.101` (eu); the server mTLS cert/key (fleet-Root-CA-signed, SAN
-  `vault-eu.proximi.internal` + IP `10.200.0.101`) + the fleet Root CA bundle;
+  `vault.eu.proximi.internal` + IP `10.200.0.101` — the convention dot form; a hyphen
+  `vault-eu.proximi.internal` SAN MAY be retained for back-compat) + the fleet Root CA bundle;
   the client certs (`demon-operator`/`demon-system`, later `aether-backup`) already issued;
   the OpenSearch `audit-writer` secret; pf/FIM/auditd applied; `:8201` scrape.
 
