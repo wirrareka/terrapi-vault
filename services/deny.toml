@@ -1,0 +1,14 @@
+# cargo-deny — supply-chain gate for the terrapi-vault services workspace.
+# Run: `cargo deny check advisories` (or `cargo audit`). See docs/review/round4/dependencies.md.
+
+[advisories]
+# `cargo deny` analyses the BUILD graph, so it never sees `rsa` (RUSTSEC-2023-0071): that crate is
+# an optional dependency of `ssh-key` this workspace doesn't enable (SSH-CA is ed25519-only) and is
+# never compiled — `cargo tree -i rsa` is empty. It only appears to `cargo audit`, which scans the
+# raw Cargo.lock; that lock-only false positive is ignored in `audit.toml`, not here.
+ignore = [
+  # RUSTSEC-2025-0134 — rustls-pemfile is unmaintained (a maintenance warning, not a vulnerability).
+  # Used only to parse the broker's server cert/key PEM once at boot (tls.rs load_certs/load_key).
+  # Functional and widely used. Tracked for migration to rustls-pki-types' PEM API; accepted meanwhile.
+  "RUSTSEC-2025-0134",
+]

@@ -1,0 +1,16 @@
+# cargo-audit config for the services workspace. cargo-audit scans the raw Cargo.lock (not the
+# build graph), so it reports advisories on crates that are present in the lock but never compiled.
+# Run: `cargo audit`. See docs/review/round4/dependencies.md for the full rationale.
+[advisories]
+ignore = [
+  # RUSTSEC-2023-0071 — rsa "Marvin Attack" timing side-channel (MEDIUM). `rsa` is an OPTIONAL
+  # dependency of `ssh-key` that this workspace NEVER enables (SSH-CA is ed25519-only). It is a
+  # Cargo.lock artifact, NOT compiled — `cargo tree -i rsa` is empty and `cargo deny` (build-graph)
+  # never sees it — so no RSA operation ever runs and the timing side-channel is unreachable.
+  # Revisit only if an RSA SSH algorithm is ever added.
+  "RUSTSEC-2023-0071",
+  # RUSTSEC-2025-0134 — rustls-pemfile unmaintained (maintenance warning, not a vulnerability).
+  # Used only to parse the broker cert/key PEM at boot (tls.rs); functional. Migration to
+  # rustls-pki-types' PEM API is tracked; accepted meanwhile.
+  "RUSTSEC-2025-0134",
+]
