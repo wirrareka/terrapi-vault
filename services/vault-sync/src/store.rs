@@ -253,9 +253,16 @@ impl Store {
     }
 
     /// Append `ops`, assigning each a fresh per-vault `seq`. Idempotent: an `op_id` already
-    /// stored is skipped (counted as a duplicate). Returns `(accepted, duplicates, latest_seq)`.
-    /// Malformed base64 in a payload aborts the whole batch with `InvalidPayload`.
-    pub fn push_ops(&self, vault_id: &str, ops: &[Op]) -> Result<(u64, u64, u64), PushError> {
+    /// stored is skipped (counted as a duplicate). Returns `(accepted, duplicates, latest_seq,
+    /// stored)` where `stored` is the accepted ops with their assigned `seq` — built in the same
+    /// write transaction, so the live-tail fan-out needs no post-commit re-read (no pooled-reader
+    /// visibility question, no extra query). Malformed base64 in a payload aborts the whole batch
+    /// with `InvalidPayload`.
+    pub fn push_ops(
+        &self,
+        vault_id: &str,
+        ops: &[Op],
+    ) -> Result<(u64, u64, u64, Vec<StoredOp>), PushError> {
         let conn = self.writer.lock().expect("writer lock");
         let tx = conn.unchecked_transaction()?;
         let mut seq: i64 = tx.query_row(
@@ -264,6 +271,7 @@ impl Store {
             |r| r.get(0),
         )?;
         let (mut accepted, mut duplicates) = (0u64, 0u64);
+        let mut stored = Vec::new();
         {
             let mut exists = tx.prepare("SELECT 1 FROM ops WHERE vault_id = ?1 AND op_id = ?2")?;
             let mut insert = tx.prepare(
@@ -293,10 +301,19 @@ impl Store {
                     now,
                 ])?;
                 accepted += 1;
+                stored.push(StoredOp {
+                    seq: u64::try_from(seq).unwrap_or(0),
+                    op: op.clone(),
+                });
             }
         }
         tx.commit()?;
-        Ok((accepted, duplicates, u64::try_from(seq).unwrap_or(0)))
+        Ok((
+            accepted,
+            duplicates,
+            u64::try_from(seq).unwrap_or(0),
+            stored,
+        ))
     }
 
     /// Ops with `seq > since`, ascending, capped at `limit`. Also returns the vault's
@@ -405,11 +422,17 @@ mod tests {
     #[test]
     fn push_assigns_monotonic_seq_and_dedupes() {
         let s = Store::open_memory().unwrap();
-        let (acc, dup, latest) = s.push_ops("v1", &[op("a", 1), op("b", 2)]).unwrap();
+        let (acc, dup, latest, stored) = s.push_ops("v1", &[op("a", 1), op("b", 2)]).unwrap();
         assert_eq!((acc, dup, latest), (2, 0, 2));
+        // push_ops returns exactly the accepted ops with their assigned seq (for tail fan-out).
+        assert_eq!(stored.len(), 2);
+        assert_eq!((stored[0].seq, stored[0].op.op_id.as_str()), (1, "a"));
+        assert_eq!((stored[1].seq, stored[1].op.op_id.as_str()), (2, "b"));
         // Re-pushing "a" plus a new "c": one dup, one accepted, seq advances to 3.
-        let (acc, dup, latest) = s.push_ops("v1", &[op("a", 1), op("c", 3)]).unwrap();
+        let (acc, dup, latest, stored) = s.push_ops("v1", &[op("a", 1), op("c", 3)]).unwrap();
         assert_eq!((acc, dup, latest), (1, 1, 3));
+        assert_eq!(stored.len(), 1); // only the newly-accepted "c", not the duplicate "a"
+        assert_eq!((stored[0].seq, stored[0].op.op_id.as_str()), (3, "c"));
     }
 
     #[test]
@@ -492,7 +515,7 @@ mod tests {
         {
             let s = Store::open(&p, 3, None).unwrap();
             assert_eq!(s.readers.len(), 3);
-            let (acc, _, _) = s.push_ops("v1", &[op("a", 1), op("b", 2)]).unwrap();
+            let (acc, _, _, _) = s.push_ops("v1", &[op("a", 1), op("b", 2)]).unwrap();
             assert_eq!(acc, 2);
             // Read back through the pool (round-robin hits different reader connections).
             for _ in 0..6 {

@@ -536,34 +536,21 @@ async fn push(
             "every op.device_id must equal the calling device",
         ));
     }
-    // One blocking trip: append, then read back exactly this push's newly-stored ops (with
-    // their server `seq`) for the live-tail fan-out. The accepted ops are contiguous and end at
-    // `latest_seq`, so they occupy `(latest_seq - accepted, latest_seq]` — derive the range from
-    // push_ops' own result rather than a separate `latest_seq` read (that read hits a pooled
-    // reader and could be stale under a concurrent same-vault push, re-publishing another push's
-    // ops and/or truncating ours).
+    // Append + get back exactly this push's stored ops (with their assigned `seq`), built in the
+    // same write transaction — no post-commit re-read, so no pooled-reader visibility question.
     let vid = vault_id.clone();
     let ops = req.ops;
-    let (accepted, duplicates, latest_seq, new_ops) = store_op(&state, move |s| {
-        let (accepted, duplicates, latest_seq) = s.push_ops(&vid, &ops)?;
-        let new_ops = if accepted > 0 {
-            let before = latest_seq - accepted; // exclusive lower bound of this push's seqs
-            s.pull_ops(&vid, before, u32::try_from(accepted).unwrap_or(u32::MAX))?
-                .0
-        } else {
-            Vec::new()
-        };
-        Ok::<_, PushError>((accepted, duplicates, latest_seq, new_ops))
-    })
-    .await?
-    .map_err(|e| match e {
-        PushError::InvalidPayload => err(
-            StatusCode::BAD_REQUEST,
-            "bad_payload",
-            "an op payload was not valid base64",
-        ),
-        PushError::Db(d) => db_err(d),
-    })?;
+    let (accepted, duplicates, latest_seq, new_ops) =
+        store_op(&state, move |s| s.push_ops(&vid, &ops))
+            .await?
+            .map_err(|e| match e {
+                PushError::InvalidPayload => err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_payload",
+                    "an op payload was not valid base64",
+                ),
+                PushError::Db(d) => db_err(d),
+            })?;
     state.metrics.add_ops(accepted, duplicates);
     // Fan the newly-stored ops out to live-tail subscribers (best-effort).
     if accepted > 0 {

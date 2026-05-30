@@ -29,11 +29,24 @@ durability gap on the audit path and a worthwhile dedup. No Critical, no round-1
 
 _Verified: clippy -D warnings + fmt clean; broker 38 tests, sync 23 (4 new)._
 
-## R2-P1 — Durability / correctness
-- **R2-4. Audit sink durability** (perf H1): `HashChainSink::emit` does `open()+write_all` per event, synchronously on the async issuance worker under the chain Mutex, and the "durably appended" comment is false — **no `sync_all`**, so the tail record is lost on crash. Fix: a held `BufWriter` drained by a single blocking writer task + an explicit fsync policy.
-- **R2-5. Audit shipper: detect `_bulk` partial failure** (S2-M2): OpenSearch `_bulk` returns 200 with `errors:true`; the cursor advances anyway → events silently never reach the index. Parse `errors`, don't advance on failure.
-- **R2-6. `push_ops` returns the accepted `StoredOp`s** (perf Med): eliminate the post-commit reader read in `push` (it builds the StoredOps it just inserted — no pooled-reader visibility question, no extra query/base64). Supersedes the round-1 `before = latest_seq - accepted` fix cleanly.
-- **R2-7. `creds.issue` TOCTOU orphan** (S2-M3): insert the `CredHandle` before `issue_lease` (or reconcile handle-less leases) so a sweeper firing mid-issue can't orphan a backend user.
+## R2-P1 — Durability / correctness — ✅ DONE 2026-05-30
+- **R2-4. ✅ Audit sink durability**: `HashChainSink` now holds the append handle (one `open`, not
+  per event) and `sync_all` (fsync)s each record to disk; the chain advances only iff `write_all`
+  succeeds (integrity), with best-effort fsync for power-loss durability — the "durably appended"
+  comment is now true. `vault-transport/src/audit.rs`.
+- **R2-5. ✅ Audit shipper detects `_bulk` partial failure**: `bulk_failures()` parses the 200
+  response `errors`/`items[].status`; a per-item failure is now an error so the cursor doesn't
+  advance past unshipped events. The doc `_id` is the chain hash, so the re-ship is **idempotent**
+  (no duplicate docs). `audit_ship.rs` (+ test `bulk_failures_detects_partial_errors`).
+- **R2-6. ✅ `push_ops` returns the accepted `StoredOp`s**: built in the write transaction, so the
+  push handler fan-out needs no post-commit reader read (no visibility question, one fewer query +
+  base64). Supersedes the round-1 `before = latest_seq - accepted` fix. `store.rs`, `http.rs`.
+- **R2-7. ✅ `creds.issue` TOCTOU closed**: the `CredHandle` is now inserted **under the same hold
+  of the leases lock** as `issue_lease` (both sync; the async revoke-on-session-end happens after
+  the guard drops). A sweeper can no longer revoke the lease before its handle exists → no orphaned
+  backend user. Lock order leases→cred_handles is deadlock-free vs. the sweeper. `http.rs`.
+
+_Verified: full tree green — root lib 32 tests, services 83 (broker 39, sync 23, transport 21); clippy -D warnings + fmt clean._
 
 ## R2-P2 — DX + dedup + polish
 - **R2-8. Hoist shared Metrics + hardening middleware into `vault-transport`** behind an optional `axum` feature (arch High): kills the two ~90%-identical `Metrics` structs + twin `concurrency_limit`/`timeout`/`record_metrics`/`reject` + copied `is_uuid_v4_lower`/`now_unix`. Keeps the default build axum-free.

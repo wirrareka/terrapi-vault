@@ -152,6 +152,9 @@ pub struct HashChainSink {
 struct ChainState {
     seq: u64,
     prev: [u8; 32],
+    /// Held append writer (opened once, not per event). `None` if it can't be opened; `emit`
+    /// then retries the open. Keeping it open avoids an `open()` syscall per audit event.
+    file: Option<std::fs::File>,
 }
 
 #[derive(Serialize)]
@@ -220,11 +223,20 @@ impl HashChainSink {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let (seq, prev) = recover_tip(&path);
+        let file = open_append(&path);
         Self {
             path,
-            state: Mutex::new(ChainState { seq, prev }),
+            state: Mutex::new(ChainState { seq, prev, file }),
         }
     }
+}
+
+fn open_append(path: &Path) -> Option<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
 }
 
 /// Recover `(next_seq, last_hash)` from the file; `(0, GENESIS)` if absent/empty. Uses the
@@ -261,16 +273,33 @@ impl AuditSink for HashChainSink {
             return;
         };
         line.push(b'\n');
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
-            // Only advance the chain once the record is durably appended.
-            if f.write_all(&line).is_ok() {
-                st.seq += 1;
-                st.prev = hash;
+        // Reopen if we lost the handle (first open failed, or a prior write errored).
+        if st.file.is_none() {
+            st.file = open_append(&self.path);
+        }
+        // Advance the chain iff the record reached the file. `write_all` with `O_APPEND` is the
+        // integrity point (the bytes are atomically in the file at this seq); `sync_all` (fsync)
+        // then flushes them to the device so the record survives power loss — the audit chain is
+        // the durable source of truth. fsync is best-effort: if it fails the bytes are still in
+        // the file (integrity holds), only durability degrades — we must NOT re-use this seq, so
+        // advance is gated on the write, not the fsync.
+        let wrote = {
+            let Some(file) = st.file.as_mut() else {
+                return;
+            };
+            match file.write_all(&line) {
+                Ok(()) => {
+                    let _ = file.sync_all();
+                    true
+                }
+                Err(_) => false,
             }
+        };
+        if wrote {
+            st.seq += 1;
+            st.prev = hash;
+        } else {
+            st.file = None; // drop a wedged handle; next emit reopens
         }
     }
 }

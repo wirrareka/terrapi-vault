@@ -31,6 +31,11 @@ const MAX_SHIP_BYTES: u64 = 4 * 1024 * 1024;
 /// Max events shipped per tick (a second bound, for many tiny events under the byte cap).
 const MAX_SHIP_ITEMS: usize = 500;
 
+/// One shippable record: `(target_index, doc_id, event_json)`. `doc_id` is the chain record's
+/// hash — a stable, content-derived `_id` so re-shipping a batch (after a partial `_bulk`
+/// failure or a crash) is **idempotent** in OpenSearch (same `_id` overwrites, no duplicates).
+type ShipItem = (String, String, String);
+
 /// Work handed to the background shipper.
 pub struct ShipTask {
     client: reqwest::Client,
@@ -136,11 +141,7 @@ async fn ship_backlog(task: &ShipTask) {
 
 /// Read complete chain lines after byte `from`; return `(index, event_json)` per record and
 /// the new cursor offset (bytes up to and including the last complete line).
-fn read_new_records(
-    chain_path: &PathBuf,
-    from: u64,
-    group: &str,
-) -> Option<(Vec<(String, String)>, u64)> {
+fn read_new_records(chain_path: &PathBuf, from: u64, group: &str) -> Option<(Vec<ShipItem>, u64)> {
     let mut f = std::fs::File::open(chain_path).ok()?;
     let len = f.metadata().ok()?.len();
     // File rotated/truncated below the cursor → re-ship from the start.
@@ -158,7 +159,7 @@ fn read_new_records(
 
 /// Pure backlog parse: split complete (newline-terminated) lines, extract each record's
 /// event + its target index, and compute the new absolute cursor offset.
-fn collect_backlog(buf: &str, from: u64, group: &str) -> (Vec<(String, String)>, u64) {
+fn collect_backlog(buf: &str, from: u64, group: &str) -> (Vec<ShipItem>, u64) {
     let mut items = Vec::new();
     let mut consumed = 0usize; // bytes of complete lines within buf
     for line in buf.split_inclusive('\n') {
@@ -173,18 +174,20 @@ fn collect_backlog(buf: &str, from: u64, group: &str) -> (Vec<(String, String)>,
         if trimmed.is_empty() {
             continue;
         }
-        if let Some((index, event)) = record_to_index_and_event(trimmed, group) {
-            items.push((index, event));
+        if let Some(item) = record_to_ship_item(trimmed, group) {
+            items.push(item);
         }
     }
     (items, from + consumed as u64)
 }
 
-/// Extract the shippable `(index, event_json)` from one chain line. The OpenSearch doc is
-/// the inner B3 `event` (not the chain envelope); the index is derived from the event ts.
-fn record_to_index_and_event(line: &str, group: &str) -> Option<(String, String)> {
+/// Extract the shippable `(index, doc_id, event_json)` from one chain line. The OpenSearch doc
+/// is the inner B3 `event` (not the chain envelope); the index is derived from the event ts and
+/// the `_id` is the chain record's `hash` (stable → idempotent re-ship).
+fn record_to_ship_item(line: &str, group: &str) -> Option<ShipItem> {
     #[derive(serde::Deserialize)]
     struct Rec {
+        hash: String,
         event: Box<serde_json::value::RawValue>,
     }
     #[derive(serde::Deserialize)]
@@ -194,7 +197,7 @@ fn record_to_index_and_event(line: &str, group: &str) -> Option<(String, String)
     let rec: Rec = serde_json::from_str(line).ok()?;
     let event_json = rec.event.get().to_owned();
     let ts: TsOnly = serde_json::from_str(&event_json).ok()?;
-    Some((index_for(group, &ts.ts), event_json))
+    Some((index_for(group, &ts.ts), rec.hash, event_json))
 }
 
 /// `audit-events-{group}-YYYY.MM` from an RFC3339 ts (`YYYY-MM-...`). Falls back to a
@@ -229,21 +232,28 @@ fn restrict(path: &PathBuf) {
 #[cfg(not(unix))]
 fn restrict(_path: &PathBuf) {}
 
-/// Bulk-index `(index, event_json)` items via the OpenSearch `_bulk` NDJSON API.
+/// Bulk-index `(index, _id, event_json)` items via the OpenSearch `_bulk` NDJSON API. The `_id`
+/// is the chain-record hash, so a re-ship (after a partial failure or crash) overwrites rather
+/// than duplicating.
 ///
 /// # Errors
-/// A request failure or a non-success cluster status.
+/// A request failure, a non-success cluster status, **or a per-item failure** (`_bulk` returns
+/// `200` with `errors:true`) — the latter must be an error so the ship cursor does not advance
+/// past events that never made it into the index.
 async fn bulk_ship(
     client: &reqwest::Client,
     base_url: &str,
     user: &str,
     password: &str,
-    items: &[(String, String)],
+    items: &[ShipItem],
 ) -> Result<(), String> {
     use std::fmt::Write as _;
     let mut body = String::with_capacity(items.len() * 256);
-    for (index, event) in items {
-        let _ = writeln!(body, "{{\"index\":{{\"_index\":\"{index}\"}}}}");
+    for (index, id, event) in items {
+        let _ = writeln!(
+            body,
+            "{{\"index\":{{\"_index\":\"{index}\",\"_id\":\"{id}\"}}}}"
+        );
         let _ = writeln!(body, "{event}");
     }
     let resp = client
@@ -254,12 +264,44 @@ async fn bulk_ship(
         .send()
         .await
         .map_err(|e| format!("bulk request: {e}"))?;
-    if !resp.status().is_success() {
-        let code = resp.status();
-        let detail = resp.text().await.unwrap_or_default();
-        return Err(format!("bulk {code}: {detail}"));
+    let code = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !code.is_success() {
+        return Err(format!("bulk {code}: {text}"));
+    }
+    if let Some(failed) = bulk_failures(&text) {
+        return Err(format!(
+            "bulk reported {failed} per-item failure(s) (errors:true)"
+        ));
     }
     Ok(())
+}
+
+/// Inspect a `200` OpenSearch `_bulk` response body. `Some(n)` if it reported `errors:true`
+/// (with `n` = items whose `status >= 300`); `None` if every item succeeded. `_bulk` returns
+/// `200` even on per-item failure, so this is what actually decides success.
+fn bulk_failures(body: &str) -> Option<usize> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("errors").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let n = v
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |items| {
+            items
+                .iter()
+                .filter(|it| {
+                    // each item is `{ "<op>": { "status": <n>, ... } }`
+                    it.as_object()
+                        .and_then(|o| o.values().next())
+                        .and_then(|op| op.get("status"))
+                        .and_then(serde_json::Value::as_u64)
+                        .is_none_or(|s| s >= 300)
+                })
+                .count()
+        });
+    Some(n)
 }
 
 #[cfg(test)]
@@ -291,9 +333,24 @@ mod tests {
         assert_eq!(items[1].0, "audit-events-eu-2026.06");
         // consumed counts only the two newline-terminated lines, offset is absolute
         assert_eq!(consumed, 100 + (l1.len() + 1 + l2.len() + 1) as u64);
+        // the doc _id is the chain hash (stable → idempotent re-ship)
+        assert_eq!(items[0].1, "aa");
+        assert_eq!(items[1].1, "bb");
         // the shipped doc is the inner event, not the chain envelope
-        assert!(items[0].1.contains("\"action\":\"a\""));
-        assert!(!items[0].1.contains("\"seq\""));
+        assert!(items[0].2.contains("\"action\":\"a\""));
+        assert!(!items[0].2.contains("\"seq\""));
+    }
+
+    #[test]
+    fn bulk_failures_detects_partial_errors() {
+        // errors:false → None (full success)
+        let ok = r#"{"took":3,"errors":false,"items":[{"index":{"status":201}}]}"#;
+        assert_eq!(bulk_failures(ok), None);
+        // errors:true with one 201 and one 429 → Some(1)
+        let partial = r#"{"took":3,"errors":true,"items":[{"index":{"status":201}},{"index":{"status":429,"error":{"type":"x"}}}]}"#;
+        assert_eq!(bulk_failures(partial), Some(1));
+        // unparseable → None (caller still treated 200 as success; conservative)
+        assert_eq!(bulk_failures("not json"), None);
     }
 
     #[test]
@@ -345,10 +402,12 @@ mod tests {
         let items = vec![
             (
                 index.clone(),
+                "id-1".to_string(),
                 r#"{"ts":"2026-05-27T00:00:00Z","action":"lease.expire"}"#.to_string(),
             ),
             (
                 index.clone(),
+                "id-2".to_string(),
                 r#"{"ts":"2026-05-27T00:00:01Z","action":"creds.revoke"}"#.to_string(),
             ),
         ];

@@ -522,12 +522,35 @@ async fn creds(
         .await
         .map_err(|e| backend("creds issue", e))?;
 
-    let issued_lease = {
+    // Reserve the lease AND register its revoke handle under one hold of the leases lock (both
+    // ops are synchronous — no await inside). The sweeper takes the leases lock to sweep before
+    // it tears creds down, so it cannot revoke this lease in the gap before its handle exists —
+    // which would otherwise orphan the backend user (teardown would find no handle to revoke).
+    // Lock order here is leases→cred_handles; the sweeper releases leases before taking
+    // cred_handles and teardown never takes leases, so there is no deadlock.
+    let lease_id = {
         let mut eng = state.leases.lock().expect("lease lock");
-        eng.issue_lease(now_unix(), &session_id, ttl, issued.max_ttl_secs, true)
+        match eng.issue_lease(now_unix(), &session_id, ttl, issued.max_ttl_secs, true) {
+            Ok(lease_id) => {
+                state
+                    .cred_handles
+                    .lock()
+                    .expect("cred handles lock")
+                    .insert(
+                        lease_id.clone(),
+                        crate::creds::CredHandle {
+                            role: role.clone(),
+                            username: issued.username.clone(),
+                        },
+                    );
+                Some(lease_id)
+            }
+            Err(_) => None,
+        }
     };
-    let Ok(lease_id) = issued_lease else {
-        // session ended between the active-session check and issue → undo the user
+    let Some(lease_id) = lease_id else {
+        // session ended between the active-session check and issue → undo the user (the leases
+        // lock is already released here, so this async revoke holds no guard).
         let _ = state
             .engines
             .get(&role)
@@ -540,18 +563,6 @@ async fn creds(
             "the operator session has ended",
         ));
     };
-
-    state
-        .cred_handles
-        .lock()
-        .expect("cred handles lock")
-        .insert(
-            lease_id.clone(),
-            crate::creds::CredHandle {
-                role: role.clone(),
-                username: issued.username.clone(),
-            },
-        );
 
     state.emit(&AuditEvent::vault(
         AppState::now_ts(),
