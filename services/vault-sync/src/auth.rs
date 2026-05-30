@@ -112,8 +112,18 @@ pub struct SignedHeaders {
 }
 
 /// In-memory replay guard: remembers `(device_id, nonce)` it has seen and rejects repeats.
-/// Entries older than the skew window are pruned (after the window a stale `ts` is rejected
-/// anyway, so the nonce can be forgotten). Adequate for a single personal server.
+/// Entries older than [`NONCE_RETENTION_SECS`] are pruned (a stale `ts` is rejected by the
+/// skew check anyway).
+///
+/// **Deliberately not persisted across restarts.** A restart re-opens a `≤ MAX_SKEW_SECS`
+/// window in which a captured request could be replayed past the skew check — but in this API
+/// a successful replay is **harmless**: every op is idempotent or read-only. A replayed `push`
+/// re-sends the same ops and is deduped on `op_id` (no state change); `pull`/`status`/`tail`
+/// are read-only and their payloads are E2E ciphertext the replayer can't decrypt and already
+/// observed; a replayed `account` → `409`, a replayed `enroll` re-registers the same pubkey
+/// (`INSERT OR REPLACE`). So the guard is defense-in-depth / noise reduction, and persisting it
+/// (a DB write per request + Store coupling) would protect a non-threat. Revisit only if a
+/// non-idempotent, state-mutating op is ever added.
 #[derive(Default)]
 pub struct ReplayGuard {
     seen: Mutex<HashMap<String, i64>>,
