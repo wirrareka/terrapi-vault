@@ -686,7 +686,8 @@ async fn kms_preflight(
     tenant_id: &str,
     key_id: &str,
 ) -> Result<std::sync::Arc<std::sync::Mutex<terrapi_vault::Vault>>, (StatusCode, Json<ErrorBody>)> {
-    kms_authorize(state, principal, headers, tenant_id).await?;
+    // Cheap, local checks first so a sealed broker or a malformed tenant/key_id fails fast —
+    // without triggering the JWT path's outbound JWKS round-trip to identity (DoS hardening).
     require_unsealed(state)?;
     if !is_uuid_v4_lower(tenant_id) {
         return Err(err(
@@ -702,6 +703,8 @@ async fn kms_preflight(
             "key_id must be 1-128 chars of [A-Za-z0-9._-]",
         ));
     }
+    // Authorize last — the JWT path (when configured) may hit identity's JWKS over the network.
+    kms_authorize(state, principal, headers, tenant_id).await?;
     state.store.clone().ok_or_else(|| {
         err(
             StatusCode::SERVICE_UNAVAILABLE,

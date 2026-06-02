@@ -22,7 +22,20 @@ use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Minimum spacing between JWKS (re)fetches. On a `kid` miss the cache refetches at most this
+/// often — so a flood of tokens bearing random/unknown `kid`s cannot amplify 1:1 into outbound
+/// fetches against identity's JWKS endpoint. A genuinely rotated signing key is therefore picked
+/// up within this bound (identity's kid-rotation overlap must outlast it — see `jwt-claims.md`).
+const MIN_JWKS_REFETCH: Duration = Duration::from_secs(30);
+
+/// Cached JWKS + the last (attempted) fetch time, so refetch-on-miss can be rate-limited.
+#[derive(Default)]
+struct JwksCache {
+    set: Option<JwkSet>,
+    last_fetch: Option<Instant>,
+}
 
 /// Why a kms bearer token was rejected. Mapped to HTTP status by the handler (`http::map_jwt_err`).
 #[derive(Debug, thiserror::Error)]
@@ -82,7 +95,8 @@ fn check_claims(claims: &Claims, expected_group: &str) -> Result<VerifiedKms, Jw
 }
 
 /// Verifies identity-minted ES256 kms-cap tokens. Holds a cached JWKS (by the whole set;
-/// `find(kid)` per call) refetched on a `kid` miss. One per broker instance (`AppState`).
+/// `find(kid)` per call); a `kid` miss refetches, but no more often than [`MIN_JWKS_REFETCH`]
+/// so unknown-`kid` floods can't amplify into per-request fetches. One per broker (`AppState`).
 pub struct JwtVerifier {
     issuer: String,
     audience: String,
@@ -90,7 +104,7 @@ pub struct JwtVerifier {
     /// Explicit JWKS URL override (`VAULT_KMS_JWT_JWKS_URI`); else discovered from the issuer.
     jwks_uri: Option<String>,
     http: reqwest::Client,
-    cache: Mutex<Option<JwkSet>>,
+    cache: Mutex<JwksCache>,
 }
 
 impl JwtVerifier {
@@ -113,7 +127,7 @@ impl JwtVerifier {
             expected_group,
             jwks_uri,
             http,
-            cache: Mutex::new(None),
+            cache: Mutex::new(JwksCache::default()),
         }
     }
 
@@ -142,25 +156,38 @@ impl JwtVerifier {
         check_claims(&data.claims, &self.expected_group)
     }
 
-    /// A `DecodingKey` for `kid` from the cached JWKS, refetching once on a miss (key rotation).
+    /// A `DecodingKey` for `kid` from the cached JWKS. A miss refetches (a signing key may have
+    /// rotated), but at most once per [`MIN_JWKS_REFETCH`]: within that window an unknown `kid`
+    /// returns `UnknownKid` WITHOUT a fetch, so a flood of bogus `kid`s can't drive one outbound
+    /// JWKS call per request against identity.
     async fn key_for(&self, kid: &str) -> Result<DecodingKey, JwtError> {
-        // Fast path: a cached set containing the kid. Guard dropped before any await.
+        // Fast path + refetch throttle. Guard dropped before any await.
         {
             let cache = self.cache.lock().expect("jwks cache lock");
-            if let Some(set) = cache.as_ref() {
+            if let Some(set) = cache.set.as_ref() {
                 if let Some(jwk) = set.find(kid) {
                     return DecodingKey::from_jwk(jwk).map_err(|e| JwtError::Jwks(e.to_string()));
                 }
             }
+            // Miss: only refetch if we haven't fetched within the throttle window.
+            if let Some(last) = cache.last_fetch {
+                if last.elapsed() < MIN_JWKS_REFETCH {
+                    return Err(JwtError::UnknownKid);
+                }
+            }
         }
-        // Miss: refetch (identity may have rotated its signing key), then look up once more.
-        let set = self.fetch_jwks().await?;
-        let result = match set.find(kid) {
+        // Refetch (identity may have rotated its signing key), then look up once more.
+        let fetched = self.fetch_jwks().await;
+        let mut cache = self.cache.lock().expect("jwks cache lock");
+        // Stamp the attempt even on failure, so a down/slow JWKS endpoint is also rate-limited.
+        cache.last_fetch = Some(Instant::now());
+        let set = fetched?;
+        let key = match set.find(kid) {
             Some(jwk) => DecodingKey::from_jwk(jwk).map_err(|e| JwtError::Jwks(e.to_string())),
             None => Err(JwtError::UnknownKid),
         };
-        *self.cache.lock().expect("jwks cache lock") = Some(set);
-        result
+        cache.set = Some(set);
+        key
     }
 
     async fn fetch_jwks(&self) -> Result<JwkSet, JwtError> {
@@ -284,5 +311,53 @@ mod tests {
             .encode(br#"{"alg":"ES256","typ":"JWT"}"#);
         let token = format!("{header}.e30.c2ln");
         assert!(matches!(v.verify(&token).await, Err(JwtError::Header(_))));
+    }
+
+    /// A flood of tokens with unknown `kid`s must NOT trigger one JWKS fetch per request:
+    /// after the first refetch, further misses are throttled (DoS hardening).
+    #[tokio::test]
+    async fn unknown_kid_flood_is_rate_limited() {
+        use axum::routing::get;
+        use axum::Json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/jwks",
+            get({
+                let hits = hits.clone();
+                move || {
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "keys": [] }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let v = JwtVerifier::new(
+            "https://identity.eu.proximi.fi/".into(),
+            "vault".into(),
+            "eu".into(),
+            Some(format!("http://{addr}/jwks")), // explicit jwks_uri → no discovery hop
+        );
+        // Valid ES256 header with an unknown kid; signature/claims are never reached (kid misses).
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"ES256","typ":"JWT","kid":"nope"}"#);
+        let token = format!("{header}.e30.c2ln");
+        assert!(matches!(v.verify(&token).await, Err(JwtError::UnknownKid)));
+        assert!(matches!(v.verify(&token).await, Err(JwtError::UnknownKid)));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "second unknown-kid must be throttled, not a second JWKS fetch"
+        );
     }
 }

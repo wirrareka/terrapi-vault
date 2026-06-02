@@ -3,6 +3,19 @@
 terrapi-vault — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
+## Unreleased
+
+KMS hardening from a high-effort code review of the v0.1.4 chain:
+- **JWKS refetch is now rate-limited (`jwt.rs`).** A `kid` miss refetches at most once per
+  `MIN_JWKS_REFETCH` (30 s); within that window an unknown `kid` returns `UnknownKid` WITHOUT a
+  fetch. Previously every token bearing a random/unknown `kid` drove one outbound JWKS call (plus
+  an OIDC-discovery GET) against identity — a request-amplification DoS. A down/slow JWKS endpoint
+  is rate-limited too (the attempt is stamped even on failure).
+- **kms preflight fails fast (`http.rs`).** `require_unsealed` + the tenant/key_id format checks
+  now run BEFORE `kms_authorize`, so a sealed broker (or a malformed request) returns `503`/`400`
+  without triggering the JWT path's network JWKS round-trip — a sealed broker is no longer an
+  amplifier.
+
 ## 0.1.4 (2026-06-02)
 
 KMS root-of-trust chain (identity ↔ vault) — vault's side, LOCKED 2026-06-02
