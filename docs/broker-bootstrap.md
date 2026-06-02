@@ -115,3 +115,30 @@ broker start  ─┬─ operator enters unseal passphrase (Argon2id → master k
                └─ bind 8200 on WG addr, require mTLS (Root CA trust anchor)
 demon → broker ── mTLS (client cert) → open session → lease short-TTL creds
 ```
+
+## KMS root-of-trust go-live (arm a + b)
+
+Both arms ship **gated off**; turning them on in eu is an operator + cross-service step.
+Vault needs **no code change** — the broker already reads `VAULT_TLS_*` for both its server cert
+and the KMS client. Order:
+
+1. **Adopt the dot-form cert (operator, on the broker host).** Infra issued
+   `vault.eu.proximi.internal.{pem,key}` (RSA4096, **serverAuth + clientAuth**, SAN +IP, fleet-CA
+   signed; staged `~/kms-eu/`). Place it in the vault-eu jail (`vault:vault`, key `0600`) and point
+   `VAULT_TLS_CERT`/`VAULT_TLS_KEY` at it — this becomes BOTH the broker server cert (retiring the
+   dash-form `vault-eu.proximi.internal`) and the arm (a) KMS client cert. `VAULT_TLS_CLIENT_CA`
+   stays the fleet Root CA. Demon broker-clients already pin the dot form, so no peer break.
+2. **Arm (b) — kms-cred verify (independent of the mTLS listener).** Identity flips
+   `kms.mint_enabled` in eu + provisions the Vulture KMS workload client, then sends a sample
+   `kms`-scoped token + the JWKS `kid` set. Set `VAULT_KMS_JWT_ISSUER=https://identity.eu.proximi.fi/`
+   and run the sample token through the verifier (round-trip). Until then leave it unset (kms stays
+   cap-based).
+3. **Arm (a) — master-key seal/unseal.** Infra provisions identity's per-group root key
+   (`kek_id=eu-2026a`) + identity enables the `:8202` native-mTLS listener (`kms.enabled`). Then on
+   the broker: set `VAULT_IDENTITY_KMS_URL=https://10.200.0.100:8202`, run **once** with
+   `VAULT_KMS_SEAL_INIT=1` to seal the current passphrase → writes `sealed-master.json`; unset the
+   flag. Subsequent boots unseal via identity (manual passphrase stays break-glass). Do a
+   seal→unseal round-trip in eu with infra/identity before relying on it.
+4. **Rotation (later, joint).** `kms.master_resealed` + the boot/timer re-seal ship in the broker;
+   identity's previous-root overlap window + the signal consumer are its fast-follow — land them
+   together before the first root rotation.
