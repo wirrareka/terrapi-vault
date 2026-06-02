@@ -376,8 +376,8 @@ aether fleet-mode backup keys; preserves their zero-knowledge model (KEK never l
   for aether Ask 2), cap `snapshot`.
 - **Metrics** — `127.0.0.1:8201/metrics` Prometheus text (per-action audit counters +
   `vault_sealed` gauge), loopback-only.
-- **Unattended unseal** — `VAULT_UNSEAL_PASSPHRASE_FILE` (mode-600 fallback). Full
-  broker-master-key KMS-wrap stays deferred (needs a per-group KMS that doesn't exist yet).
+- **Unattended unseal** — `VAULT_UNSEAL_PASSPHRASE_FILE` (mode-600 fallback). Broker-master-key
+  KMS-wrap now lands as the KMS root-of-trust arm (a) — see the status entry below.
 
 **FreeBSD deploy module — DONE:** `deploy/` mirrors `identity/deploy/` — `build.sh`,
 `jail/{Bastillefile,provision.sh}` (bastille vnet jail per group), `rc.d/vault-broker`
@@ -396,6 +396,24 @@ limits are env-tunable (`VAULT_{MAX_BODY_BYTES,REQUEST_TIMEOUT_SECS,MAX_CONCURRE
 with safe defaults — no deploy change required. Zero new crates (axum `DefaultBodyLimit` +
 `middleware::from_fn` + std/tokio). Uniform JSON `404` fallback for unrouted paths.
 
+**KMS root-of-trust chain (identity ↔ vault) — vault side DONE 2026-06-02 (broker API 1.1.0).**
+The chain locked with identity (`coordination/conventions/secrets-broker.md §KMS root-of-trust`);
+vault's three pieces shipped + tested (gated off until identity/infra enable their side):
+- **Option J — kms-cap JWT verify (`jwt.rs`):** per-call ES256 verify of identity-minted
+  workload creds against the issuer's JWKS (cached, refetched on a `kid` miss); enforces
+  `iss`/`aud="vault"`/`exp`/`scope ⊇ kms`/`residency_group == instance`/`tenant_id == path`.
+  Opt-in `VAULT_KMS_JWT_ISSUER`; unset ⇒ kms stays cap-based (aether unchanged).
+- **`kms.rewrap` (`POST …/kms/{key_id}/rewrap`):** server-side re-wrap onto the current KEK
+  version (plaintext DEK never leaves the broker) for the ack-gated rotation flow.
+- **Arm (a) — identity-sealed master key (`identity_kms.rs`):** at boot the broker exchanges
+  a stored `{kek_id, wrapped}` blob for its master key via identity's native-mTLS KMS listener
+  (`POST /kms/v1/{seal,unseal}`), auth = the broker's own `VAULT_TLS_*` client cert (the
+  dot-form `vault.<group>.proximi.internal`); manual passphrase = break-glass fallback. Opt-in
+  `VAULT_IDENTITY_KMS_URL`; one-time bootstrap `VAULT_KMS_SEAL_INIT=1`. Worklog:
+  `docs/worklog/2026-06-02-kms-root-of-trust.md`.
+- **Pending (not vault code):** adopt the infra-issued dot-form cert as `VAULT_TLS_*` +
+  eu seal→unseal round-trip; identity enables arm (b) mint (`/kms/v1/workload-cred`) for the
+  live JWT round-trip; vault `kms.rewrap_complete` emit lands with KEK rotation.
+
 **Next:** additional `CredEngine` adapters for any *modern* datastore that needs brokered
-creds (RethinkDB is out); broker-master-key KMS-wrap for unattended unseal once a KMS
-exists; `vault-sync` (Svet B).
+creds (RethinkDB is out); `kms.rewrap_complete` emit + KEK rotation flow; `vault-sync` (Svet B).

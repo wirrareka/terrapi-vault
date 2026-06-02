@@ -24,7 +24,17 @@ The broker stores its CA keys + lease state in an at-rest encrypted store (the
 - **Unattended restart fallback:** the passphrase comes from an `rc.conf`-managed secret
   / env file on a **ZFS-encrypted dataset** (host root can read it — documented
   trade-off; acceptable because the dataset is encrypted and the host is WG-isolated).
-- **Phase 4 — KMS-wrap** once a per-group KMS exists. Not required for v1.
+- **Arm (a) — identity-sealed master key (implemented, `identity_kms.rs`; opt-in):** when
+  `VAULT_IDENTITY_KMS_URL` is set the broker no longer relies on a local passphrase alone —
+  at boot it exchanges an inert `{kek_id, wrapped}` blob (stored on the encrypted dataset) for
+  the plaintext master key via identity's WG-only **native-mTLS** KMS listener
+  (`POST /kms/v1/unseal`). A stolen at-rest store is then useless without a live,
+  residency-matched call to identity (the per-group root key never leaves identity). Auth is
+  **mTLS**: the broker presents its own `VAULT_TLS_*` client cert (the dot-form
+  `vault.<group>.proximi.internal`, clientAuth EKU); there is no application-layer secret. If
+  identity is unreachable the broker falls back to the manual passphrase (**break-glass**).
+  One-time bootstrap: `VAULT_KMS_SEAL_INIT=1` seals the current passphrase and writes the blob.
+  See `coordination/conventions/secrets-broker.md §KMS root-of-trust`.
 
 No TPM is involved. Security rests on: FreeBSD file perms (`mode 600`, dedicated user),
 ZFS dataset encryption, and WG isolation.
@@ -45,10 +55,23 @@ ZFS dataset encryption, and WG isolation.
   against it, and the peer DNS-SAN maps to a broker role. All three TLS vars are
   **mandatory in production** — the broker refuses to start without them.
 - `VAULT_ROLES_CONFIG` — JSON file mapping each cert's first SAN `dNSName` → `{role, caps}`
-  (capabilities: `ssh-ca`, `ssh-sign`, `creds`, `session`, `leases`). Drives both the
-  SAN→role match and per-role least-privilege authorization. **Required in production** —
-  unset/empty means every verified cert is trusted-but-unauthorised (`403`). Sample:
+  (capabilities: `ssh-ca`, `ssh-sign`, `creds`, `session`, `leases`, `kms`, `snapshot`). Drives
+  both the SAN→role match and per-role least-privilege authorization. **Required in production**
+  — unset/empty means every verified cert is trusted-but-unauthorised (`403`). Sample:
   `docs/dev/roles.example.json`.
+- **KMS-cap auth (Option J, optional)** — `VAULT_KMS_JWT_ISSUER` enables an identity-minted
+  ES256 bearer JWT as the per-call proof of the `kms` cap, **on top of** mTLS (the JWT carries
+  the cap; the channel still authenticates). Verifies the issuer's JWKS (OIDC-discovered, or
+  `VAULT_KMS_JWT_JWKS_URI`), `aud` (`VAULT_KMS_JWT_AUDIENCE`, default `vault`), `exp`,
+  `scope ⊇ kms`, `residency_group ==` this instance's group, and `tenant_id ==` the request
+  path tenant. **Unset ⇒ kms ops stay cap-based** (cert-SAN `kms` capability — the aether
+  fleet-backup path; unchanged).
+- **Arm (a) identity-sealed master key (optional, see Broker unseal above)** —
+  `VAULT_IDENTITY_KMS_URL` (identity's WG-only native-mTLS KMS listener, e.g.
+  `https://10.200.0.100:8202`) enables boot-time unseal via identity; auth reuses the broker's
+  `VAULT_TLS_*` client cert (must be the dot-form clientAuth cert). `VAULT_SEALED_MASTER_FILE`
+  (default: next to the store) holds the inert `{kek_id, wrapped}` blob. `VAULT_KMS_SEAL_INIT=1`
+  is the one-time bootstrap that seals the current passphrase. Unset ⇒ manual passphrase only.
 - `VAULT_AUDIT_PATH` — durable local B3 audit store (source of truth): a **tamper-evident
   hash-chained** append-only JSONL (each record SHA-256-chained to the previous; edits,
   reorders, and deletions are detectable).
