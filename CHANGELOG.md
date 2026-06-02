@@ -3,7 +3,7 @@
 terrapi-vault — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
-## Unreleased
+## 0.1.5 (2026-06-03)
 
 KMS hardening from a high-effort code review of the v0.1.4 chain:
 - **JWKS refetch is now rate-limited (`jwt.rs`).** A `kid` miss refetches at most once per
