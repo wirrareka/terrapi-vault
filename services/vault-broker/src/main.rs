@@ -17,6 +17,7 @@ mod creds;
 mod dto;
 mod hardening;
 mod http;
+mod identity_kms;
 mod jwt;
 mod kms;
 mod opensearch;
@@ -36,15 +37,16 @@ use terrapi_vault::{KdfParams, Vault};
 const SWEEP_INTERVAL_SECS: u64 = 30;
 
 /// Attempt a boot-time unseal: open the at-rest store and load the group's SSH CA. Dev
-/// mode auto-unseals (ephemeral store); production requires `VAULT_UNSEAL_PASSPHRASE`. A
-/// failed/absent unseal is non-fatal: the broker starts SEALED and mutating ops `503`
-/// until it is restarted with a valid passphrase.
-fn boot_unseal(cfg: &BrokerConfig) -> Option<Unsealed> {
+/// mode auto-unseals (ephemeral store); production obtains the unseal passphrase via
+/// [`obtain_unseal_passphrase`] (identity arm (a) if configured, else the manual passphrase).
+/// A failed/absent unseal is non-fatal: the broker starts SEALED and mutating ops `503`
+/// until it is restarted with a working unseal path.
+async fn boot_unseal(cfg: &BrokerConfig) -> Option<Unsealed> {
     let store = if cfg.allow_insecure_dev {
         seal::unseal_dev()
     } else {
-        let Some(p) = unseal_passphrase() else {
-            eprintln!("vault-broker: no VAULT_UNSEAL_PASSPHRASE[_FILE]; starting SEALED");
+        let Some(p) = obtain_unseal_passphrase(cfg).await else {
+            eprintln!("vault-broker: no unseal passphrase (identity arm (a) and manual both unavailable); starting SEALED");
             return None;
         };
         seal::unseal(&cfg.store_path, &p, KdfParams::default())
@@ -57,6 +59,87 @@ fn boot_unseal(cfg: &BrokerConfig) -> Option<Unsealed> {
         }
     };
     load_ca(store, cfg.residency_group.as_str())
+}
+
+/// The unseal passphrase, via arm (a) (identity-sealed master key) when configured, else the
+/// manual passphrase. Arm (a) (secrets-broker.md §KMS root-of-trust): the broker stores an
+/// inert `{kek_id, wrapped}` blob and exchanges it for the plaintext master key at identity's
+/// KMS listener, so a stolen at-rest store is useless without a live in-group call to identity.
+/// If identity is unreachable (or the blob is missing) the broker falls back to the manual
+/// passphrase — **break-glass**, as agreed, until arm (a) has run a prod cycle.
+///
+/// One-time bootstrap: with `VAULT_KMS_SEAL_INIT=1` the broker seals the *current* manual
+/// passphrase under identity, persists the returned blob, and boots with it — run once, then
+/// unset the flag.
+async fn obtain_unseal_passphrase(cfg: &BrokerConfig) -> Option<String> {
+    let Some(k) = &cfg.identity_kms else {
+        return unseal_passphrase(); // arm (a) not configured → manual passphrase
+    };
+    let client = identity_kms::IdentityKmsClient::new(k.url.clone(), k.auth_secret.clone());
+
+    if std::env::var("VAULT_KMS_SEAL_INIT").as_deref() == Ok("1") {
+        return seal_init(&client, k).await;
+    }
+
+    let Some(blob) = identity_kms::load_sealed(&k.sealed_master_file) else {
+        eprintln!(
+            "vault-broker: arm (a) configured but no sealed-master blob at {} — using manual passphrase (run once with VAULT_KMS_SEAL_INIT=1 to seal it)",
+            k.sealed_master_file.display()
+        );
+        return unseal_passphrase();
+    };
+    let master = match client.unseal(&blob).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("vault-broker: identity unseal FAILED ({e}); falling back to break-glass passphrase");
+            return unseal_passphrase();
+        }
+    };
+    if let Ok(p) = String::from_utf8(master) {
+        eprintln!(
+            "vault-broker: unsealed via identity arm (a) (kek_id={})",
+            blob.kek_id
+        );
+        Some(p)
+    } else {
+        eprintln!("vault-broker: identity returned a non-UTF8 master; falling back to break-glass passphrase");
+        unseal_passphrase()
+    }
+}
+
+/// One-time arm (a) bootstrap: seal the current manual passphrase under identity's per-group
+/// root and persist the inert blob, then return that passphrase so this boot proceeds normally.
+async fn seal_init(
+    client: &identity_kms::IdentityKmsClient,
+    k: &config::IdentityKmsConfig,
+) -> Option<String> {
+    let Some(p) = unseal_passphrase() else {
+        eprintln!(
+            "vault-broker: VAULT_KMS_SEAL_INIT=1 but no manual passphrase to seal; starting SEALED"
+        );
+        return None;
+    };
+    match client.seal(p.as_bytes()).await {
+        Ok(sealed) => {
+            if let Err(e) = identity_kms::store_sealed(&k.sealed_master_file, &sealed) {
+                eprintln!(
+                    "vault-broker: SEAL_INIT sealed the master under identity but FAILED to persist {} ({e}); fix perms + retry, NOT booting sealed-by-identity",
+                    k.sealed_master_file.display()
+                );
+                return None;
+            }
+            eprintln!(
+                "vault-broker: SEAL_INIT ok — master sealed under identity (kek_id={}); wrote {}. Unset VAULT_KMS_SEAL_INIT for subsequent boots.",
+                sealed.kek_id,
+                k.sealed_master_file.display()
+            );
+            Some(p)
+        }
+        Err(e) => {
+            eprintln!("vault-broker: SEAL_INIT seal call FAILED ({e}); starting SEALED");
+            None
+        }
+    }
 }
 
 /// The operator unseal passphrase, from `VAULT_UNSEAL_PASSPHRASE` or, for unattended
@@ -151,7 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.audit_path.display(),
     );
 
-    let seal = boot_unseal(&cfg);
+    let seal = boot_unseal(&cfg).await;
     let bind = cfg.bind;
     let allow_insecure_dev = cfg.allow_insecure_dev;
     let tls = cfg.tls.clone();

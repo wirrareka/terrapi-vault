@@ -1109,6 +1109,7 @@ mod tests {
             allow_insecure_dev: true,
             tls: None,
             kms_jwt: None,
+            identity_kms: None,
         };
         AppState::new(cfg, None, Arc::new(NullSink))
     }
@@ -1132,6 +1133,7 @@ mod tests {
             allow_insecure_dev: false,
             tls: None,
             kms_jwt: None,
+            identity_kms: None,
         };
         AppState::new(cfg, None, Arc::new(NullSink))
     }

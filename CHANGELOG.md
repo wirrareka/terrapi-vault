@@ -18,9 +18,15 @@ KMS root-of-trust chain (identity ↔ vault) — vault's side, LOCKED 2026-06-02
   unwrap under the blob's embedded KEK version, re-wrap under the current version; the
   plaintext DEK never leaves the broker. Drives the ack-gated re-wrap flow (consumer streams
   blobs → emits `kms.rewrap_complete` so identity retires the old root).
-- **Still scheduled (blocked on identity's not-yet-built root endpoints):** arm (a)
-  identity-seal unseal client (`POST {identity}/kms/v1/unseal`, `kms-unseal` mTLS role) and
-  the `kms.rewrap_complete` emit — wired once identity specs the req/resp.
+- **arm (a) — identity-sealed master key (unseal client).** New `identity_kms` module: at
+  boot the broker exchanges an inert `{kek_id, wrapped}` blob for its plaintext unseal master
+  key via identity's WG-only KMS listener (`POST /kms/v1/{seal,unseal}`, `X-Kms-Auth` boundary
+  secret), so a stolen at-rest store is useless without a live in-group call to identity. Falls
+  back to the manual passphrase (break-glass) when identity is unreachable. Opt-in via
+  `VAULT_IDENTITY_KMS_URL`; one-time bootstrap with `VAULT_KMS_SEAL_INIT=1`. Ships gated off
+  until infra stands up the WG mTLS terminator + per-group root key.
+- **Still scheduled:** the `kms.rewrap_complete` emit (ack-gated retire signal) — wired when
+  KEK rotation lands; identity's previous-root overlap window is its fast-follow on that.
 
 ## 0.1.3
 
