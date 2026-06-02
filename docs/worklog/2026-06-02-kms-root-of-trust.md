@@ -66,8 +66,29 @@ round-trip, absent file), sync 23, transport 21, lib 38+5+2. `clippy --all-targe
 clean. The real mTLS handshake + the live JWT round-trip are integration steps (eu), gated on
 identity/infra enablement — see the contract.
 
+## Follow-up — root-rotation handling + `kms.master_resealed` (DONE, same day)
+
+After a design round with identity (`inbox/identity/vault-kms-root-rotation-sequence.md`) that
+caught a contract conflation — "re-wrap master + ~150 DEKs" mixed (1) identity ROOT rotation
+(vault re-seals its **master key only**; KEKs + consumer DEK blobs are under the master, unchanged)
+with (2) vault's own KEK rotation (`kms.rotate`/`kms.rewrap`, identity-uninvolved) — the rotation
+handling shipped:
+- `identity_kms`: unseal response gains `current_kek_id` + `reseal_required` (serde-default →
+  back-compat with pre-rotation identity); `store_sealed` is now an atomic temp+rename swap.
+- `main`: `unseal_and_maybe_reseal` re-seals the master under the current root + persists when
+  identity signals `reseal_required` (+ a sanity-check that the sealed kek_id matches the
+  advertised current); `emit_master_resealed` emits B3 `kms.master_resealed
+  {old_kek_id→new_kek_id}` (at-least-once; identity dedups by `{old,new}`); handled at boot AND in
+  a `reseal_watch` timer task (`VAULT_KMS_RESEAL_CHECK_SECS`, default 6 h) for a broker running
+  across a rotation without restart. Identity's overlap window (current+previous root) is what
+  lets the boot unseal-with-old succeed so vault can re-seal-under-new (7-day auto-retire backstop).
+- Renamed from the contract's `kms.rewrap_complete` → **`kms.master_resealed`** (accurate: no DEK
+  re-wrap on root rotation). identity fixed the CONTRACTS "~150 DEKs" wording.
+- Tests: +1 (`unseal_signals_reseal_after_root_rotation`) → broker **52**.
+
 ## Pending (not vault code)
 
 Adopt the infra-issued dot-form cert `vault.eu.proximi.internal` (clientAuth) as `VAULT_TLS_*`
 + eu seal→unseal round-trip; identity enables arm (b) mint (`/kms/v1/workload-cred`, principal-
-gated) for the live kms-cred verify; `kms.rewrap_complete` emit lands with KEK rotation.
+gated) for the live kms-cred verify; identity wires its side of the overlap window +
+`kms.master_resealed` consumer (the fast-follow, landed together when we go live).

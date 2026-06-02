@@ -63,6 +63,22 @@ struct UnsealRequest<'a> {
 #[derive(Deserialize)]
 struct UnsealResponse {
     master_key_b64: String,
+    // Root-rotation fields (identity adds these for the re-seal flow); absent on older identity
+    // builds → serde defaults to None/false (no re-seal), so the client stays back-compatible.
+    #[serde(default)]
+    current_kek_id: Option<String>,
+    #[serde(default)]
+    reseal_required: bool,
+}
+
+/// Result of an `unseal`: the plaintext master key plus identity's view of the current root.
+/// `reseal_required` (= the sealed blob is under a now-previous root) drives the root-rotation
+/// re-seal; `current_kek_id` is the root to re-seal under. Both are absent (None/false) against
+/// a pre-rotation identity build.
+pub struct UnsealOutcome {
+    pub master_key: Vec<u8>,
+    pub current_kek_id: Option<String>,
+    pub reseal_required: bool,
 }
 
 /// Client for identity's `POST /kms/v1/{seal,unseal}`. One per broker; used only at boot.
@@ -139,14 +155,20 @@ impl IdentityKmsClient {
     /// # Errors
     /// [`Error`] on a transport failure, non-2xx status (e.g. a retired `kek_id` → 400), or a
     /// malformed / non-base64 response.
-    pub async fn unseal(&self, sealed: &SealedMaster) -> Result<Vec<u8>, Error> {
+    pub async fn unseal(&self, sealed: &SealedMaster) -> Result<UnsealOutcome, Error> {
         let body = UnsealRequest {
             kek_id: &sealed.kek_id,
             wrapped: &sealed.wrapped,
         };
         let resp: UnsealResponse = self.post("/kms/v1/unseal", &body).await?;
-        B64.decode(resp.master_key_b64.as_bytes())
-            .map_err(|e| Error::Decode(e.to_string()))
+        let master_key = B64
+            .decode(resp.master_key_b64.as_bytes())
+            .map_err(|e| Error::Decode(e.to_string()))?;
+        Ok(UnsealOutcome {
+            master_key,
+            current_kek_id: resp.current_kek_id,
+            reseal_required: resp.reseal_required,
+        })
     }
 
     async fn post<B, R>(&self, path: &str, body: &B) -> Result<R, Error>
@@ -187,8 +209,14 @@ pub fn load_sealed(path: &Path) -> Option<SealedMaster> {
 pub fn store_sealed(path: &Path, sealed: &SealedMaster) -> std::io::Result<()> {
     let json = serde_json::to_vec_pretty(sealed)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, &json)?;
-    set_owner_only(path)?;
+    // Atomic swap: write a sibling temp (0600), then rename over the target — so a crash mid-write
+    // (e.g. during a root-rotation re-seal) can never leave a torn/half-written blob at `path`.
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    std::fs::write(&tmp, &json)?;
+    set_owner_only(&tmp)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -243,8 +271,44 @@ mod tests {
         let client = IdentityKmsClient::from_parts(url, reqwest::Client::new());
         let sealed = client.seal(b"correct horse battery staple").await.unwrap();
         assert_eq!(sealed.kek_id, "eu-2026a");
-        let master = client.unseal(&sealed).await.unwrap();
-        assert_eq!(master, b"correct horse battery staple");
+        let out = client.unseal(&sealed).await.unwrap();
+        assert_eq!(out.master_key, b"correct horse battery staple");
+        // mock omits the rotation fields → back-compat defaults (no re-seal).
+        assert!(!out.reseal_required);
+        assert_eq!(out.current_kek_id, None);
+    }
+
+    // identity signals a root rotation: the unseal response carries current_kek_id +
+    // reseal_required for a blob sealed under a now-previous root.
+    #[tokio::test]
+    async fn unseal_signals_reseal_after_root_rotation() {
+        async fn unseal_rot(Json(req): Json<Value>) -> Json<Value> {
+            let w = req["wrapped"].as_str().unwrap_or_default().to_owned();
+            let requested = req["kek_id"].as_str().unwrap_or_default();
+            Json(json!({
+                "master_key_b64": w,
+                "current_kek_id": "eu-2026b",
+                "reseal_required": requested != "eu-2026b",
+            }))
+        }
+        let app = Router::new().route("/kms/v1/unseal", post(unseal_rot));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client =
+            IdentityKmsClient::from_parts(format!("http://{addr}"), reqwest::Client::new());
+        let out = client
+            .unseal(&SealedMaster {
+                kek_id: "eu-2026a".into(),
+                wrapped: B64.encode(b"master"),
+            })
+            .await
+            .unwrap();
+        assert!(out.reseal_required);
+        assert_eq!(out.current_kek_id.as_deref(), Some("eu-2026b"));
+        assert_eq!(out.master_key, b"master");
     }
 
     #[test]

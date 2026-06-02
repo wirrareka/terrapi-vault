@@ -41,24 +41,129 @@ const SWEEP_INTERVAL_SECS: u64 = 30;
 /// [`obtain_unseal_passphrase`] (identity arm (a) if configured, else the manual passphrase).
 /// A failed/absent unseal is non-fatal: the broker starts SEALED and mutating ops `503`
 /// until it is restarted with a working unseal path.
-async fn boot_unseal(cfg: &BrokerConfig) -> Option<Unsealed> {
-    let store = if cfg.allow_insecure_dev {
-        seal::unseal_dev()
+async fn boot_unseal(cfg: &BrokerConfig) -> (Option<Unsealed>, Option<ResealEvent>) {
+    let (store_res, reseal) = if cfg.allow_insecure_dev {
+        (seal::unseal_dev(), None)
     } else {
-        let Some(p) = obtain_unseal_passphrase(cfg).await else {
+        let Some((p, reseal)) = obtain_unseal_passphrase(cfg).await else {
             eprintln!("vault-broker: no unseal passphrase (identity arm (a) and manual both unavailable); starting SEALED");
-            return None;
+            return (None, None);
         };
-        seal::unseal(&cfg.store_path, &p, KdfParams::default())
+        (
+            seal::unseal(&cfg.store_path, &p, KdfParams::default()),
+            reseal,
+        )
     };
-    let store = match store {
+    let store = match store_res {
         Ok(v) => v,
         Err(e) => {
+            // The re-seal (if any) already persisted, so still surface it for the audit emit.
             eprintln!("vault-broker: unseal FAILED ({e}); starting SEALED");
-            return None;
+            return (None, reseal);
         }
     };
-    load_ca(store, cfg.residency_group.as_str())
+    (load_ca(store, cfg.residency_group.as_str()), reseal)
+}
+
+/// A completed root re-seal (arm (a)): the master key was re-sealed from `old_kek_id` under the
+/// now-current `new_kek_id`. Surfaced so the broker emits B3 `kms.master_resealed` once the audit
+/// sink is built — identity consumes it to retire the old root (idempotent; dedup by `{old,new}`).
+struct ResealEvent {
+    old_kek_id: String,
+    new_kek_id: String,
+}
+
+/// Unseal the master key via identity and, when identity signals a root rotation
+/// (`reseal_required`), re-seal the (value-unchanged) master under the current root and persist
+/// the new blob atomically. Returns the master key bytes + the reseal event (Some on re-seal).
+async fn unseal_and_maybe_reseal(
+    client: &identity_kms::IdentityKmsClient,
+    sealed_file: &std::path::Path,
+    blob: &identity_kms::SealedMaster,
+) -> Result<(Vec<u8>, Option<ResealEvent>), identity_kms::Error> {
+    let outcome = client.unseal(blob).await?;
+    if !outcome.reseal_required {
+        return Ok((outcome.master_key, None));
+    }
+    // Root rotated: re-seal the same master under the current root, persist atomically (temp+rename).
+    let new = client.seal(&outcome.master_key).await?;
+    // Sanity: identity should have sealed under the root it just advertised as current. A mismatch
+    // means the root rotated again between unseal and seal — the new blob is still valid under
+    // new.kek_id, so we proceed, but log it.
+    if let Some(cur) = &outcome.current_kek_id {
+        if cur != &new.kek_id {
+            eprintln!(
+                "vault-broker: re-seal kek_id {} != identity's advertised current {} (root rotated mid-reseal?); proceeding with {}",
+                new.kek_id, cur, new.kek_id
+            );
+        }
+    }
+    identity_kms::store_sealed(sealed_file, &new)
+        .map_err(|e| identity_kms::Error::Io(e.to_string()))?;
+    let reseal = ResealEvent {
+        old_kek_id: blob.kek_id.clone(),
+        new_kek_id: new.kek_id,
+    };
+    Ok((outcome.master_key, Some(reseal)))
+}
+
+/// Emit B3 `kms.master_resealed` (`source:"vault"`) so identity retires the old root. At-least-once
+/// (identity dedups by `{old,new}`); a lost emit is covered by identity's overlap backstop.
+fn emit_master_resealed(state: &AppState, r: &ResealEvent) {
+    use vault_transport::audit::{Actor, ActorKind, AuditEvent, Outcome, Target};
+    state.emit(&AuditEvent::vault(
+        AppState::now_ts(),
+        state.cfg.node.clone(),
+        Some(state.cfg.residency_group.as_str().to_owned()),
+        Actor {
+            label: state.cfg.node.clone(),
+            kind: ActorKind::System,
+            id: None,
+            tenant: None,
+        },
+        "kms.master_resealed",
+        Target {
+            kind: "kms-root".into(),
+            id: Some(format!("{}->{}", r.old_kek_id, r.new_kek_id)),
+        },
+        Outcome::Success,
+        None,
+    ));
+}
+
+/// Periodically re-check identity for a root rotation and re-seal if needed. Boot-time re-seal
+/// handles the common case (routine restarts); this covers a broker that runs *across* a rotation
+/// without restarting, within identity's overlap window. No-op unless arm (a) is configured.
+/// Cadence `VAULT_KMS_RESEAL_CHECK_SECS` (default 6 h) — root rotation is annual + break-glass, so
+/// a long interval bounds how often the plaintext master transits (in-group, over mTLS).
+async fn reseal_watch(state: AppState, interval: std::time::Duration) {
+    let (Some(k), Some(tls)) = (state.cfg.identity_kms.clone(), state.cfg.tls.clone()) else {
+        return; // arm (a) not configured (or no mTLS material) → nothing to watch
+    };
+    let client = match identity_kms::IdentityKmsClient::new(k.url.clone(), &tls) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("vault-broker: reseal-watch disabled — KMS client setup failed ({e})");
+            return;
+        }
+    };
+    loop {
+        tokio::time::sleep(interval).await;
+        let Some(blob) = identity_kms::load_sealed(&k.sealed_master_file) else {
+            continue;
+        };
+        match unseal_and_maybe_reseal(&client, &k.sealed_master_file, &blob).await {
+            Ok((_master, Some(r))) => {
+                eprintln!(
+                    "vault-broker: reseal-watch — root rotation, re-sealed {} -> {}",
+                    r.old_kek_id, r.new_kek_id
+                );
+                emit_master_resealed(&state, &r);
+            }
+            Ok((_master, None)) => {} // already under the current root
+            Err(e) => eprintln!("vault-broker: reseal-watch check failed ({e})"),
+        }
+    }
 }
 
 /// The unseal passphrase, via arm (a) (identity-sealed master key) when configured, else the
@@ -71,25 +176,27 @@ async fn boot_unseal(cfg: &BrokerConfig) -> Option<Unsealed> {
 /// One-time bootstrap: with `VAULT_KMS_SEAL_INIT=1` the broker seals the *current* manual
 /// passphrase under identity, persists the returned blob, and boots with it — run once, then
 /// unset the flag.
-async fn obtain_unseal_passphrase(cfg: &BrokerConfig) -> Option<String> {
+async fn obtain_unseal_passphrase(cfg: &BrokerConfig) -> Option<(String, Option<ResealEvent>)> {
+    let manual = || unseal_passphrase().map(|p| (p, None));
+
     let Some(k) = &cfg.identity_kms else {
-        return unseal_passphrase(); // arm (a) not configured → manual passphrase
+        return manual(); // arm (a) not configured → manual passphrase
     };
     // Arm (a) authenticates to identity with the broker's own mTLS material (client cert).
     let Some(tls) = &cfg.tls else {
         eprintln!("vault-broker: arm (a) configured but no VAULT_TLS_* mTLS material for the KMS client; using manual passphrase");
-        return unseal_passphrase();
+        return manual();
     };
     let client = match identity_kms::IdentityKmsClient::new(k.url.clone(), tls) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("vault-broker: KMS client mTLS setup FAILED ({e}); falling back to manual passphrase");
-            return unseal_passphrase();
+            return manual();
         }
     };
 
     if std::env::var("VAULT_KMS_SEAL_INIT").as_deref() == Ok("1") {
-        return seal_init(&client, k).await;
+        return seal_init(&client, k).await.map(|p| (p, None));
     }
 
     let Some(blob) = identity_kms::load_sealed(&k.sealed_master_file) else {
@@ -97,25 +204,32 @@ async fn obtain_unseal_passphrase(cfg: &BrokerConfig) -> Option<String> {
             "vault-broker: arm (a) configured but no sealed-master blob at {} — using manual passphrase (run once with VAULT_KMS_SEAL_INIT=1 to seal it)",
             k.sealed_master_file.display()
         );
-        return unseal_passphrase();
+        return manual();
     };
-    let master = match client.unseal(&blob).await {
-        Ok(bytes) => bytes,
+    let (master, reseal) = match unseal_and_maybe_reseal(&client, &k.sealed_master_file, &blob)
+        .await
+    {
+        Ok(v) => v,
         Err(e) => {
-            eprintln!("vault-broker: identity unseal FAILED ({e}); falling back to break-glass passphrase");
-            return unseal_passphrase();
+            eprintln!("vault-broker: identity unseal/re-seal FAILED ({e}); falling back to break-glass passphrase");
+            return manual();
         }
     };
-    if let Ok(p) = String::from_utf8(master) {
-        eprintln!(
-            "vault-broker: unsealed via identity arm (a) (kek_id={})",
-            blob.kek_id
-        );
-        Some(p)
-    } else {
+    let Ok(p) = String::from_utf8(master) else {
         eprintln!("vault-broker: identity returned a non-UTF8 master; falling back to break-glass passphrase");
-        unseal_passphrase()
+        return manual();
+    };
+    eprintln!(
+        "vault-broker: unsealed via identity arm (a) (kek_id={})",
+        blob.kek_id
+    );
+    if let Some(r) = &reseal {
+        eprintln!(
+            "vault-broker: root rotation detected — re-sealed master {} -> {}",
+            r.old_kek_id, r.new_kek_id
+        );
     }
+    Some((p, reseal))
 }
 
 /// One-time arm (a) bootstrap: seal the current manual passphrase under identity's per-group
@@ -245,7 +359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.audit_path.display(),
     );
 
-    let seal = boot_unseal(&cfg).await;
+    let (seal, reseal) = boot_unseal(&cfg).await;
     let bind = cfg.bind;
     let allow_insecure_dev = cfg.allow_insecure_dev;
     let tls = cfg.tls.clone();
@@ -256,6 +370,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(task) = ship_task {
         tokio::spawn(audit_ship::run(task));
     }
+
+    // Arm (a): if boot re-sealed the master under a rotated root, signal it now that the audit
+    // sink exists (identity retires the old root on this; at-least-once, deduped by {old,new}).
+    if let Some(r) = &reseal {
+        emit_master_resealed(&state, r);
+    }
+    // Watch for a root rotation that happens while the broker runs (no restart) — re-seal within
+    // identity's overlap window. No-op unless arm (a) is configured.
+    let reseal_check = std::time::Duration::from_secs(
+        std::env::var("VAULT_KMS_RESEAL_CHECK_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(6 * 60 * 60),
+    );
+    tokio::spawn(reseal_watch(state.clone(), reseal_check));
 
     // Drive lease/session expiry on a timer so short-TTL creds auto-expire.
     tokio::spawn(sweeper::run(

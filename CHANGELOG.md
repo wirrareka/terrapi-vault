@@ -28,8 +28,14 @@ KMS root-of-trust chain (identity ↔ vault) — vault's side, LOCKED 2026-06-02
   (break-glass) when identity is unreachable. Opt-in via `VAULT_IDENTITY_KMS_URL`; one-time
   bootstrap with `VAULT_KMS_SEAL_INIT=1`. Ships gated off until the dot-form cert is adopted
   and identity's listener (v0.1.13) + per-group root key are live.
-- **Still scheduled:** the `kms.rewrap_complete` emit (ack-gated retire signal) — wired when
-  KEK rotation lands; identity's previous-root overlap window is its fast-follow on that.
+- **Root-rotation handling — arm (a) re-seal + `kms.master_resealed`.** When identity rotates
+  its per-group root, the unseal response now carries `current_kek_id`/`reseal_required`; the
+  broker re-seals its (value-unchanged) master key under the current root, persists the new blob
+  atomically (temp+rename), and emits B3 `kms.master_resealed {old_kek_id→new_kek_id}` so identity
+  retires the old root (at-least-once; identity dedups by `{old,new}`). Handled at boot **and** on a
+  timer (`VAULT_KMS_RESEAL_CHECK_SECS`, default 6 h) for a broker running across a rotation without
+  a restart. NB: this is the *root*-rotation path (master re-seal only); vault's own per-target KEK
+  rotation (`kms.rotate`/`kms.rewrap`) is independent and identity-uninvolved.
 
 ## 0.1.3
 

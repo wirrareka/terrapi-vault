@@ -411,9 +411,14 @@ vault's three pieces shipped + tested (gated off until identity/infra enable the
   dot-form `vault.<group>.proximi.internal`); manual passphrase = break-glass fallback. Opt-in
   `VAULT_IDENTITY_KMS_URL`; one-time bootstrap `VAULT_KMS_SEAL_INIT=1`. Worklog:
   `docs/worklog/2026-06-02-kms-root-of-trust.md`.
+- **Root-rotation handling — DONE:** on an identity ROOT rotation the broker re-seals its
+  master key (only — KEKs/DEKs are unchanged) under the current root and emits B3
+  `kms.master_resealed` so identity retires the old root (boot + 6h `reseal_watch` timer;
+  identity holds current+previous during an ack-gated overlap, 7d backstop). Renamed from the
+  contract's `kms.rewrap_complete` — accurate, no DEK re-wrap on root rotation.
 - **Pending (not vault code):** adopt the infra-issued dot-form cert as `VAULT_TLS_*` +
   eu seal→unseal round-trip; identity enables arm (b) mint (`/kms/v1/workload-cred`) for the
-  live JWT round-trip; vault `kms.rewrap_complete` emit lands with KEK rotation.
+  live JWT round-trip + wires its overlap-window/`kms.master_resealed` consumer.
 
 **Next:** additional `CredEngine` adapters for any *modern* datastore that needs brokered
-creds (RethinkDB is out); `kms.rewrap_complete` emit + KEK rotation flow; `vault-sync` (Svet B).
+creds (RethinkDB is out); `vault-sync` (Svet B) client integration (memento/probe).
