@@ -3,7 +3,7 @@
 terrapi-vault — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
-## Unreleased
+## 0.1.4 (2026-06-02)
 
 KMS root-of-trust chain (identity ↔ vault) — vault's side, LOCKED 2026-06-02
 (`coordination/conventions/secrets-broker.md §KMS root-of-trust`). Broker API `1.1.0`.
