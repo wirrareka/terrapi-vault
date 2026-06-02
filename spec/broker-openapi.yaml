@@ -9,7 +9,7 @@
 openapi: 3.1.0
 info:
   title: terrapi-vault broker
-  version: "1.0.0"
+  version: "1.1.0"
   summary: Network secrets broker for the proximi.io platform (one instance per residency group).
   description: |
     Network secrets broker for the proximi.io platform. **One instance per residency
@@ -17,11 +17,16 @@ info:
     another group's path returns `404` (residency air-gap — there is no cross-group route).
 
     **Auth.** mutual TLS over WireGuard, client cert signed by the fleet Root CA; the
-    cert's first SAN `dNSName` maps to a registered service role (no bearer tokens /
-    AppRole). The listener is reachable only on the WG mesh. Each role is granted a set of
-    **capabilities** (ssh-ca, ssh-sign, creds, session, leases, kms, snapshot); calling an
-    op the role isn't granted returns `403` (least privilege). Prometheus metrics are served
-    on a separate loopback listener (`127.0.0.1:8201/metrics`), never on this mTLS surface.
+    cert's first SAN `dNSName` maps to a registered service role. The listener is reachable
+    only on the WG mesh. Each role is granted a set of **capabilities** (ssh-ca, ssh-sign,
+    creds, session, leases, kms, snapshot); calling an op the role isn't granted returns
+    `403` (least privilege). Prometheus metrics are served on a separate loopback listener
+    (`127.0.0.1:8201/metrics`), never on this mTLS surface.
+
+    **KMS root-of-trust (Option J).** When configured with `VAULT_KMS_JWT_ISSUER`, the `kms`
+    ops additionally require an identity-minted short-TTL **ES256** bearer JWT (`kmsBearer`)
+    as the per-call cap proof on top of the mTLS channel — see the `kmsBearer` security scheme.
+    Otherwise kms ops are authorized by the cert-SAN `kms` capability alone (aether path).
 
     Three auth outcomes a client can distinguish by the `error` code: `401 missing_identity`
     (no verified mTLS SAN), `403 unregistered_principal` (cert trusted but its SAN is not a
@@ -33,7 +38,7 @@ info:
     | `ssh-ca`   | `GET /v1/{group}/ssh/ca`, `GET /v1/{group}/ssh/revoked` |
     | `ssh-sign` | `POST /v1/{group}/ssh/sign` |
     | `creds`    | `POST /v1/{group}/{tenant_id}/creds/{role}` |
-    | `kms`      | `POST /v1/{group}/{tenant_id}/kms/{key_id}/{wrap,unwrap,rotate}` |
+    | `kms`      | `POST /v1/{group}/{tenant_id}/kms/{key_id}/{wrap,unwrap,rotate,rewrap}` |
     | `session`  | `POST /v1/sys/session`, `DELETE /v1/sys/session/{id}` |
     | `leases`   | `POST /v1/sys/leases/{renew,revoke}` |
     | `snapshot` | `POST /v1/sys/store-snapshot` |
@@ -86,6 +91,19 @@ components:
     mtlsWireGuard:
       type: mutualTLS
       description: Client cert signed by fleet Root CA; SAN maps to a broker role. WG-only.
+    kmsBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        KMS root-of-trust (Option J, secrets-broker.md §KMS root-of-trust). Identity-minted
+        short-TTL **ES256** workload cred proving the `kms` cap per call, **in addition to**
+        the mTLS-over-WG channel (not a replacement). Verified against identity's JWKS:
+        `alg=ES256` + `kid`; `iss` (pinned, exact incl. trailing slash) + `aud="vault"` +
+        `exp`; `scope ⊇ "kms"`; `residency_group == this instance's group`; and the token's
+        `tenant_id` (lowercase UUIDv4) MUST equal the request path `tenant_id`. Enabled only
+        when the broker is configured with `VAULT_KMS_JWT_ISSUER`; otherwise kms ops are
+        authorized by the cert-SAN `kms` capability alone (the aether fleet-backup path).
 
   parameters:
     GroupParam:
@@ -261,6 +279,11 @@ components:
       properties:
         wrapped: { type: string, description: "base64 of version(4 LE) || nonce(24) || XChaCha20-Poly1305 ciphertext+tag (opaque to the client)" }
         kek_id: { type: string, description: "<group>/<tenant_id>/<key_id> — which KEK wrapped it" }
+    KmsRewrapRequest:
+      type: object
+      required: [wrapped]
+      properties:
+        wrapped: { type: string, description: base64 wrapped blob from a prior wrap (possibly under an older KEK version) }
     KmsUnwrapRequest:
       type: object
       required: [wrapped]
@@ -491,6 +514,9 @@ paths:
         snapshots stay decryptable. NOT session-bound. For aether fleet-mode backups.
       x-implementation-status: implemented
       x-audit-action: kms.wrap
+      security:
+        - { mtlsWireGuard: [], kmsBearer: [] }   # Option J (VAULT_KMS_JWT_ISSUER set): mTLS + identity JWT
+        - { mtlsWireGuard: [] }                   # cap mode: mTLS + cert-SAN `kms` capability (aether)
       parameters:
         - { $ref: "#/components/parameters/GroupParam" }
         - { $ref: "#/components/parameters/TenantIdParam" }
@@ -511,6 +537,9 @@ paths:
       summary: Unwrap a previously-wrapped DEK under the per-target KEK.
       x-implementation-status: implemented
       x-audit-action: kms.unwrap
+      security:
+        - { mtlsWireGuard: [], kmsBearer: [] }   # Option J (VAULT_KMS_JWT_ISSUER set): mTLS + identity JWT
+        - { mtlsWireGuard: [] }                   # cap mode: mTLS + cert-SAN `kms` capability (aether)
       parameters:
         - { $ref: "#/components/parameters/GroupParam" }
         - { $ref: "#/components/parameters/TenantIdParam" }
@@ -534,6 +563,9 @@ paths:
         unwrapping under their own (older) version. cap `kms`.
       x-implementation-status: implemented
       x-audit-action: kms.rotate
+      security:
+        - { mtlsWireGuard: [], kmsBearer: [] }   # Option J (VAULT_KMS_JWT_ISSUER set): mTLS + identity JWT
+        - { mtlsWireGuard: [] }                   # cap mode: mTLS + cert-SAN `kms` capability (aether)
       parameters:
         - { $ref: "#/components/parameters/GroupParam" }
         - { $ref: "#/components/parameters/TenantIdParam" }
@@ -541,6 +573,35 @@ paths:
       responses:
         "200": { description: rotated, content: { application/json: { schema: { $ref: "#/components/schemas/KmsRotateResponse" } } } }
         "400": { description: bad tenant_id / key_id, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/GroupMismatch" }
+        "503": { $ref: "#/components/responses/Sealed" }
+
+  /v1/{group}/{tenant_id}/kms/{key_id}/rewrap:
+    post:
+      tags: [kms]
+      operationId: kmsRewrap
+      summary: Server-side re-wrap a blob onto the target's current KEK version.
+      description: |
+        Unwraps the supplied blob under its own (embedded) KEK version and re-wraps the
+        recovered DEK under the target's **current** version — the plaintext DEK never leaves
+        the broker. Drives the ack-gated re-wrap flow (secrets-broker.md §KMS root-of-trust):
+        after a `rotate`, a consumer streams its ~150 wrapped blobs through `rewrap`, then
+        emits `kms.rewrap_complete` so identity can retire the old root. cap `kms`.
+      x-implementation-status: implemented
+      x-audit-action: kms.rewrap
+      security:
+        - { mtlsWireGuard: [], kmsBearer: [] }   # Option J (VAULT_KMS_JWT_ISSUER set): mTLS + identity JWT
+        - { mtlsWireGuard: [] }                   # cap mode: mTLS + cert-SAN `kms` capability (aether)
+      parameters:
+        - { $ref: "#/components/parameters/GroupParam" }
+        - { $ref: "#/components/parameters/TenantIdParam" }
+        - { name: key_id, in: path, required: true, schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,128}$" }, description: backup target id }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/KmsRewrapRequest" } } } }
+      responses:
+        "200": { description: re-wrapped blob (under the current KEK version), content: { application/json: { schema: { $ref: "#/components/schemas/KmsWrapResponse" } } } }
+        "400": { description: bad input, or blob did not authenticate (wrong target / tampered), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/GroupMismatch" }

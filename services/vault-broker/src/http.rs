@@ -5,9 +5,10 @@
 
 use crate::auth::{Capability, Principal};
 use crate::dto::{
-    Ack, CredsRequest, ErrorBody, KmsRotateResponse, KmsUnwrapRequest, KmsUnwrapResponse,
-    KmsWrapRequest, KmsWrapResponse, LeaseRenewRequest, LeaseRenewResponse, LeaseRevokeRequest,
-    SealStatus, SessionEndResponse, SessionOpenRequest, SessionOpenResponse, SshSignRequest,
+    Ack, CredsRequest, ErrorBody, KmsRewrapRequest, KmsRotateResponse, KmsUnwrapRequest,
+    KmsUnwrapResponse, KmsWrapRequest, KmsWrapResponse, LeaseRenewRequest, LeaseRenewResponse,
+    LeaseRevokeRequest, SealStatus, SessionEndResponse, SessionOpenRequest, SessionOpenResponse,
+    SshSignRequest,
 };
 use crate::state::{
     now_unix, AppState, CREDS_DEFAULT_TTL_SECS, DEFAULT_SESSION_IDLE_SECS,
@@ -15,7 +16,7 @@ use crate::state::{
     SSH_CERT_TTL_INTERACTIVE_SECS,
 };
 use axum::extract::{FromRequestParts, Path, RawPathParams, State};
-use axum::http::{request::Parts, StatusCode};
+use axum::http::{header::AUTHORIZATION, request::Parts, HeaderMap, StatusCode};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -106,7 +107,7 @@ impl FromRequestParts<AppState> for Group {
 }
 
 /// Lowercase UUIDv4 check (Vulture organization_id), without pulling a uuid crate.
-fn is_uuid_v4_lower(s: &str) -> bool {
+pub(crate) fn is_uuid_v4_lower(s: &str) -> bool {
     let b = s.as_bytes();
     if b.len() != 36 {
         return false;
@@ -159,6 +160,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/{group}/{tenant_id}/kms/{key_id}/rotate",
             post(kms_rotate),
+        )
+        .route(
+            "/v1/{group}/{tenant_id}/kms/{key_id}/rewrap",
+            post(kms_rewrap),
         )
         .route("/v1/sys/session", post(session_open))
         .route("/v1/sys/session/{id}", delete(session_end))
@@ -598,17 +603,90 @@ fn is_valid_key_id(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// Common validation for the KMS ops: capability, unsealed, tenant UUIDv4, key_id. The
-/// `:group` segment is validated upstream by the [`Group`] extractor (residency `404`
-/// before the body is read), so it is not re-checked here.
-/// Returns the unsealed store on success.
-fn kms_preflight(
+/// The `Bearer <token>` value from the `Authorization` header, if present and well-formed.
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
+/// Map a kms-JWT rejection to a status (secrets-broker.md §KMS root-of-trust). Token/header
+/// failures → `401`; policy failures (scope/residency) → `403`; a JWKS-fetch failure (identity
+/// unreachable) → `502` (the bearer may be fine — don't tell the client it's invalid).
+fn map_jwt_err(e: crate::jwt::JwtError) -> (StatusCode, Json<ErrorBody>) {
+    use crate::jwt::JwtError;
+    match e {
+        JwtError::Missing => err(
+            StatusCode::UNAUTHORIZED,
+            "missing_token",
+            "kms requires an identity-minted bearer JWT",
+        ),
+        JwtError::ScopeMissing => err(
+            StatusCode::FORBIDDEN,
+            "insufficient_scope",
+            "token scope does not include 'kms'",
+        ),
+        JwtError::ResidencyMismatch => err(
+            StatusCode::FORBIDDEN,
+            "residency_mismatch",
+            "token residency_group does not match this broker",
+        ),
+        JwtError::BadTenant => err(
+            StatusCode::BAD_REQUEST,
+            "bad_tenant_id",
+            "token tenant_id must be a lowercase UUIDv4",
+        ),
+        JwtError::Jwks(detail) => backend("kms jwt jwks", detail),
+        // header / signature / iss / aud / exp / unknown-kid → terse 401 (no internals leak).
+        JwtError::Header(_) | JwtError::UnknownKid | JwtError::Invalid => err(
+            StatusCode::UNAUTHORIZED,
+            "invalid_token",
+            "kms bearer token rejected",
+        ),
+    }
+}
+
+/// Authorize a kms op. When the kms-JWT verifier is configured (Option J), the `kms` cap is
+/// proven **per call** by a valid identity-minted ES256 bearer token whose `tenant_id` equals
+/// the request path tenant (a cred for tenant X can only act on X). The mTLS `Principal` still
+/// authenticated the channel. When the verifier is NOT configured, kms falls back to the
+/// cert-SAN capability (`Capability::Kms`) — the existing aether fleet-backup path.
+async fn kms_authorize(
     state: &AppState,
     principal: &Principal,
+    headers: &HeaderMap,
+    tenant_id: &str,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let Some(verifier) = state.kms_jwt.as_ref() else {
+        return require_cap(principal, Capability::Kms);
+    };
+    let token = bearer(headers).ok_or_else(|| map_jwt_err(crate::jwt::JwtError::Missing))?;
+    let grant = verifier.verify(token).await.map_err(map_jwt_err)?;
+    if grant.tenant_id != tenant_id {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "tenant_mismatch",
+            "token tenant_id does not match the request path tenant",
+        ));
+    }
+    Ok(())
+}
+
+/// Common preflight for the KMS ops: authorize (JWT or cap), unsealed, tenant UUIDv4, key_id.
+/// The `:group` segment is validated upstream by the [`Group`] extractor (residency `404`
+/// before the body is read), so it is not re-checked here. Returns the unsealed store.
+async fn kms_preflight(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
     tenant_id: &str,
     key_id: &str,
 ) -> Result<std::sync::Arc<std::sync::Mutex<terrapi_vault::Vault>>, (StatusCode, Json<ErrorBody>)> {
-    require_cap(principal, Capability::Kms)?;
+    kms_authorize(state, principal, headers, tenant_id).await?;
     require_unsealed(state)?;
     if !is_uuid_v4_lower(tenant_id) {
         return Err(err(
@@ -651,9 +729,10 @@ async fn kms_wrap(
     principal: Principal,
     Path((group, tenant_id, key_id)): Path<(String, String, String)>,
     _group_check: Group,
+    headers: HeaderMap,
     Json(req): Json<KmsWrapRequest>,
 ) -> ApiResult<KmsWrapResponse> {
-    let store = kms_preflight(&state, &principal, &tenant_id, &key_id)?;
+    let store = kms_preflight(&state, &principal, &headers, &tenant_id, &key_id).await?;
     let dek = base64::engine::general_purpose::STANDARD
         .decode(req.dek.as_bytes())
         .map_err(|_| {
@@ -693,9 +772,10 @@ async fn kms_unwrap(
     principal: Principal,
     Path((group, tenant_id, key_id)): Path<(String, String, String)>,
     _group_check: Group,
+    headers: HeaderMap,
     Json(req): Json<KmsUnwrapRequest>,
 ) -> ApiResult<KmsUnwrapResponse> {
-    let store = kms_preflight(&state, &principal, &tenant_id, &key_id)?;
+    let store = kms_preflight(&state, &principal, &headers, &tenant_id, &key_id).await?;
     let wrapped = base64::engine::general_purpose::STANDARD
         .decode(req.wrapped.as_bytes())
         .map_err(|_| {
@@ -734,8 +814,9 @@ async fn kms_rotate(
     principal: Principal,
     Path((group, tenant_id, key_id)): Path<(String, String, String)>,
     _group_check: Group,
+    headers: HeaderMap,
 ) -> ApiResult<KmsRotateResponse> {
-    let store = kms_preflight(&state, &principal, &tenant_id, &key_id)?;
+    let store = kms_preflight(&state, &principal, &headers, &tenant_id, &key_id).await?;
     let version = {
         let v = store.lock().expect("store lock");
         crate::kms::rotate(&v, &group, &tenant_id, &key_id)
@@ -758,6 +839,53 @@ async fn kms_rotate(
     Ok(Json(KmsRotateResponse {
         kek_id: format!("{group}/{tenant_id}/{key_id}"),
         version,
+    }))
+}
+
+/// Server-side re-wrap: move a wrapped blob onto the target's current KEK version after a
+/// [`kms_rotate`], without the plaintext DEK ever leaving the broker. Drives the ack-gated
+/// re-wrap flow (secrets-broker.md §KMS root-of-trust) — a consumer streams its blobs here,
+/// then emits `kms.rewrap_complete` once all are migrated so identity can retire the old root.
+async fn kms_rewrap(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path((group, tenant_id, key_id)): Path<(String, String, String)>,
+    _group_check: Group,
+    headers: HeaderMap,
+    Json(req): Json<KmsRewrapRequest>,
+) -> ApiResult<KmsWrapResponse> {
+    let store = kms_preflight(&state, &principal, &headers, &tenant_id, &key_id).await?;
+    let wrapped_in = base64::engine::general_purpose::STANDARD
+        .decode(req.wrapped.as_bytes())
+        .map_err(|_| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "bad_wrapped",
+                "wrapped must be valid base64",
+            )
+        })?;
+    let wrapped_out = {
+        let v = store.lock().expect("store lock");
+        crate::kms::rewrap(&v, &group, &tenant_id, &key_id, &wrapped_in)
+    }
+    .map_err(map_kms_err)?;
+
+    state.emit(&AuditEvent::vault(
+        AppState::now_ts(),
+        state.cfg.node.clone(),
+        Some(state.cfg.residency_group.as_str().to_owned()),
+        system_actor(&principal),
+        "kms.rewrap",
+        Target {
+            kind: "kms-kek".into(),
+            id: Some(format!("{group}/{tenant_id}/{key_id}")),
+        },
+        Outcome::Success,
+        None,
+    ));
+    Ok(Json(KmsWrapResponse {
+        wrapped: base64::engine::general_purpose::STANDARD.encode(wrapped_out),
+        kek_id: format!("{group}/{tenant_id}/{key_id}"),
     }))
 }
 
@@ -980,6 +1108,7 @@ mod tests {
             roles: HashMap::new(),
             allow_insecure_dev: true,
             tls: None,
+            kms_jwt: None,
         };
         AppState::new(cfg, None, Arc::new(NullSink))
     }
@@ -1002,6 +1131,7 @@ mod tests {
             roles,
             allow_insecure_dev: false,
             tls: None,
+            kms_jwt: None,
         };
         AppState::new(cfg, None, Arc::new(NullSink))
     }

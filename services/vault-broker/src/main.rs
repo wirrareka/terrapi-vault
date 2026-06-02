@@ -17,6 +17,7 @@ mod creds;
 mod dto;
 mod hardening;
 mod http;
+mod jwt;
 mod kms;
 mod opensearch;
 mod seal;

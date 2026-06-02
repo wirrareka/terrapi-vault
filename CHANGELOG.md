@@ -3,6 +3,25 @@
 terrapi-vault — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
+## Unreleased
+
+KMS root-of-trust chain (identity ↔ vault) — vault's side, LOCKED 2026-06-02
+(`coordination/conventions/secrets-broker.md §KMS root-of-trust`). Broker API `1.1.0`.
+- **kms-cap auth = Option J (JWT-bearer).** New `jwt` module verifies identity-minted
+  short-TTL **ES256** workload creds as the per-call `kms` cap proof, on top of the mTLS
+  channel: `alg=ES256`+`kid`, JWKS (OIDC-discovered or `VAULT_KMS_JWT_JWKS_URI`, cached +
+  refetched on a `kid` miss), `iss`/`aud="vault"`/`exp`, `scope ⊇ kms`, `residency_group ==`
+  this instance's group, and the token `tenant_id == path tenant_id`. Opt-in via
+  `VAULT_KMS_JWT_ISSUER` (+ `_AUDIENCE`); absent ⇒ kms stays cap-based (cert-SAN `kms`, the
+  aether fleet-backup path) — no behaviour change for existing consumers.
+- **`kms.rewrap`** (`POST /v1/{group}/{tenant_id}/kms/{key_id}/rewrap`) — server-side re-wrap:
+  unwrap under the blob's embedded KEK version, re-wrap under the current version; the
+  plaintext DEK never leaves the broker. Drives the ack-gated re-wrap flow (consumer streams
+  blobs → emits `kms.rewrap_complete` so identity retires the old root).
+- **Still scheduled (blocked on identity's not-yet-built root endpoints):** arm (a)
+  identity-seal unseal client (`POST {identity}/kms/v1/unseal`, `kms-unseal` mTLS role) and
+  the `kms.rewrap_complete` emit — wired once identity specs the req/resp.
+
 ## 0.1.3
 
 Deploy-only fix (binary unchanged) — the second rc.subr-magic collision found by `sh -x`

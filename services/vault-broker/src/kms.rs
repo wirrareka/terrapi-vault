@@ -185,6 +185,27 @@ pub fn rotate(vault: &Vault, group: &str, tenant_id: &str, key_id: &str) -> Resu
     Ok(next)
 }
 
+/// Server-side **re-wrap**: unwrap `wrapped` under its own (embedded) KEK version, then
+/// re-wrap the recovered DEK under the target's **current** version. The plaintext DEK lives
+/// only in this call's stack and never leaves the broker — so a consumer can migrate its ~150
+/// wrapped blobs onto a freshly [`rotate`]d KEK without ever handling the DEK itself (the
+/// ack-gated re-wrap flow in secrets-broker.md §KMS root-of-trust). A blob already on the
+/// current version is simply re-wrapped under it again (idempotent w.r.t. version).
+///
+/// # Errors
+/// `BadInput`/`Crypto` if `wrapped` doesn't authenticate under this target (see [`unwrap`]);
+/// `Store` on a DB error.
+pub fn rewrap(
+    vault: &Vault,
+    group: &str,
+    tenant_id: &str,
+    key_id: &str,
+    wrapped: &[u8],
+) -> Result<Vec<u8>, KmsError> {
+    let dek = unwrap(vault, group, tenant_id, key_id, wrapped)?;
+    wrap(vault, group, tenant_id, key_id, &dek)
+}
+
 /// Wrap `dek` under the target's **current** KEK. Returns `version(4 LE) || nonce(24) || ct+tag`;
 /// the tag also covers the target tuple as AAD (see [`aad_for`]).
 ///
@@ -381,6 +402,36 @@ mod tests {
         // BOTH still unwrap (old under v1, fresh under v2)
         assert_eq!(unwrap(&v, "eu", tid, "t", &old).unwrap(), b"old-dek");
         assert_eq!(unwrap(&v, "eu", tid, "t", &fresh).unwrap(), b"new-dek");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rewrap_moves_a_blob_to_the_current_version_preserving_the_dek() {
+        let (v, path) = dev_vault("rewrap");
+        let tid = "11111111-1111-4111-8111-111111111111";
+        let dek = b"a-32-byte-data-encryption-key!!!";
+        // wrap under v1, rotate to v2, then re-wrap the v1 blob server-side
+        let v1_blob = wrap(&v, "eu", tid, "t", dek).unwrap();
+        assert_eq!(v1_blob[0], 1);
+        assert_eq!(rotate(&v, "eu", tid, "t").unwrap(), 2);
+        let v2_blob = rewrap(&v, "eu", tid, "t", &v1_blob).unwrap();
+        // re-wrapped under the new current version, same DEK recovered, plaintext never exposed
+        assert_eq!(v2_blob[0], 2);
+        assert_ne!(&v2_blob[VER_LEN + NONCE_LEN..], &dek[..]);
+        assert_eq!(unwrap(&v, "eu", tid, "t", &v2_blob).unwrap(), dek);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rewrap_rejects_a_blob_for_a_different_target() {
+        let (v, path) = dev_vault("rewrap-wrong");
+        let tid = "11111111-1111-4111-8111-111111111111";
+        let blob = wrap(&v, "eu", tid, "t", b"secret").unwrap();
+        // a blob from key_id "t" cannot be re-wrapped under "other" (AEAD auth fails on unwrap)
+        assert!(matches!(
+            rewrap(&v, "eu", tid, "other", &blob),
+            Err(KmsError::Crypto)
+        ));
         cleanup(&path);
     }
 }

@@ -88,6 +88,22 @@ pub struct BrokerConfig {
     /// mTLS material. `Some` in production (server cert/key + the fleet Root CA bundle
     /// used to require + verify client certs). `None` only in `allow_insecure_dev`.
     pub tls: Option<TlsPaths>,
+    /// KMS-cap JWT verification (Option J, secrets-broker.md §KMS root-of-trust). `Some`
+    /// when `VAULT_KMS_JWT_ISSUER` is set → kms ops require a valid identity-minted ES256
+    /// bearer token. `None` → kms stays cap-based (the aether cert-SAN path). See `jwt`.
+    pub kms_jwt: Option<KmsJwtConfig>,
+}
+
+/// Issuer/audience config for verifying identity-minted kms-cap tokens. The instance's
+/// `residency_group` (already on [`BrokerConfig`]) is the expected `residency_group` claim.
+#[derive(Debug, Clone)]
+pub struct KmsJwtConfig {
+    /// Pinned `iss`, matched exactly (incl. trailing slash), e.g. `https://identity.eu.proximi.fi/`.
+    pub issuer: String,
+    /// Expected `aud` — `"vault"` (literal) unless overridden.
+    pub audience: String,
+    /// Explicit JWKS URL (`VAULT_KMS_JWT_JWKS_URI`); `None` → discover via OIDC `/.well-known`.
+    pub jwks_uri: Option<String>,
 }
 
 /// Filesystem paths to the broker's mTLS material (PEM).
@@ -141,6 +157,20 @@ impl BrokerConfig {
             _ => None,
         };
         let roles = load_roles();
+        // KMS-cap JWT verification is opt-in: enabled only when an issuer is configured.
+        let kms_jwt = std::env::var("VAULT_KMS_JWT_ISSUER")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|issuer| KmsJwtConfig {
+                issuer,
+                audience: std::env::var("VAULT_KMS_JWT_AUDIENCE")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "vault".to_owned()),
+                jwks_uri: std::env::var("VAULT_KMS_JWT_JWKS_URI")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+            });
         Self {
             bind,
             residency_group: group,
@@ -152,6 +182,7 @@ impl BrokerConfig {
             roles,
             allow_insecure_dev,
             tls,
+            kms_jwt,
         }
     }
 }

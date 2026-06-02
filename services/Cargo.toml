@@ -56,6 +56,9 @@ ed25519-dalek = "2"
 # security REST client (rustls TLS, no OpenSSL).
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# KMS-cap JWT verification (Option J, secrets-broker.md §KMS root-of-trust): verify
+# identity-minted short-TTL ES256 workload creds against the issuer's JWKS. See vault-broker/src/jwt.rs.
+jsonwebtoken = "9"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

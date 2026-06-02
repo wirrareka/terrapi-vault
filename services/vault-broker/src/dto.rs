@@ -139,6 +139,12 @@ pub struct KmsUnwrapResponse {
     pub dek: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct KmsRewrapRequest {
+    /// Base64 wrapped blob from a prior `wrap` (possibly under an older KEK version).
+    pub wrapped: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct KmsRotateResponse {
     pub kek_id: String,

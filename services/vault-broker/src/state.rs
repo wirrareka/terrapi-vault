@@ -123,6 +123,9 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     /// Runtime hardening state: concurrency permits + per-principal rate buckets.
     pub harden: Arc<crate::hardening::HardenState>,
+    /// KMS-cap JWT verifier (Option J). `Some` when `VAULT_KMS_JWT_ISSUER` is configured →
+    /// kms ops require a valid identity-minted ES256 bearer token; `None` → kms is cap-based.
+    pub kms_jwt: Option<Arc<crate::jwt::JwtVerifier>>,
 }
 
 /// Current unix time in seconds — the clock the lease/session engine is driven by.
@@ -183,6 +186,16 @@ impl AppState {
     pub fn new(cfg: BrokerConfig, seal: Option<Unsealed>, audit: Arc<dyn AuditSink>) -> Self {
         let gen: BoxedGen = Box::new(random_id);
         let harden = Arc::new(crate::hardening::HardenState::new(cfg.hardening));
+        // Build the kms-cap JWT verifier when configured. The instance's residency group is
+        // the expected `residency_group` claim (cross-region replay defence).
+        let kms_jwt = cfg.kms_jwt.as_ref().map(|c| {
+            Arc::new(crate::jwt::JwtVerifier::new(
+                c.issuer.clone(),
+                c.audience.clone(),
+                cfg.residency_group.as_str().to_owned(),
+                c.jwks_uri.clone(),
+            ))
+        });
         let sealed = seal.is_none();
         let (store, ssh_ca) = match seal {
             Some(u) => (
@@ -203,6 +216,7 @@ impl AppState {
             ssh_serials: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             harden,
+            kms_jwt,
             cfg: Arc::new(cfg),
         }
     }
