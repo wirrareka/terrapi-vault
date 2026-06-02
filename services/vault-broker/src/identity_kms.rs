@@ -4,15 +4,19 @@
 //! plaintext unseal master key via identity's WG-only KMS listener (`POST /kms/v1/unseal`),
 //! so a stolen at-rest store is useless without a live, residency-matched call to identity
 //! (`coordination/conventions/secrets-broker.md §KMS root-of-trust`). The per-group ROOT key
-//! never leaves identity; only this broker's own master key transits, in-group, behind the WG
-//! mTLS terminator. The manual unseal passphrase stays the **break-glass** path when identity
-//! is unreachable (augment, not replace).
+//! never leaves identity; only this broker's own master key transits, in-group, over mTLS.
+//! The manual unseal passphrase stays the **break-glass** path when identity is unreachable
+//! (augment, not replace).
 //!
-//! Auth: the WG mTLS terminator verifies the broker's fleet-CA client cert and forwards the
-//! verified SAN to identity behind the `X-Kms-Auth` boundary secret (the same pattern as the
-//! Vulture a/b control plane); the broker sends that secret on each call. The whole path is
-//! **disabled unless `VAULT_IDENTITY_KMS_URL` is configured** — until then the broker unseals
-//! with the manual passphrase exactly as before.
+//! Auth: identity's `:8202` is a **native mTLS listener** (infra §2→(A) decision, identity
+//! v0.1.13). The broker connects as an mTLS **client** presenting its fleet-CA cert
+//! (`vault.<group>.proximi.internal`, clientAuth EKU); identity verifies it
+//! (`WebPkiClientVerifier`) + authorizes the SAN → `kms-unseal`. There is no application-layer
+//! secret — auth is the client certificate itself. The broker reuses its own broker mTLS
+//! material (`VAULT_TLS_*`: cert+key as the client identity, the fleet Root CA bundle as the
+//! trust root for identity's server cert). The whole path is **disabled unless
+//! `VAULT_IDENTITY_KMS_URL` is configured** — until then the broker unseals with the manual
+//! passphrase exactly as before.
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
@@ -28,6 +32,10 @@ pub enum Error {
     Status(u16),
     #[error("identity kms response malformed: {0}")]
     Decode(String),
+    #[error("kms mTLS material unreadable: {0}")]
+    Io(String),
+    #[error("kms mTLS client setup failed: {0}")]
+    Tls(String),
 }
 
 /// The inert sealed-master blob persisted at rest (`VAULT_SEALED_MASTER_FILE`). Opaque to the
@@ -60,27 +68,54 @@ struct UnsealResponse {
 /// Client for identity's `POST /kms/v1/{seal,unseal}`. One per broker; used only at boot.
 pub struct IdentityKmsClient {
     base_url: String,
-    auth_secret: String,
     http: reqwest::Client,
 }
 
+/// Build the mTLS reqwest client: the broker's cert+key as the client identity, and ONLY the
+/// fleet Root CA as the trust root (so the broker will only talk to a fleet-CA-signed identity).
+fn build_mtls_client(tls: &crate::config::TlsPaths) -> Result<reqwest::Client, Error> {
+    let read = |p: &Path, what: &str| {
+        std::fs::read(p).map_err(|e| Error::Io(format!("{what} {}: {e}", p.display())))
+    };
+    let cert = read(&tls.cert, "kms client cert")?;
+    let key = read(&tls.key, "kms client key")?;
+    let ca = read(&tls.client_ca, "kms trust CA")?;
+
+    // reqwest's rustls `Identity` wants the leaf cert chain + private key in one PEM.
+    let mut identity_pem = cert;
+    identity_pem.push(b'\n');
+    identity_pem.extend_from_slice(&key);
+    let identity =
+        reqwest::Identity::from_pem(&identity_pem).map_err(|e| Error::Tls(e.to_string()))?;
+
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .use_rustls_tls()
+        .tls_built_in_root_certs(false)
+        .identity(identity);
+    for root in reqwest::Certificate::from_pem_bundle(&ca).map_err(|e| Error::Tls(e.to_string()))? {
+        builder = builder.add_root_certificate(root);
+    }
+    builder.build().map_err(|e| Error::Tls(e.to_string()))
+}
+
 impl IdentityKmsClient {
-    /// `base_url` is identity's KMS listener (WG-only, e.g. via the terminator); `auth_secret`
-    /// is the `X-Kms-Auth` boundary secret sent on each call.
-    #[must_use]
-    pub fn new(mut base_url: String, auth_secret: String) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("reqwest client");
+    /// Build a client for identity's KMS listener at `base_url`, authenticating with mTLS from
+    /// the broker's own TLS material (`tls`): the cert+key as the client identity, the fleet
+    /// Root CA bundle as the sole trust root for identity's server cert.
+    ///
+    /// # Errors
+    /// [`Error::Io`] if the cert/key/CA files can't be read; [`Error::Tls`] if they don't parse
+    /// or the TLS client can't be built.
+    pub fn new(base_url: String, tls: &crate::config::TlsPaths) -> Result<Self, Error> {
+        Ok(Self::from_parts(base_url, build_mtls_client(tls)?))
+    }
+
+    fn from_parts(mut base_url: String, http: reqwest::Client) -> Self {
         while base_url.ends_with('/') {
             base_url.pop();
         }
-        Self {
-            base_url,
-            auth_secret,
-            http,
-        }
+        Self { base_url, http }
     }
 
     /// One-time bootstrap: seal `master_key` under identity's per-group root, returning the
@@ -123,7 +158,6 @@ impl IdentityKmsClient {
         let resp = self
             .http
             .post(&url)
-            .header("X-Kms-Auth", &self.auth_secret)
             .json(body)
             .send()
             .await
@@ -171,37 +205,24 @@ fn set_owner_only(_path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::{HeaderMap, StatusCode};
     use axum::routing::post;
     use axum::{Json, Router};
     use serde_json::{json, Value};
 
-    fn check_auth(headers: &HeaderMap) -> Result<(), StatusCode> {
-        match headers.get("x-kms-auth").and_then(|v| v.to_str().ok()) {
-            Some("boundary-secret") => Ok(()),
-            _ => Err(StatusCode::UNAUTHORIZED),
-        }
-    }
-
-    // Mock identity KMS: a trivially-reversible "seal" (wrapped == the b64 master) so the
-    // client's request shape, X-Kms-Auth header, and seal→unseal round-trip are exercised.
-    async fn mock_seal(
-        headers: HeaderMap,
-        Json(req): Json<Value>,
-    ) -> Result<Json<Value>, StatusCode> {
-        check_auth(&headers)?;
+    // Mock identity KMS over plain HTTP — a trivially-reversible "seal" (wrapped == the b64
+    // master) so the client's request/response wire shapes + seal→unseal round-trip are
+    // exercised. The mTLS handshake is identity's side and is verified in the live eu
+    // round-trip; here we inject a plain client via `from_parts` (TLS config is moot for http).
+    async fn mock_seal(Json(req): Json<Value>) -> Json<Value> {
         let m = req["master_key_b64"]
             .as_str()
-            .ok_or(StatusCode::BAD_REQUEST)?;
-        Ok(Json(json!({ "kek_id": "eu-root-1", "wrapped": m })))
+            .unwrap_or_default()
+            .to_owned();
+        Json(json!({ "kek_id": "eu-2026a", "wrapped": m }))
     }
-    async fn mock_unseal(
-        headers: HeaderMap,
-        Json(req): Json<Value>,
-    ) -> Result<Json<Value>, StatusCode> {
-        check_auth(&headers)?;
-        let w = req["wrapped"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
-        Ok(Json(json!({ "master_key_b64": w })))
+    async fn mock_unseal(Json(req): Json<Value>) -> Json<Value> {
+        let w = req["wrapped"].as_str().unwrap_or_default().to_owned();
+        Json(json!({ "master_key_b64": w }))
     }
 
     async fn spawn_mock() -> String {
@@ -217,27 +238,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seal_then_unseal_round_trips_and_sends_auth() {
+    async fn seal_then_unseal_round_trips() {
         let url = spawn_mock().await;
-        let client = IdentityKmsClient::new(url, "boundary-secret".into());
+        let client = IdentityKmsClient::from_parts(url, reqwest::Client::new());
         let sealed = client.seal(b"correct horse battery staple").await.unwrap();
-        assert_eq!(sealed.kek_id, "eu-root-1");
+        assert_eq!(sealed.kek_id, "eu-2026a");
         let master = client.unseal(&sealed).await.unwrap();
         assert_eq!(master, b"correct horse battery staple");
     }
 
-    #[tokio::test]
-    async fn wrong_boundary_secret_is_rejected() {
-        let url = spawn_mock().await;
-        let client = IdentityKmsClient::new(url, "WRONG".into());
-        let err = client
-            .unseal(&SealedMaster {
-                kek_id: "eu-root-1".into(),
-                wrapped: B64.encode(b"x"),
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Status(401)));
+    #[test]
+    fn new_fails_on_unreadable_mtls_material() {
+        let tls = crate::config::TlsPaths {
+            cert: "/nonexistent/vault.pem".into(),
+            key: "/nonexistent/vault.key".into(),
+            client_ca: "/nonexistent/fleet-ca.pem".into(),
+        };
+        assert!(matches!(
+            IdentityKmsClient::new("https://identity.eu.proximi.fi".into(), &tls),
+            Err(Error::Io(_))
+        ));
     }
 
     #[test]

@@ -20,11 +20,14 @@ KMS root-of-trust chain (identity ↔ vault) — vault's side, LOCKED 2026-06-02
   blobs → emits `kms.rewrap_complete` so identity retires the old root).
 - **arm (a) — identity-sealed master key (unseal client).** New `identity_kms` module: at
   boot the broker exchanges an inert `{kek_id, wrapped}` blob for its plaintext unseal master
-  key via identity's WG-only KMS listener (`POST /kms/v1/{seal,unseal}`, `X-Kms-Auth` boundary
-  secret), so a stolen at-rest store is useless without a live in-group call to identity. Falls
-  back to the manual passphrase (break-glass) when identity is unreachable. Opt-in via
-  `VAULT_IDENTITY_KMS_URL`; one-time bootstrap with `VAULT_KMS_SEAL_INIT=1`. Ships gated off
-  until infra stands up the WG mTLS terminator + per-group root key.
+  key via identity's WG-only KMS listener (`POST /kms/v1/{seal,unseal}`), so a stolen at-rest
+  store is useless without a live in-group call to identity. **Auth = native mTLS** (infra
+  §2→(A) decision): the broker connects as an mTLS client presenting its own `VAULT_TLS_*`
+  cert (the dot-form `vault.<group>.proximi.internal`, clientAuth EKU) and trusts identity's
+  server cert via the fleet Root CA — no app-layer secret. Falls back to the manual passphrase
+  (break-glass) when identity is unreachable. Opt-in via `VAULT_IDENTITY_KMS_URL`; one-time
+  bootstrap with `VAULT_KMS_SEAL_INIT=1`. Ships gated off until the dot-form cert is adopted
+  and identity's listener (v0.1.13) + per-group root key are live.
 - **Still scheduled:** the `kms.rewrap_complete` emit (ack-gated retire signal) — wired when
   KEK rotation lands; identity's previous-root overlap window is its fast-follow on that.
 

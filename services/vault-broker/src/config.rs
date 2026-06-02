@@ -98,27 +98,15 @@ pub struct BrokerConfig {
     pub identity_kms: Option<IdentityKmsConfig>,
 }
 
-/// Config for the arm (a) seal/unseal client (`identity_kms`). The master key the broker
-/// unseals with is sealed under identity's per-group root; this points at that listener.
-#[derive(Clone)]
+/// Config for the arm (a) seal/unseal client (`identity_kms`). Auth is mTLS (the broker's own
+/// `VAULT_TLS_*` material — see `identity_kms`), so this carries no secret: just where to reach
+/// identity's KMS listener and where the inert sealed-master blob lives.
+#[derive(Debug, Clone)]
 pub struct IdentityKmsConfig {
-    /// Identity's WG-only KMS listener base URL (e.g. via the WG mTLS terminator).
+    /// Identity's WG-only native-mTLS KMS listener base URL (e.g. `https://10.200.0.100:8202`).
     pub url: String,
-    /// The `X-Kms-Auth` boundary secret forwarded to identity (from `VAULT_IDENTITY_KMS_AUTH[_FILE]`).
-    pub auth_secret: String,
     /// Where the inert `{kek_id, wrapped}` sealed-master blob is persisted (encrypted dataset).
     pub sealed_master_file: PathBuf,
-}
-
-// Redact the boundary secret so a debug-print of the config can never leak it.
-impl std::fmt::Debug for IdentityKmsConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IdentityKmsConfig")
-            .field("url", &self.url)
-            .field("auth_secret", &"<redacted>")
-            .field("sealed_master_file", &self.sealed_master_file)
-            .finish()
-    }
 }
 
 /// Issuer/audience config for verifying identity-minted kms-cap tokens. The instance's
@@ -218,20 +206,12 @@ impl BrokerConfig {
 }
 
 /// Build the arm (a) config from env. `None` when `VAULT_IDENTITY_KMS_URL` is unset (arm (a)
-/// off). A URL without a boundary secret is a misconfig → log + disable (never run unauthed).
+/// off). Auth to identity is mTLS via the broker's `VAULT_TLS_*` material (no secret here).
 /// The sealed-master blob defaults next to the at-rest store unless `VAULT_SEALED_MASTER_FILE`.
 fn load_identity_kms(store_path: &Path) -> Option<IdentityKmsConfig> {
     let url = std::env::var("VAULT_IDENTITY_KMS_URL")
         .ok()
         .filter(|s| !s.is_empty())?;
-    let Some(auth_secret) =
-        read_secret_env("VAULT_IDENTITY_KMS_AUTH", "VAULT_IDENTITY_KMS_AUTH_FILE")
-    else {
-        eprintln!(
-            "vault-broker: VAULT_IDENTITY_KMS_URL set but no VAULT_IDENTITY_KMS_AUTH[_FILE]; arm (a) DISABLED (manual passphrase only)"
-        );
-        return None;
-    };
     let sealed_master_file = std::env::var("VAULT_SEALED_MASTER_FILE").map_or_else(
         |_| {
             store_path
@@ -243,24 +223,8 @@ fn load_identity_kms(store_path: &Path) -> Option<IdentityKmsConfig> {
     );
     Some(IdentityKmsConfig {
         url,
-        auth_secret,
         sealed_master_file,
     })
-}
-
-/// Read a secret from `direct` (env), else from a file at `file_var` (mode-600 on the encrypted
-/// dataset). Env wins; trailing newline trimmed; empty → `None`.
-fn read_secret_env(direct: &str, file_var: &str) -> Option<String> {
-    if let Ok(v) = std::env::var(direct) {
-        if !v.is_empty() {
-            return Some(v);
-        }
-    }
-    let path = std::env::var(file_var).ok()?;
-    std::fs::read_to_string(&path)
-        .ok()
-        .map(|s| s.trim_end_matches(['\n', '\r']).to_owned())
-        .filter(|s| !s.is_empty())
 }
 
 /// Roles config file shape (`VAULT_ROLES_CONFIG`, JSON):

@@ -75,7 +75,18 @@ async fn obtain_unseal_passphrase(cfg: &BrokerConfig) -> Option<String> {
     let Some(k) = &cfg.identity_kms else {
         return unseal_passphrase(); // arm (a) not configured → manual passphrase
     };
-    let client = identity_kms::IdentityKmsClient::new(k.url.clone(), k.auth_secret.clone());
+    // Arm (a) authenticates to identity with the broker's own mTLS material (client cert).
+    let Some(tls) = &cfg.tls else {
+        eprintln!("vault-broker: arm (a) configured but no VAULT_TLS_* mTLS material for the KMS client; using manual passphrase");
+        return unseal_passphrase();
+    };
+    let client = match identity_kms::IdentityKmsClient::new(k.url.clone(), tls) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("vault-broker: KMS client mTLS setup FAILED ({e}); falling back to manual passphrase");
+            return unseal_passphrase();
+        }
+    };
 
     if std::env::var("VAULT_KMS_SEAL_INIT").as_deref() == Ok("1") {
         return seal_init(&client, k).await;
