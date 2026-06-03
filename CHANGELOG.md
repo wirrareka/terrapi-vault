@@ -3,6 +3,15 @@
 terrapi-vault — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
+## Unreleased
+
+- **OpenSearch clients gain a CA-file TLS option (`opensearch.rs`, `audit_ship.rs`).** New
+  `VAULT_OS_CA` / `VAULT_AUDIT_OS_CA` (PEM, mirrors `VAULT_TLS_CLIENT_CA`): when set, the cred-engine
+  and audit-ship reqwest clients add it as the **sole** trust root (built-in/public roots off), so a
+  fleet-CA-signed OpenSearch node cert verifies — the rustls client ignores the FreeBSD system trust,
+  so the prior options were only `*_INSECURE_TLS`. Lets eu drop the interim insecure toggle. Shared
+  `build_os_client` helper (no duplicate client-build logic across the two modules).
+
 ## 0.1.5 (2026-06-03)
 
 KMS hardening from a high-effort code review of the v0.1.4 chain:

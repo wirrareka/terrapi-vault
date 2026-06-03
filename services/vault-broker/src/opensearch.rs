@@ -54,10 +54,8 @@ impl OpenSearchEngine {
             );
         }
 
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(insecure)
-            .build()
-            .map_err(|e| format!("opensearch http client: {e}"))?;
+        let ca_path = std::env::var("VAULT_OS_CA").ok().filter(|s| !s.is_empty());
+        let client = build_os_client(insecure, ca_path, "VAULT_OS_CA")?;
 
         Ok(Some(Self {
             client,
@@ -81,6 +79,34 @@ impl OpenSearchEngine {
             self.base_url
         )
     }
+}
+
+/// Build a reqwest client for an OpenSearch endpoint. When `ca_pem_path` is set, that PEM (bundle)
+/// becomes the **sole** trust root (built-in/public roots disabled) — so a fleet-CA-signed node
+/// cert verifies without relying on the OS system trust (the rustls client ignores it). `insecure`
+/// disables verification entirely (dev only). `label` names the env source for error messages.
+/// Shared by the cred engine and the audit shipper so both gain the CA option uniformly.
+///
+/// # Errors
+/// `String` if the CA file can't be read/parsed or the client can't be built.
+pub(crate) fn build_os_client(
+    insecure: bool,
+    ca_pem_path: Option<String>,
+    label: &str,
+) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(insecure);
+    if let Some(path) = ca_pem_path {
+        let pem = std::fs::read(&path).map_err(|e| format!("{label} {path}: {e}"))?;
+        builder = builder.tls_built_in_root_certs(false);
+        for cert in reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|e| format!("{label} parse: {e}"))?
+        {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+    builder
+        .build()
+        .map_err(|e| format!("opensearch http client: {e}"))
 }
 
 #[async_trait::async_trait]
@@ -135,6 +161,43 @@ impl CredEngine for OpenSearchEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_os_client_no_ca_builds() {
+        // No CA + verifying: builds fine (uses default roots). Insecure also builds.
+        assert!(build_os_client(false, None, "VAULT_OS_CA").is_ok());
+        assert!(build_os_client(true, None, "VAULT_OS_CA").is_ok());
+    }
+
+    #[test]
+    fn build_os_client_unreadable_ca_errors() {
+        let err = build_os_client(
+            false,
+            Some("/nonexistent/fleet-ca.pem".into()),
+            "VAULT_OS_CA",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("VAULT_OS_CA"),
+            "error names the env source: {err}"
+        );
+    }
+
+    #[test]
+    fn build_os_client_accepts_a_valid_ca_pem() {
+        // A self-signed cert PEM is a valid trust root to add (verification target is separate).
+        let cert = rcgen::generate_simple_self_signed(vec!["ca.test".into()]).unwrap();
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("vault-os-ca-test-{}.pem", std::process::id()));
+        std::fs::write(&path, cert.cert.pem()).unwrap();
+        assert!(build_os_client(
+            false,
+            Some(path.to_string_lossy().into_owned()),
+            "VAULT_OS_CA"
+        )
+        .is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// Integration test against a live OpenSearch. Skipped unless `VAULT_OS_TEST_URL` is
     /// set (see docs/dev/opensearch-it.md for the docker one-liner). Verifies the full

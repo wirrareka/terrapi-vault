@@ -78,12 +78,16 @@ ZFS dataset encryption, and WG isolation.
 - `VAULT_AUDIT_OS_URL` / `VAULT_AUDIT_OS_USER` / `VAULT_AUDIT_OS_PASSWORD` — optional
   best-effort shipping of B3 events to group-local OpenSearch (`audit-events-{group}-YYYY.MM`,
   bulk-indexed by a background task; a ship failure never blocks issuance). Set
-  `VAULT_AUDIT_OS_URL` to enable. `VAULT_AUDIT_OS_INSECURE_TLS=1` for dev/self-signed.
+  `VAULT_AUDIT_OS_URL` to enable. `VAULT_AUDIT_OS_CA` = PEM CA-file to verify the OS node cert
+  (e.g. the fleet Root CA; the rustls client does NOT use the FreeBSD system trust). `VAULT_AUDIT_OS_INSECURE_TLS=1`
+  for dev/self-signed only — prefer `VAULT_AUDIT_OS_CA`.
 - `VAULT_OS_URL` / `VAULT_OS_ADMIN_USER` / `VAULT_OS_ADMIN_PASSWORD` — OpenSearch
   dynamic-cred engine: the cluster + the admin credential the broker uses to mint/delete
   ephemeral users. Set `VAULT_OS_URL` to enable the engine. `VAULT_OS_ROLE` (default
-  `audit-writer`), `VAULT_OS_MAX_TTL_SECS` (default 28800), `VAULT_OS_INSECURE_TLS=1`
-  (dev/self-signed only). See `docs/dev/opensearch-it.md`.
+  `audit-writer`), `VAULT_OS_MAX_TTL_SECS` (default 28800), `VAULT_OS_CA` (PEM CA-file to verify
+  the OS node cert — the rustls client ignores the system trust), `VAULT_OS_INSECURE_TLS=1`
+  (dev/self-signed only; refused outside `VAULT_ALLOW_INSECURE_DEV` — use `VAULT_OS_CA` in prod).
+  See `docs/dev/opensearch-it.md`.
 - `VAULT_ALLOW_INSECURE_DEV=1` — **local dev only**: plain HTTP, `X-Client-Cert-SAN`
   header identity, auto-unseal with an ephemeral key. Never in production.
 

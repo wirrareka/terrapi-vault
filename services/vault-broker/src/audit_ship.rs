@@ -52,6 +52,7 @@ struct ShipConfig {
     user: String,
     password: String,
     insecure: bool,
+    ca_path: Option<String>,
 }
 
 impl ShipConfig {
@@ -62,6 +63,9 @@ impl ShipConfig {
             user: std::env::var("VAULT_AUDIT_OS_USER").unwrap_or_else(|_| "admin".into()),
             password: std::env::var("VAULT_AUDIT_OS_PASSWORD").unwrap_or_default(),
             insecure: std::env::var("VAULT_AUDIT_OS_INSECURE_TLS").as_deref() == Ok("1"),
+            ca_path: std::env::var("VAULT_AUDIT_OS_CA")
+                .ok()
+                .filter(|s| !s.is_empty()),
         })
     }
 }
@@ -73,10 +77,11 @@ pub fn build(cfg: &BrokerConfig) -> (Arc<dyn AuditSink>, Option<ShipTask>) {
     let Some(ship) = ShipConfig::from_env() else {
         return (sink, None);
     };
-    let client = match reqwest::Client::builder()
-        .danger_accept_invalid_certs(ship.insecure)
-        .build()
-    {
+    let client = match crate::opensearch::build_os_client(
+        ship.insecure,
+        ship.ca_path.clone(),
+        "VAULT_AUDIT_OS_CA",
+    ) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("vault-broker: audit shipper DISABLED (http client: {e})");
