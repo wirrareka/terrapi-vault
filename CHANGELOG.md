@@ -3,7 +3,7 @@
 terrapi-vault — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
-## Unreleased
+## 0.1.6 (2026-06-04)
 
 - **OpenSearch clients gain a CA-file TLS option (`opensearch.rs`, `audit_ship.rs`).** New
   `VAULT_OS_CA` / `VAULT_AUDIT_OS_CA` (PEM, mirrors `VAULT_TLS_CLIENT_CA`): when set, the cred-engine

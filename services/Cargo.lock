@@ -2235,7 +2235,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "vault-broker"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "axum",
@@ -2266,7 +2266,7 @@ dependencies = [
 
 [[package]]
 name = "vault-sync"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "axum",
  "base64",
@@ -2287,7 +2287,7 @@ dependencies = [
 
 [[package]]
 name = "vault-transport"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "serde_json",
