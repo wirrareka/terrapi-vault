@@ -1,7 +1,7 @@
 //! The [`Vault`] type: lifecycle over an encrypted SQLCipher database.
 
 use crate::error::{Error, Result};
-use crate::kdf::{derive_key, random_salt, DerivedKey, KdfParams};
+use crate::kdf::{derive_key, random_salt, DerivedKey, KdfParams, SALT_LEN};
 use crate::meta::{meta_path_for, VaultMeta};
 use rusqlite::Connection;
 use secrecy::{ExposeSecret, SecretBox};
@@ -32,6 +32,28 @@ pub struct Vault {
     key: SecretBox<DerivedKey>,
     vault_path: PathBuf,
     meta_path: PathBuf,
+}
+
+/// Snapshot of the inputs the (expensive) rotation KDF needs.
+///
+/// Captured cheaply on the thread that owns the [`Vault`]
+/// ([`Vault::rotation_inputs`]) so the two Argon2id derivations in
+/// [`Vault::plan_rotation`] can then run on a background thread while the
+/// `!Send` vault stays put. The current key it carries zeroizes on drop;
+/// treat its bytes as sensitive and never log or persist them.
+pub struct RotationInputs {
+    current_key: SecretBox<DerivedKey>,
+    salt: [u8; SALT_LEN],
+    params: KdfParams,
+}
+
+/// The result of the expensive half of a key rotation: a key freshly derived
+/// from the new passphrase over a fresh salt, ready to be committed by
+/// [`Vault::apply_rotation`]. Carries no passphrase; the key zeroizes on drop.
+pub struct RotationPlan {
+    new_key: SecretBox<DerivedKey>,
+    new_salt: [u8; SALT_LEN],
+    params: KdfParams,
 }
 
 impl std::fmt::Debug for Vault {
@@ -202,36 +224,93 @@ impl Vault {
     ///
     /// [`Error::WrongPassphrase`] if `old_passphrase` is wrong, otherwise
     /// [`Error::Db`] / [`Error::Io`] / [`Error::Json`].
+    ///
+    /// This is the synchronous all-in-one path: it runs the expensive
+    /// Argon2id KDF inline, so it blocks its thread for the KDF's duration
+    /// (~seconds). A UI that must stay responsive should instead drive the
+    /// three-phase split — [`rotation_inputs`](Self::rotation_inputs) (cheap,
+    /// on the vault's thread) → [`plan_rotation`](Self::plan_rotation)
+    /// (expensive, on a background thread) → [`apply_rotation`](Self::apply_rotation)
+    /// (cheap, back on the vault's thread) — of which this method is exactly
+    /// the composition.
     pub fn rotate_key(&mut self, old_passphrase: &str, new_passphrase: &str) -> Result<()> {
-        let meta = VaultMeta::read(&self.meta_path)?;
-        let salt = meta.salt()?;
+        let inputs = self.rotation_inputs()?;
+        let plan = Self::plan_rotation(&inputs, old_passphrase, new_passphrase)?;
+        self.apply_rotation(plan)
+    }
 
-        // Confirm the caller actually knows the current passphrase before
-        // we touch the cipher key. Compare in constant time so the check does
-        // not leak how many leading key bytes matched via timing (no extra
-        // crate — a fixed-length XOR-accumulate over the 32-byte keys).
-        let old_key = derive_key(old_passphrase, &salt, meta.kdf_params)?;
-        if !constant_time_eq(&old_key.expose_secret().0, &self.key.expose_secret().0) {
+    /// Cheaply snapshot the inputs a rotation's KDF needs, so the expensive
+    /// [`plan_rotation`](Self::plan_rotation) can run off the vault's thread.
+    ///
+    /// Reads the sidecar (salt + KDF params) and clones the current derived
+    /// key. The returned [`RotationInputs`] is `Send`; its key bytes are
+    /// sensitive — never log or persist them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] / [`Error::Json`] if the sidecar cannot be read.
+    pub fn rotation_inputs(&self) -> Result<RotationInputs> {
+        let meta = VaultMeta::read(&self.meta_path)?;
+        Ok(RotationInputs {
+            current_key: self.derived_key(),
+            salt: meta.salt()?,
+            params: meta.kdf_params,
+        })
+    }
+
+    /// The expensive half of a rotation: two Argon2id derivations plus a
+    /// constant-time check that `old_passphrase` matches the current key.
+    ///
+    /// Pure compute over owned inputs — it touches no files and no connection,
+    /// so it is safe (and intended) to run on a background executor while the
+    /// `!Send` vault stays on its own thread. Compares in constant time so the
+    /// check does not leak how many leading key bytes matched via timing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongPassphrase`] if `old_passphrase` is wrong, [`Error::Kdf`]
+    /// on invalid params.
+    pub fn plan_rotation(
+        inputs: &RotationInputs,
+        old_passphrase: &str,
+        new_passphrase: &str,
+    ) -> Result<RotationPlan> {
+        let old_key = derive_key(old_passphrase, &inputs.salt, inputs.params)?;
+        if !constant_time_eq(&old_key.expose_secret().0, &inputs.current_key.expose_secret().0) {
             return Err(Error::WrongPassphrase);
         }
-
         let new_salt = random_salt();
-        let new_key = derive_key(new_passphrase, &new_salt, meta.kdf_params)?;
+        let new_key = derive_key(new_passphrase, &new_salt, inputs.params)?;
+        Ok(RotationPlan {
+            new_key,
+            new_salt,
+            params: inputs.params,
+        })
+    }
 
-        // Crash-safe rotation. `PRAGMA rekey` re-encrypts the DB in place under the new key, so
-        // the sidecar must follow it; a crash between the two would otherwise brick the vault
-        // (the committed sidecar's salt no longer matches the DB key). Stage the new sidecar
-        // BEFORE rekey, rekey, then atomically commit it. If we crash after rekey but before the
-        // commit, the staged sidecar (whose salt matches the rekeyed DB) survives and `open`
-        // finalizes it — see `recover_interrupted_rekey`.
+    /// The cheap, crash-safe half of a rotation: commit a [`RotationPlan`].
+    /// Must run on the thread that owns the connection.
+    ///
+    /// `PRAGMA rekey` re-encrypts the DB in place under the new key, so the
+    /// sidecar must follow it; a crash between the two would otherwise brick
+    /// the vault (the committed sidecar's salt no longer matches the DB key).
+    /// Stage the new sidecar BEFORE rekey, rekey, then atomically commit it.
+    /// If we crash after rekey but before the commit, the staged sidecar
+    /// (whose salt matches the rekeyed DB) survives and `open` finalizes it —
+    /// see `recover_interrupted_rekey`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`] / [`Error::Io`] / [`Error::Json`].
+    pub fn apply_rotation(&mut self, plan: RotationPlan) -> Result<()> {
         let staged = rekey_staging_path(&self.meta_path);
-        VaultMeta::new(&new_salt, meta.kdf_params).write(&staged)?;
-        let literal = new_key.expose_secret().pragma_literal();
+        VaultMeta::new(&plan.new_salt, plan.params).write(&staged)?;
+        let literal = plan.new_key.expose_secret().pragma_literal();
         self.conn
             .pragma_update(None, "rekey", literal.as_str())
             .map_err(map_cipher_err)?;
         std::fs::rename(&staged, &self.meta_path)?;
-        self.key = new_key;
+        self.key = plan.new_key;
         Ok(())
     }
 
@@ -539,6 +618,51 @@ mod tests {
         assert!(matches!(
             v.rotate_key("bogus", "new").unwrap_err(),
             Error::WrongPassphrase
+        ));
+    }
+
+    #[test]
+    fn three_phase_rotation_matches_rotate_key() {
+        // The split path (rotation_inputs → plan_rotation → apply_rotation) the
+        // responsive UI uses must be byte-for-byte equivalent to rotate_key:
+        // same crash-safe on-disk protocol, same data preserved, old passphrase
+        // rejected afterwards.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        {
+            let mut v = Vault::create(&path, "old", p()).unwrap();
+            v.with_connection(|c| c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (9);"))
+                .unwrap();
+            let inputs = v.rotation_inputs().unwrap();
+            // plan_rotation is the off-thread half; takes only owned inputs.
+            let plan = Vault::plan_rotation(&inputs, "old", "new").unwrap();
+            v.apply_rotation(plan).unwrap();
+            v.lock();
+        }
+        assert!(matches!(
+            Vault::open(&path, "old").unwrap_err(),
+            Error::WrongPassphrase
+        ));
+        let v = Vault::open(&path, "new").unwrap();
+        let x: i64 = v
+            .with_connection(|c| c.query_row("SELECT x FROM t", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(x, 9);
+    }
+
+    #[test]
+    fn plan_rotation_rejects_wrong_old_passphrase() {
+        // The constant-time passphrase check must live in the off-thread half,
+        // so a wrong old passphrase never reaches apply_rotation / PRAGMA rekey.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        let v = Vault::create(&path, "old", p()).unwrap();
+        let inputs = v.rotation_inputs().unwrap();
+        // `matches!` (not `unwrap_err`) because the Ok variant `RotationPlan`
+        // holds a `SecretBox` and deliberately has no `Debug`.
+        assert!(matches!(
+            Vault::plan_rotation(&inputs, "bogus", "new"),
+            Err(Error::WrongPassphrase)
         ));
     }
 

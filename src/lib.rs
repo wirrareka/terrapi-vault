@@ -68,7 +68,7 @@ pub use kdf::{derive_key, random_salt, DerivedKey, KdfParams, KEY_LEN, SALT_LEN}
 pub use meta::{meta_path_for, VaultMeta, FORMAT_VERSION, META_SUFFIX};
 #[cfg(feature = "note-export")]
 pub use note_export::{export_note, import_note, ExportedNote, CONTAINER_VERSION, NOTE_MAGIC};
-pub use vault::Vault;
+pub use vault::{RotationInputs, RotationPlan, Vault};
 
 /// Re-export of the `rusqlite` version this crate links, so downstream
 /// crates can depend on the exact same SQLCipher/rusqlite without a
