@@ -700,7 +700,10 @@ fn do_presign(
         action,
         Target {
             kind: "object-store".into(),
-            id: Some(format!("key={key};tenant={};expires={expires}", req.tenant_id)),
+            id: Some(format!(
+                "key={key};tenant={};expires={expires}",
+                req.tenant_id
+            )),
         },
         Outcome::Success,
         None,
@@ -721,8 +724,7 @@ fn is_safe_segment(s: &str) -> bool {
         && s.len() <= 128
         && s != "."
         && s != ".."
-        && s
-            .bytes()
+        && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 

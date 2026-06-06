@@ -312,7 +312,9 @@ mod tests {
         // signature is 64 lowercase hex chars
         let sig = url1.split("X-Amz-Signature=").nth(1).unwrap();
         assert_eq!(sig.len(), 64);
-        assert!(sig.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert!(sig
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
     }
 
     #[test]
