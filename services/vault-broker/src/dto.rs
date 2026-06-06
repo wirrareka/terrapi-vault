@@ -70,6 +70,47 @@ pub struct CredsResponse {
     pub max_ttl_secs: u64,
 }
 
+// --- Object-store presign -------------------------------------------------------
+
+/// Which object the publisher is presigning a PUT for. Selects a server-constructed key
+/// template (the client never supplies a path), so a publish is two calls: `archive` then
+/// `manifest`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PresignKind {
+    /// The tile archive: `t/<tenant>/<map_id>/<version>.pmtiles`.
+    Archive,
+    /// The mutable pointer readers follow: `t/<tenant>/<map_id>/latest.json`.
+    Manifest,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PresignRequest {
+    /// Tenant (Vulture `organization_id`), lowercase UUIDv4.
+    pub tenant_id: String,
+    /// Map/dataset id, `[A-Za-z0-9._-]`.
+    pub map_id: String,
+    /// Version label, `[A-Za-z0-9._-]` (e.g. a date or build id). Ignored for `manifest`.
+    pub version: String,
+    pub kind: PresignKind,
+    /// Requested URL lifetime; clamped to the signer's `[1, max]`. Defaults when absent.
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+}
+
+/// A short-TTL presigned PUT URL. No secret transits: the URL authorises a single `PUT` to
+/// `key` until `expires` and nothing else. NOT a lease — there is no `lease_id` / revoke.
+#[derive(Serialize)]
+pub struct PresignResponse {
+    pub url: String,
+    /// Always `PUT` (the only method the URL is signed for).
+    pub method: String,
+    /// The exact object key the URL is scoped to (non-secret; echoes what the client will hit).
+    pub key: String,
+    /// Absolute expiry, unix seconds.
+    pub expires: u64,
+}
+
 // --- Sessions + leases ----------------------------------------------------------
 
 #[derive(Debug, Deserialize)]

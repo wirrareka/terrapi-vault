@@ -165,6 +165,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/{group}/{tenant_id}/kms/{key_id}/rewrap",
             post(kms_rewrap),
         )
+        .route("/v1/{group}/object-store/presign", post(presign))
         .route("/v1/sys/session", post(session_open))
         .route("/v1/sys/session/{id}", delete(session_end))
         .route("/v1/sys/store-snapshot", post(store_snapshot))
@@ -593,6 +594,97 @@ async fn creds(
         renewable: true,
         max_ttl_secs: issued.max_ttl_secs,
     }))
+}
+
+/// Sign a short-TTL presigned `PUT` URL for a tile archive or its manifest pointer. **Stateless**
+/// — no lease: the URL authorises exactly one `PUT` to one server-constructed key until it
+/// expires, and nothing else (DO Spaces has no per-key API, so the per-tenant / write-only /
+/// single-object scoping lives in the signature). The `object-store` cap gates it; residency is
+/// enforced by the `Group` extractor (the bucket is per-instance). See `object_store.rs` +
+/// `inbox/vault/proximiio-outer-map-object-storage-creds.md`.
+async fn presign(
+    State(state): State<AppState>,
+    principal: Principal,
+    _group: Group,
+    Json(req): Json<crate::dto::PresignRequest>,
+) -> ApiResult<crate::dto::PresignResponse> {
+    require_cap(&principal, Capability::ObjectStore)?;
+    let Some(signer) = state.object_store.clone() else {
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_configured",
+            "object-store presign is not configured on this instance",
+        ));
+    };
+    if !is_uuid_v4_lower(&req.tenant_id) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "bad_tenant_id",
+            "tenant_id must be a lowercase UUIDv4 (Vulture organization_id)",
+        ));
+    }
+    if !is_safe_segment(&req.map_id) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "bad_map_id",
+            "map_id must be 1-128 chars of [A-Za-z0-9._-] and not '.'/'..'",
+        ));
+    }
+    let kind = match req.kind {
+        crate::dto::PresignKind::Archive => crate::object_store::Kind::Archive,
+        crate::dto::PresignKind::Manifest => crate::object_store::Kind::Manifest,
+    };
+    // `version` only appears in the archive key; validate it where it's used.
+    if matches!(kind, crate::object_store::Kind::Archive) && !is_safe_segment(&req.version) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "bad_version",
+            "version must be 1-128 chars of [A-Za-z0-9._-] and not '.'/'..'",
+        ));
+    }
+
+    let key = crate::object_store::ObjectStoreSigner::object_key(
+        kind,
+        &req.tenant_id,
+        &req.map_id,
+        &req.version,
+    );
+    let ttl = signer.clamp_ttl(req.ttl_secs);
+    let (url, expires) = signer.presign_put(&key, now_unix(), ttl);
+
+    // Audit the issuance — the object key + tenant + expiry only. NEVER the URL or signature.
+    state.emit(&AuditEvent::vault(
+        AppState::now_ts(),
+        state.cfg.node.clone(),
+        Some(state.cfg.residency_group.as_str().to_owned()),
+        system_actor(&principal),
+        "object_store.presign",
+        Target {
+            kind: "object-store".into(),
+            id: Some(format!("key={key};tenant={};expires={expires}", req.tenant_id)),
+        },
+        Outcome::Success,
+        None,
+    ));
+
+    Ok(Json(crate::dto::PresignResponse {
+        url,
+        method: "PUT".into(),
+        key,
+        expires,
+    }))
+}
+
+/// A single object-key path component: non-empty, ≤128 of `[A-Za-z0-9._-]`, and not `.`/`..`
+/// — so a caller can't escape its server-constructed prefix (`/` is already off the charset).
+fn is_safe_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s != "."
+        && s != ".."
+        && s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Backup-target key id: a short, filesystem/DB-safe token (the aether `target_id`).

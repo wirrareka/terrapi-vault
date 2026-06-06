@@ -1932,6 +1932,7 @@ name = "terrapi-vault"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "chacha20poly1305",
  "rand 0.8.6",
  "rusqlite",
  "secrecy",
@@ -2241,6 +2242,7 @@ dependencies = [
  "axum",
  "base64",
  "chacha20poly1305",
+ "hmac",
  "hyper",
  "hyper-util",
  "jsonwebtoken",

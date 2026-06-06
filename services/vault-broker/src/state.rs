@@ -126,6 +126,10 @@ pub struct AppState {
     /// KMS-cap JWT verifier (Option J). `Some` when `VAULT_KMS_JWT_ISSUER` is configured →
     /// kms ops require a valid identity-minted ES256 bearer token; `None` → kms is cap-based.
     pub kms_jwt: Option<Arc<crate::jwt::JwtVerifier>>,
+    /// Object-store presigner (DO Spaces tile publishing). `Some` when `VAULT_OBJECT_STORE_KEY`
+    /// is configured → `object-store/presign` signs URLs; `None` → that op is `503 not_configured`.
+    /// Independent of the seal (the Spaces key is env-held, like the OpenSearch admin cred).
+    pub object_store: Option<Arc<crate::object_store::ObjectStoreSigner>>,
 }
 
 /// Current unix time in seconds — the clock the lease/session engine is driven by.
@@ -196,6 +200,19 @@ impl AppState {
                 c.jwks_uri.clone(),
             ))
         });
+        // Object-store presigner: built from env (VAULT_OBJECT_STORE_*), like the OpenSearch
+        // engine. Disabled (op → 503) when unconfigured; a misconfig logs + stays disabled.
+        let object_store = match crate::object_store::ObjectStoreSigner::from_env() {
+            Ok(Some(s)) => {
+                eprintln!("vault-broker: object-store presigner enabled");
+                Some(Arc::new(s))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("vault-broker: object-store presigner DISABLED ({e})");
+                None
+            }
+        };
         let sealed = seal.is_none();
         let (store, ssh_ca) = match seal {
             Some(u) => (
@@ -217,6 +234,7 @@ impl AppState {
             metrics: Arc::new(Metrics::default()),
             harden,
             kms_jwt,
+            object_store,
             cfg: Arc::new(cfg),
         }
     }

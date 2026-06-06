@@ -39,6 +39,7 @@ info:
     | `ssh-sign` | `POST /v1/{group}/ssh/sign` |
     | `creds`    | `POST /v1/{group}/{tenant_id}/creds/{role}` |
     | `kms`      | `POST /v1/{group}/{tenant_id}/kms/{key_id}/{wrap,unwrap,rotate,rewrap}` |
+    | `object-store` | `POST /v1/{group}/object-store/presign` |
     | `session`  | `POST /v1/sys/session`, `DELETE /v1/sys/session/{id}` |
     | `leases`   | `POST /v1/sys/leases/{renew,revoke}` |
     | `snapshot` | `POST /v1/sys/store-snapshot` |
@@ -82,6 +83,7 @@ tags:
   - { name: ssh, description: SSH signed-certificate CA (group-scoped). }
   - { name: creds, description: Leased, ephemeral service-admin credentials (tenant-scoped). }
   - { name: kms, description: Per-target KEK wrap/unwrap (envelope encryption; KEK never leaves the broker). }
+  - { name: object-store, description: Short-TTL presigned PUT URLs for tile publishing (stateless; the Spaces key never leaves the broker). }
 
 security:
   - mtlsWireGuard: []
@@ -267,6 +269,30 @@ components:
           properties:
             username: { type: string, description: ephemeral backend user, created on issue, deleted on revoke/expiry }
             password: { type: string, description: generated secret — NEVER logged or audited }
+
+    PresignRequest:
+      type: object
+      required: [tenant_id, map_id, version, kind]
+      properties:
+        tenant_id: { type: string, format: uuid, description: tenant (Vulture organization_id), lowercase UUIDv4 }
+        map_id: { type: string, pattern: "^[A-Za-z0-9._-]{1,128}$", description: map/dataset id }
+        version: { type: string, pattern: "^[A-Za-z0-9._-]{1,128}$", description: "version label (ignored for kind=manifest)" }
+        kind:
+          type: string
+          enum: [archive, manifest]
+          description: >
+            archive → key `t/<tenant_id>/<map_id>/<version>.pmtiles`;
+            manifest → key `t/<tenant_id>/<map_id>/latest.json`. Server-constructed; the client supplies no path.
+        ttl_secs: { type: integer, minimum: 1, description: "requested URL lifetime; clamped to the signer's [1, max] (default 300, max 900). Optional." }
+
+    PresignResponse:
+      type: object
+      required: [url, method, key, expires]
+      properties:
+        url: { type: string, description: presigned PUT URL — authorises exactly one PUT to `key` until `expires`, nothing else }
+        method: { type: string, enum: [PUT], description: the only method the URL is signed for }
+        key: { type: string, description: the object key the URL is scoped to (non-secret; echoes the target) }
+        expires: { type: integer, description: absolute expiry, unix seconds }
 
     KmsWrapRequest:
       type: object
@@ -606,6 +632,34 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/GroupMismatch" }
         "503": { $ref: "#/components/responses/Sealed" }
+
+  /v1/{group}/object-store/presign:
+    post:
+      tags: [object-store]
+      operationId: presignObjectPut
+      summary: Sign a short-TTL presigned PUT URL for one tile-archive or manifest object.
+      description: |
+        Returns a presigned S3-style **PUT** URL scoped to exactly one server-constructed
+        object key, valid until `expires`. The publisher (`proximiio-outer-map`) PUTs the
+        bytes **direct to Spaces** — no payload transits the broker. DO Spaces has no
+        per-key API, so the per-tenant / write-only / single-object scoping lives in the
+        **SigV4 signature**, not in the underlying Spaces key (which the broker holds and
+        never exports). **Stateless: NOT a lease** — there is no `lease_id` and no
+        renew/revoke; the short TTL is the only bound (a presigned URL can't be revoked).
+        A publish is two calls: `kind=archive` then `kind=manifest`. Residency: the bucket
+        is per-instance, so an `eu` signer can only sign `eu`-bucket URLs.
+      x-implementation-status: implemented
+      x-audit-action: object_store.presign
+      parameters:
+        - { $ref: "#/components/parameters/GroupParam" }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/PresignRequest" } } } }
+      responses:
+        "200": { description: presigned PUT URL + expiry, content: { application/json: { schema: { $ref: "#/components/schemas/PresignResponse" } } } }
+        "400": { description: bad tenant_id (not lowercase UUIDv4) / map_id / version, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/GroupMismatch" }
+        "503": { description: object-store presign not configured on this instance (no Spaces key), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
 
   /v1/sys/session:
     post:

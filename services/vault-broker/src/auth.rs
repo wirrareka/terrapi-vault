@@ -47,6 +47,8 @@ pub enum Capability {
     Leases,
     /// `POST /v1/{group}/{tenant_id}/kms/{key_id}/{wrap,unwrap}`
     Kms,
+    /// `POST /v1/{group}/object-store/presign` (short-TTL presigned PUT URL for tile publishing)
+    ObjectStore,
     /// `POST /v1/sys/store-snapshot` (consistent snapshot of vault's own at-rest store)
     Snapshot,
 }
@@ -62,6 +64,7 @@ impl Capability {
             Capability::Session,
             Capability::Leases,
             Capability::Kms,
+            Capability::ObjectStore,
             Capability::Snapshot,
         ]
         .into_iter()
@@ -194,7 +197,7 @@ mod tests {
     #[test]
     fn dev_principal_holds_all_caps() {
         let all = Capability::all();
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
         for c in [
             Capability::SshCa,
             Capability::SshSign,
@@ -202,6 +205,7 @@ mod tests {
             Capability::Session,
             Capability::Leases,
             Capability::Kms,
+            Capability::ObjectStore,
             Capability::Snapshot,
         ] {
             assert!(all.contains(&c));

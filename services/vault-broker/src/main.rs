@@ -20,6 +20,7 @@ mod http;
 mod identity_kms;
 mod jwt;
 mod kms;
+mod object_store;
 mod opensearch;
 mod seal;
 mod ssh_ca;
