@@ -12,7 +12,7 @@ jobs:
   lib-msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust 1.83 (the lib MSRV floor)
         uses: dtolnay/rust-toolchain@1.83.0
         with:
@@ -28,7 +28,7 @@ jobs:
   lib-neutrality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.83.0
       - name: Assert no platform/networking deps in the lib tree
         run: |
@@ -49,7 +49,7 @@ jobs:
       run:
         working-directory: services
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust 1.91.1 (services build toolchain)
         uses: dtolnay/rust-toolchain@1.91.1
         with:

@@ -37,7 +37,7 @@ jobs:
     runs-on: [self-hosted, medina]
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Sync source into the FreeBSD VM
         run: |
