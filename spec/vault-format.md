@@ -6,14 +6,24 @@ You may share and adapt it, including for commercial purposes, provided you
 give appropriate credit to the Terrapi terrapi-vault project.
 -->
 
-# Memento Vault On-Disk Format — v1 (doc rev 1.6)
+# Memento Vault On-Disk Format — v1 + v2 (doc rev 1.7)
 
 This document specifies the on-disk format produced by `terrapi-vault`
 precisely enough that an independent implementation can write a compatible
 reader/writer. It describes **exactly what the code produces**; if the code
 and this document disagree, that is a bug to be reconciled.
 
-> **Document revision:** 1.6 (2026-05-24). The sidecar integer `version`
+> **Document revision:** 1.7 (2026-06-06) — **introduces sidecar format
+> `version: 2`**, the **DEK key-slot** model that backs recovery codes. The
+> database is now keyed by a random data-encryption key (DEK) wrapped under
+> one or more credential slots (passphrase + optional recovery code) instead
+> of the passphrase deriving the key directly. v1 vaults are **lazily migrated
+> to v2 on the next passphrase unlock**. v1 (§1–§3) remains specified for
+> reading legacy/in-flight vaults; the v2 envelope, slots, recovery code, and
+> migration are specified in **§13**. The passphrase-change procedure changes
+> meaning under v2 (re-wrap a slot, not rekey the DB) — see §13.6.
+>
+> **Earlier:** Document revision 1.6 (2026-05-24). The sidecar integer `version`
 > field (§2) stays at **1**. This revision adds the **M9 `succession_plans`
 > table** (§12) — a single additive, new-table application-level migration
 > (`user_version` 8 → 9), following the §6b checklist; the table stores only
@@ -704,7 +714,162 @@ re-encryption occurs. A third-party reader unaware of `succession_plans`
 simply ignores the table — `SELECT *` and named-column reads on other tables
 remain valid.
 
+## 13. Recovery codes & the v2 DEK key-slot format
+
+Sidecar `version: 2` replaces the v1 "passphrase derives the database key
+directly" model with a **data-encryption key (DEK) envelope**. This is what
+makes a vault recoverable from a forgotten passphrase via a separate,
+high-entropy **recovery code**, without weakening the zero-knowledge property:
+there is still no master backdoor; recovery requires a secret the user holds.
+
+### 13.1 Model
+
+- A **DEK** is 32 random bytes generated at vault creation (or at v1→v2
+  migration). It is the actual SQLCipher key (`PRAGMA key = x'<dek hex>'`,
+  raw-key path, no inner KDF — identical to §3 keying, just with a random key
+  instead of a passphrase-derived one). The DEK is **stable for the life of
+  the vault**.
+- Each **credential** (the passphrase, and optionally a recovery code) has a
+  **key slot** that wraps the *same* DEK. Unlocking = derive the slot key from
+  the credential → AEAD-open the slot → recover the DEK → open the database
+  with it. Changing one credential re-wraps only its slot; the DEK and every
+  other slot are untouched (this is why a recovery code survives a passphrase
+  change).
+
+### 13.2 Sidecar schema (v2)
+
+```jsonc
+{
+  "version": 2,
+  "kdf": "argon2id",
+  "created_at": "2026-06-06T12:00:00Z",
+  "slots": {
+    "password": {
+      "kdf_params": { "m_cost_kib": 65536, "t_cost": 2, "p_cost": 1 },
+      "salt_hex": "<32 hex chars = 16-byte Argon2id salt>",
+      "wrap": {
+        "alg": "xchacha20poly1305",
+        "nonce_hex": "<48 hex chars = 24-byte XChaCha20 nonce>",
+        "ct_hex": "<96 hex chars = 32-byte DEK + 16-byte Poly1305 tag, sealed>"
+      }
+    },
+    "recovery": { /* same shape; present iff a recovery code is enrolled */ }
+  }
+}
+```
+
+`deny_unknown_fields` applies to every object (a stray key is a hard error).
+The reader **dispatches on the integer `version`** first: `1` parses the v1
+schema (§2), `2` parses this schema, anything higher is rejected
+(`UnsupportedFormat`). The sidecar still contains **no secret material** — the
+DEK is only present as authenticated ciphertext inside each `wrap`.
+
+### 13.3 Slot key derivation and DEK wrap
+
+- **Slot key** = `Argon2id(credential_bytes, slot.salt, slot.kdf_params)` →
+  32 bytes (the same `derive_key` used in §1; the passphrase slot feeds UTF-8
+  bytes, the recovery slot feeds the code's raw 20 bytes).
+- **Wrap** = `XChaCha20-Poly1305` seal of the 32-byte DEK under the slot key,
+  with a fresh random 24-byte nonce per seal. **AAD =
+  `"terrapi-vault/dek-slot/v2/" + slot_name`** (`slot_name` ∈ {`password`,
+  `recovery`}). Binding the slot name into the AAD means a blob lifted from
+  one slot fails authentication in another — a wrong-slot ciphertext cannot be
+  replayed.
+- A wrong credential is an AEAD **authentication failure**, surfaced as
+  `WrongPassphrase` / `WrongRecoveryCode`. A structurally malformed slot
+  (unknown `alg`, bad hex, wrong nonce/DEK length) is `KeySlotCorrupt` and is
+  distinct from a wrong credential.
+
+### 13.4 Recovery code format
+
+- **160 bits** (20 bytes) of CSPRNG entropy.
+- Display form: **Crockford Base32** (alphabet `0123456789ABCDEFGHJKMNPQRSTVWXYZ`,
+  no I/L/O/U), 32 payload characters shown as eight 4-character groups, plus a
+  trailing 4-character **checksum** group:
+  `XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-CCCC`.
+- The checksum is **CRC-16/CCITT-FALSE** of the 20 payload bytes, Base32-encoded.
+  It is a **typo guard only** (lets the UI reject a mistyped code before
+  ~1 s of Argon2id); the real integrity check is the slot's Poly1305 tag.
+- Parsing is case-insensitive, ignores dashes/whitespace, and folds Crockford
+  look-alikes (`O→0`, `I/L→1`). The raw 20 bytes (not the formatted string)
+  are fed to the slot KDF, so display formatting is never load-bearing.
+
+### 13.5 Unlock procedure (v2)
+
+1. Read + dispatch the sidecar; for `version: 2` take `slots.password`.
+2. `slot_key = Argon2id(passphrase, password.salt, password.kdf_params)`.
+3. AEAD-open `password.wrap` (AAD = `…/password`). Failure → `WrongPassphrase`.
+4. `PRAGMA key = x'<dek hex>'`; verify with a cheap read (§5).
+
+Recovery unlock is identical with `slots.recovery` and AAD `…/recovery`
+(absent slot → `NoRecoverySlot`; auth failure → `WrongRecoveryCode`).
+
+### 13.6 Passphrase change, reset, and recovery enrollment
+
+- **Passphrase change** (knowing the old one): verify by unwrapping the DEK
+  from the current `password` slot, then re-seal the *same* DEK under a new
+  `password` slot (fresh salt). The sidecar is rewritten atomically
+  (temp-then-rename). **No `PRAGMA rekey`** — the database is untouched, so it
+  is openable throughout and a crash before the rename simply leaves the old
+  passphrase working. **Any enrolled `recovery` slot is preserved.**
+- **Reset via recovery** (forgot passphrase): unwrap the DEK with the recovery
+  code, then set a new `password` slot with no old-passphrase check
+  (authorization came from the recovery code).
+- **Enroll / remove recovery**: derive a recovery slot key from a freshly
+  generated code, seal the DEK, add the `recovery` slot (atomic write);
+  removal drops the slot. Enrolling runs Argon2id and is split into a cheap
+  snapshot → off-thread derivation → cheap commit, like rotation.
+
+### 13.7 Lazy v1 → v2 migration
+
+A v1 vault migrates on its **next passphrase unlock**:
+
+1. Open the database with the v1 salt-derived key (§1).
+2. Generate a random DEK; build a v2 `password` slot wrapping it (preserving
+   the vault's Argon2id cost params).
+3. **Stage** the v2 sidecar at `<name>.meta.json.rekeying`.
+4. `PRAGMA rekey` the database from the v1 key to the DEK.
+5. Atomically rename the staged sidecar over the v1 one.
+
+Crash-safety reuses the §169 staged-sidecar protocol: a crash after the rekey
+but before the rename leaves the database keyed by the DEK with a committed v1
+sidecar (whose key no longer opens it) plus the staged v2 sidecar. The next
+unlock detects this — the v1 key fails, the staged v2 slot unwraps the DEK and
+opens the database — and finalizes the rename. Raw-key (`open_with_key`,
+biometric §7) opens do **not** migrate (no passphrase is available to build the
+password slot); such a vault migrates on its next passphrase unlock.
+
+### 13.8 Security notes (for the audit)
+
+- **DEK stability is a deliberate trade-off.** Because a passphrase change only
+  re-wraps the `password` slot, it does **not** invalidate the DEK — so a
+  recovery code (and any raw key stashed for biometric unlock, §7) keeps
+  working across a passphrase change. The v1 guarantee that "rotating the
+  passphrase invalidates the old derived key" no longer holds. Re-gating
+  biometric unlock on a passphrase change is therefore an **application UI
+  policy** (Memento clears the stashed key on change), not a cryptographic
+  consequence.
+- Each slot has an **independent salt** and a **fresh random nonce per seal**;
+  the DEK is held in zeroizing memory and never logged or persisted in the
+  clear. The recovery code is zeroized after the slot key is derived.
+- Losing the sidecar is still fatal (the only copies of the DEK live in its
+  slots). The recovery code is a *credential*, not a sidecar backup: it cannot
+  reconstruct a lost sidecar.
+
 ## Changelog
+
+- **doc rev 1.7 (2026-06-06)** — Recovery codes & the v2 DEK key-slot format.
+  New §13 specifying sidecar `version: 2`: the database is keyed by a random,
+  life-stable **DEK** wrapped under per-credential **key slots** (passphrase +
+  optional recovery code) via Argon2id slot keys + XChaCha20-Poly1305 with
+  slot-name-bound AAD; the 160-bit Crockford-Base32 recovery code format with a
+  CRC-16 typo-guard checksum; the v2 unlock / passphrase-change (slot re-wrap,
+  no DB rekey) / reset-via-recovery / enroll procedures; and the **crash-safe
+  lazy v1→v2 migration on next passphrase unlock**. Documents the deliberate
+  DEK-stability trade-off (a passphrase change no longer invalidates the DEK;
+  biometric re-gating is a UI policy). v1 (§1–§3) remains specified for legacy
+  and in-flight vaults. A v1 reader cannot open a v2 sidecar (version
+  dispatch); v2 is the format this build writes for new and migrated vaults.
 
 - **doc rev 1.6 (2026-05-24)** — Succession-plan bookkeeping (M9). New §12
   documenting the `succession_plans` table (which folder subtrees had bundles

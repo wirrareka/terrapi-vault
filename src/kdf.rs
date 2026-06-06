@@ -183,6 +183,25 @@ pub fn derive_key(
     salt: &[u8; SALT_LEN],
     params: KdfParams,
 ) -> Result<SecretBox<DerivedKey>> {
+    derive_key_from_bytes(passphrase.as_bytes(), salt, params)
+}
+
+/// Derive a 32-byte key from arbitrary secret bytes and a salt.
+///
+/// The bytes-level counterpart of [`derive_key`] (which is just this over
+/// `passphrase.as_bytes()`). Used by the recovery-code slot, whose secret is
+/// raw high-entropy bytes rather than a UTF-8 passphrase, so it is fed to
+/// Argon2id directly with no lossy string round-trip.
+///
+/// # Errors
+///
+/// Returns [`Error::Kdf`] if the Argon2 parameters are invalid or hashing
+/// fails.
+pub fn derive_key_from_bytes(
+    secret: &[u8],
+    salt: &[u8; SALT_LEN],
+    params: KdfParams,
+) -> Result<SecretBox<DerivedKey>> {
     let argon_params = Params::new(
         params.m_cost_kib,
         params.t_cost,
@@ -195,12 +214,26 @@ pub fn derive_key(
 
     let mut out = [0u8; KEY_LEN];
     argon
-        .hash_password_into(passphrase.as_bytes(), salt, &mut out)
+        .hash_password_into(secret, salt, &mut out)
         .map_err(|e| Error::Kdf(format!("argon2 hashing failed: {e}")))?;
 
     let key = SecretBox::new(Box::new(DerivedKey(out)));
     out.zeroize();
     Ok(key)
+}
+
+/// Generate a fresh cryptographically-random 32-byte data-encryption key (DEK).
+///
+/// The DEK is the actual SQLCipher key in the v2 vault format: it is random
+/// (not passphrase-derived) and stable for the life of the vault, so every
+/// credential slot (password, recovery) wraps the *same* DEK. Uses `OsRng`.
+#[must_use]
+pub fn random_key() -> SecretBox<DerivedKey> {
+    let mut out = [0u8; KEY_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut out);
+    let key = SecretBox::new(Box::new(DerivedKey(out)));
+    out.zeroize();
+    key
 }
 
 #[cfg(test)]

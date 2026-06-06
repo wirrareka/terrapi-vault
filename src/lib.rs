@@ -54,8 +54,11 @@
 #![warn(missing_docs)]
 
 mod error;
+mod hex;
 mod kdf;
+mod keyslot;
 mod meta;
+mod recovery;
 /// The `.memento-note` single-note export format. Behind the default-on `note-export` feature so
 /// a neutral consumer (e.g. `probe`) can drop it with `default-features = false`; memento, which
 /// uses it, gets it by default.
@@ -64,8 +67,16 @@ mod note_export;
 mod vault;
 
 pub use error::{Error, Result};
-pub use kdf::{derive_key, random_salt, DerivedKey, KdfParams, KEY_LEN, SALT_LEN};
-pub use meta::{meta_path_for, VaultMeta, FORMAT_VERSION, META_SUFFIX};
+pub use kdf::{
+    derive_key, derive_key_from_bytes, random_key, random_salt, DerivedKey, KdfParams, KEY_LEN,
+    SALT_LEN,
+};
+pub use keyslot::WrappedKey;
+pub use meta::{
+    meta_path_for, KeySlot, KeySlots, MetaV2, StoredMeta, VaultMeta, CURRENT_FORMAT_VERSION,
+    FORMAT_VERSION, META_SUFFIX,
+};
+pub use recovery::{RecoveryCode, RECOVERY_ENTROPY_BYTES};
 #[cfg(feature = "note-export")]
 pub use note_export::{export_note, import_note, ExportedNote, CONTAINER_VERSION, NOTE_MAGIC};
 pub use vault::{RotationInputs, RotationPlan, Vault};

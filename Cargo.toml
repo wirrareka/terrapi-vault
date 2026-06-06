@@ -23,6 +23,10 @@ secrecy = "0.10.3"
 thiserror = "1.0.69"
 serde = { version = "1.0.215", features = ["derive"] }
 serde_json = "1.0.133"
+# AEAD used to wrap the random data-encryption key (DEK) under each credential
+# slot (password / recovery) in the v2 vault format. Same version the memento
+# sync layer already vendors, so no new audited cipher enters the workspace.
+chacha20poly1305 = "0.10.1"
 
 [features]
 # `note-export` (the `.memento-note` single-note container) is on by default so memento is

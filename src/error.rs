@@ -62,4 +62,28 @@ pub enum Error {
     /// be stored **in the clear**. The vault fails closed rather than write plaintext at rest.
     #[error("at-rest encryption unavailable: the linked SQLite is not SQLCipher")]
     EncryptionUnavailable,
+
+    /// A recovery code was structurally invalid: wrong length, illegal
+    /// characters, or a failed checksum. Distinct from [`Error::WrongRecoveryCode`]
+    /// (a well-formed code that simply did not decrypt the slot) so the UI can
+    /// say "that doesn't look like a recovery code" before spending ~1 s on Argon2id.
+    #[error("recovery code is malformed: {0}")]
+    RecoveryCodeInvalid(String),
+
+    /// A well-formed recovery code did not unwrap the data key — the analogue
+    /// of [`Error::WrongPassphrase`] for the recovery slot.
+    #[error("incorrect recovery code (could not unwrap the data key)")]
+    WrongRecoveryCode,
+
+    /// The vault has no recovery slot enrolled, so it cannot be opened with a
+    /// recovery code (or a recovery slot was asked to be removed when none exists).
+    #[error("no recovery code is enrolled for this vault")]
+    NoRecoverySlot,
+
+    /// A key-slot wrap/unwrap operation failed for a non-authentication reason
+    /// (malformed slot ciphertext, unknown wrap algorithm, bad nonce length).
+    /// An authentication failure is reported as the credential-specific
+    /// [`Error::WrongPassphrase`] / [`Error::WrongRecoveryCode`] instead.
+    #[error("key slot is corrupt: {0}")]
+    KeySlotCorrupt(String),
 }

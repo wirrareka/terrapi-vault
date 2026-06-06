@@ -1,11 +1,21 @@
 //! The [`Vault`] type: lifecycle over an encrypted SQLCipher database.
 
 use crate::error::{Error, Result};
-use crate::kdf::{derive_key, random_salt, DerivedKey, KdfParams, SALT_LEN};
-use crate::meta::{meta_path_for, VaultMeta};
+use crate::kdf::{
+    derive_key, derive_key_from_bytes, random_key, random_salt, DerivedKey, KdfParams,
+};
+use crate::keyslot;
+use crate::meta::{meta_path_for, KeySlot, MetaV2, StoredMeta, VaultMeta};
+use crate::recovery::RecoveryCode;
 use rusqlite::Connection;
 use secrecy::{ExposeSecret, SecretBox};
 use std::path::{Path, PathBuf};
+
+/// Slot name for the passphrase credential. Bound into the AEAD AAD so a blob
+/// can only be opened in the slot it was sealed for (see [`crate::keyslot`]).
+const PASSWORD_SLOT: &str = "password";
+/// Slot name for the recovery-code credential.
+const RECOVERY_SLOT: &str = "recovery";
 
 /// An open, unlocked encrypted vault.
 ///
@@ -34,26 +44,43 @@ pub struct Vault {
     meta_path: PathBuf,
 }
 
-/// Snapshot of the inputs the (expensive) rotation KDF needs.
+/// Snapshot of the inputs a passphrase change needs, captured cheaply on the
+/// thread that owns the [`Vault`] ([`Vault::rotation_inputs`]).
 ///
-/// Captured cheaply on the thread that owns the [`Vault`]
-/// ([`Vault::rotation_inputs`]) so the two Argon2id derivations in
-/// [`Vault::plan_rotation`] can then run on a background thread while the
-/// `!Send` vault stays put. The current key it carries zeroizes on drop;
-/// treat its bytes as sensitive and never log or persist them.
+/// In the v2 (DEK) format a passphrase change **re-wraps the data key under a
+/// new password slot** — it does not re-encrypt the database — so the snapshot
+/// carries the current DEK plus the existing password slot (whose salt/params
+/// let [`Vault::plan_rotation`] verify the old passphrase off-thread). The DEK
+/// it holds zeroizes on drop; treat its bytes as sensitive.
 pub struct RotationInputs {
-    current_key: SecretBox<DerivedKey>,
-    salt: [u8; SALT_LEN],
+    dek: SecretBox<DerivedKey>,
+    password_slot: KeySlot,
+}
+
+/// Inputs for setting a passphrase **without** the old one — used after a
+/// recovery-code unlock, where authorization already came from the recovery
+/// code. Carries the DEK (zeroized on drop) and the cost params to use.
+pub struct SetPassphraseInputs {
+    dek: SecretBox<DerivedKey>,
     params: KdfParams,
 }
 
-/// The result of the expensive half of a key rotation: a key freshly derived
-/// from the new passphrase over a fresh salt, ready to be committed by
-/// [`Vault::apply_rotation`]. Carries no passphrase; the key zeroizes on drop.
+/// Inputs for enrolling a recovery code: just the current DEK (zeroized on
+/// drop), captured on the vault thread so the expensive Argon2id derivation in
+/// [`Vault::plan_enroll_recovery`] can run off-thread.
+pub struct RecoveryEnrollInputs {
+    dek: SecretBox<DerivedKey>,
+}
+
+/// The result of the expensive half of a passphrase change: a freshly built
+/// password [`KeySlot`] (a new salt + the DEK re-sealed under the new
+/// passphrase's slot key), ready to be committed by [`Vault::apply_rotation`].
+///
+/// Holds **no** bare key material — the DEK inside `new_password_slot` is
+/// authenticated ciphertext — so it is trivially `Send` for the off-thread
+/// derivation handoff.
 pub struct RotationPlan {
-    new_key: SecretBox<DerivedKey>,
-    new_salt: [u8; SALT_LEN],
-    params: KdfParams,
+    new_password_slot: KeySlot,
 }
 
 impl std::fmt::Debug for Vault {
@@ -87,17 +114,25 @@ impl Vault {
 
         prepare_paths_for_create(&vault_path, &meta_path)?;
 
+        // v2 format: the database is keyed by a random DEK (stable for life);
+        // the passphrase only wraps the DEK in its key slot.
+        let dek = random_key();
         let salt = random_salt();
-        let key = derive_key(passphrase, &salt, params)?;
+        let slot_key = derive_key(passphrase, &salt, params)?;
+        let wrap = keyslot::seal(
+            slot_key.expose_secret().expose_bytes(),
+            dek.expose_secret().expose_bytes(),
+            PASSWORD_SLOT,
+        );
 
-        let conn = open_keyed(&vault_path, &key)?;
+        let conn = open_keyed(&vault_path, &dek)?;
         init_schema(&conn)?;
 
-        VaultMeta::new(&salt, params).write(&meta_path)?;
+        MetaV2::new(KeySlot::new(&salt, params, wrap)).write(&meta_path)?;
 
         Ok(Self {
             conn,
-            key,
+            key: dek,
             vault_path,
             meta_path,
         })
@@ -117,33 +152,30 @@ impl Vault {
         let vault_path = path.as_ref().to_path_buf();
         let meta_path = meta_path_for(&vault_path);
 
-        let meta = VaultMeta::read(&meta_path)?;
-        let salt = meta.salt()?;
-        let key = derive_key(passphrase, &salt, meta.kdf_params)?;
-
-        // A wrong key surfaces as `WrongPassphrase` from EITHER `open_keyed` (a PRAGMA fails to
-        // read the header) or `verify_key` — catch both, so an interrupted-rotation recovery still
-        // runs rather than the `?` propagating early.
-        match open_and_verify(&vault_path, &key) {
-            Ok(conn) => {
-                // The committed sidecar opened the DB, so any staged sidecar is a stale pre-rekey
-                // orphan (a rotation that crashed *before* rekey) — clean it up, best-effort.
-                let _ = std::fs::remove_file(rekey_staging_path(&meta_path));
-                Ok(Self {
-                    conn,
-                    key,
-                    vault_path,
-                    meta_path,
-                })
+        match StoredMeta::read(&meta_path)? {
+            StoredMeta::V2(meta) => open_v2(vault_path, meta_path, passphrase, &meta),
+            // Legacy v1 sidecar: open with the salt-derived key, then transparently
+            // migrate to the v2 DEK format on this unlock (the chosen "lazy migration"),
+            // recovering crash-safely if a prior migration was interrupted mid-rekey.
+            StoredMeta::V1(meta) => {
+                let key = derive_key(passphrase, &meta.salt()?, meta.kdf_params)?;
+                match open_and_verify(&vault_path, &key) {
+                    Ok(conn) => {
+                        // v1 key opened the DB → no migration was committed; any staged sidecar is
+                        // a pre-rekey orphan. Drop it, then migrate fresh.
+                        let _ = std::fs::remove_file(rekey_staging_path(&meta_path));
+                        migrate_v1_to_v2(conn, vault_path, meta_path, passphrase, &meta)
+                    }
+                    // v1 key failed: either a genuine wrong passphrase, or a migration interrupted
+                    // after `rekey` but before the sidecar commit (DB now keyed by the DEK) — try
+                    // the staged v2 sidecar.
+                    Err(Error::WrongPassphrase) => {
+                        recover_interrupted_migration(&vault_path, &meta_path, passphrase)?
+                            .ok_or(Error::WrongPassphrase)
+                    }
+                    Err(e) => Err(e),
+                }
             }
-            // The committed sidecar's salt didn't derive a working key: either a genuine wrong
-            // passphrase, or a `rotate_key` interrupted after `rekey` but before the sidecar commit
-            // — try the staged sidecar (whose salt matches the rekeyed DB).
-            Err(Error::WrongPassphrase) => {
-                recover_interrupted_rekey(&vault_path, &meta_path, passphrase)?
-                    .ok_or(Error::WrongPassphrase)
-            }
-            Err(e) => Err(e),
         }
     }
 
@@ -172,10 +204,10 @@ impl Vault {
         let vault_path = path.as_ref().to_path_buf();
         let meta_path = meta_path_for(&vault_path);
 
-        // Read the sidecar so the salt/params are available for a later
-        // rotate_key, and to fail early with the same MetaMissing error
-        // shape as the passphrase path.
-        let _meta = VaultMeta::read(&meta_path)?;
+        // Validate the sidecar exists and parses (either format), to fail early
+        // with the same MetaMissing/MetaInvalid error shape as the passphrase
+        // path. `key` is used directly, so the salt/params aren't needed here.
+        let _meta = StoredMeta::read(&meta_path)?;
         let key = SecretBox::new(Box::new(DerivedKey::from_bytes(*key)));
 
         let conn = open_keyed(&vault_path, &key)?;
@@ -189,13 +221,19 @@ impl Vault {
         })
     }
 
-    /// A clone of the current derived key, in a zeroizing handle.
+    /// A clone of the current data-encryption key (DEK), in a zeroizing handle.
     ///
-    /// Returned so an opt-in alternative-unlock feature can stash the key
-    /// in a biometric-gated OS keystore *after* a successful passphrase
-    /// unlock, then later reopen via [`Vault::open_with_key`] without the
-    /// passphrase. The returned [`SecretBox`] zeroizes on drop; treat the
-    /// bytes as sensitive and never log or persist them in the clear.
+    /// In the v2 format this is the random DEK — the actual SQLCipher key —
+    /// **not** a passphrase-derived value. An opt-in alternative-unlock feature
+    /// can stash it in a biometric-gated OS keystore after a successful unlock
+    /// and later reopen via [`Vault::open_with_key`] without the passphrase.
+    ///
+    /// Because the DEK is stable across passphrase changes (a passphrase change
+    /// only re-wraps it), a stashed DEK keeps working after the user changes
+    /// their passphrase. A UI that wants biometric re-enrollment gated on
+    /// passphrase change must enforce that as a policy; it is no longer implied
+    /// by key invalidation. The returned [`SecretBox`] zeroizes on drop; treat
+    /// the bytes as sensitive and never log or persist them in the clear.
     #[must_use]
     pub fn derived_key(&self) -> SecretBox<DerivedKey> {
         SecretBox::new(Box::new(self.key.expose_secret().clone()))
@@ -213,105 +251,295 @@ impl Vault {
         (&self.vault_path, &self.meta_path)
     }
 
-    /// Re-key the vault: change the passphrase in place.
+    /// Change the passphrase in place.
     ///
-    /// Verifies `old_passphrase` against the current key, runs SQLCipher
-    /// `PRAGMA rekey` with a key derived from `new_passphrase` over a
-    /// **fresh salt**, then rewrites the sidecar. Existing data is preserved
-    /// and remains accessible only with the new passphrase.
+    /// Verifies `old_passphrase`, then re-wraps the data key (DEK) under a new
+    /// password slot derived from `new_passphrase` over a **fresh salt**. The
+    /// database itself is **not** re-encrypted (the DEK is unchanged), so this
+    /// is fast and — crucially — leaves any enrolled recovery slot intact: a
+    /// recovery code keeps working after a passphrase change.
     ///
     /// # Errors
     ///
     /// [`Error::WrongPassphrase`] if `old_passphrase` is wrong, otherwise
     /// [`Error::Db`] / [`Error::Io`] / [`Error::Json`].
     ///
-    /// This is the synchronous all-in-one path: it runs the expensive
-    /// Argon2id KDF inline, so it blocks its thread for the KDF's duration
-    /// (~seconds). A UI that must stay responsive should instead drive the
-    /// three-phase split — [`rotation_inputs`](Self::rotation_inputs) (cheap,
-    /// on the vault's thread) → [`plan_rotation`](Self::plan_rotation)
-    /// (expensive, on a background thread) → [`apply_rotation`](Self::apply_rotation)
-    /// (cheap, back on the vault's thread) — of which this method is exactly
-    /// the composition.
+    /// Synchronous all-in-one: runs the Argon2id KDF inline (~seconds). A UI
+    /// that must stay responsive should drive the three-phase split —
+    /// [`rotation_inputs`](Self::rotation_inputs) (cheap) →
+    /// [`plan_rotation`](Self::plan_rotation) (expensive, off-thread) →
+    /// [`apply_rotation`](Self::apply_rotation) (cheap) — of which this is the
+    /// composition.
     pub fn rotate_key(&mut self, old_passphrase: &str, new_passphrase: &str) -> Result<()> {
         let inputs = self.rotation_inputs()?;
         let plan = Self::plan_rotation(&inputs, old_passphrase, new_passphrase)?;
         self.apply_rotation(plan)
     }
 
-    /// Cheaply snapshot the inputs a rotation's KDF needs, so the expensive
+    /// Cheaply snapshot the inputs a passphrase change needs, so the expensive
     /// [`plan_rotation`](Self::plan_rotation) can run off the vault's thread.
     ///
-    /// Reads the sidecar (salt + KDF params) and clones the current derived
-    /// key. The returned [`RotationInputs`] is `Send`; its key bytes are
-    /// sensitive — never log or persist them.
+    /// Clones the current DEK and reads the password slot from the sidecar. The
+    /// returned [`RotationInputs`] is `Send`; its DEK bytes are sensitive —
+    /// never log or persist them.
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] / [`Error::Json`] if the sidecar cannot be read.
+    /// [`Error::Io`] / [`Error::Json`] if the sidecar cannot be read, or
+    /// [`Error::MetaInvalid`] if the vault has not been migrated to v2.
     pub fn rotation_inputs(&self) -> Result<RotationInputs> {
-        let meta = VaultMeta::read(&self.meta_path)?;
+        let meta = self.read_v2_meta()?;
         Ok(RotationInputs {
-            current_key: self.derived_key(),
-            salt: meta.salt()?,
-            params: meta.kdf_params,
+            dek: self.derived_key(),
+            password_slot: meta.slots.password,
         })
     }
 
-    /// The expensive half of a rotation: two Argon2id derivations plus a
-    /// constant-time check that `old_passphrase` matches the current key.
+    /// The expensive half of a passphrase change: verify the old passphrase by
+    /// unwrapping the DEK from the current password slot, then derive a new
+    /// slot key and re-seal the DEK under it.
     ///
-    /// Pure compute over owned inputs — it touches no files and no connection,
-    /// so it is safe (and intended) to run on a background executor while the
-    /// `!Send` vault stays on its own thread. Compares in constant time so the
-    /// check does not leak how many leading key bytes matched via timing.
+    /// Pure compute over owned inputs — touches no files and no connection —
+    /// so it is safe to run on a background executor while the `!Send` vault
+    /// stays on its own thread.
     ///
     /// # Errors
     ///
     /// [`Error::WrongPassphrase`] if `old_passphrase` is wrong, [`Error::Kdf`]
-    /// on invalid params.
+    /// on invalid params, [`Error::KeySlotCorrupt`] on a malformed slot.
     pub fn plan_rotation(
         inputs: &RotationInputs,
         old_passphrase: &str,
         new_passphrase: &str,
     ) -> Result<RotationPlan> {
-        let old_key = derive_key(old_passphrase, &inputs.salt, inputs.params)?;
-        if !constant_time_eq(&old_key.expose_secret().0, &inputs.current_key.expose_secret().0) {
+        // Verify the old passphrase by actually unwrapping the DEK from its slot.
+        let old_slot_key = derive_key(
+            old_passphrase,
+            &inputs.password_slot.salt()?,
+            inputs.password_slot.kdf_params,
+        )?;
+        let Some(unwrapped) = keyslot::open(
+            old_slot_key.expose_secret().expose_bytes(),
+            &inputs.password_slot.wrap,
+            PASSWORD_SLOT,
+        )?
+        else {
+            return Err(Error::WrongPassphrase);
+        };
+        // Defensive: the slot must unwrap to the very DEK the vault is using.
+        if !constant_time_eq(
+            &unwrapped.expose_secret().0,
+            &inputs.dek.expose_secret().0,
+        ) {
             return Err(Error::WrongPassphrase);
         }
-        let new_salt = random_salt();
-        let new_key = derive_key(new_passphrase, &new_salt, inputs.params)?;
         Ok(RotationPlan {
-            new_key,
-            new_salt,
-            params: inputs.params,
+            new_password_slot: reseal_password_slot(
+                &inputs.dek,
+                new_passphrase,
+                inputs.password_slot.kdf_params,
+            )?,
         })
     }
 
-    /// The cheap, crash-safe half of a rotation: commit a [`RotationPlan`].
-    /// Must run on the thread that owns the connection.
+    /// The cheap, crash-safe half of a passphrase change / reset: commit a
+    /// [`RotationPlan`]'s new password slot. Must run on the vault's thread.
     ///
-    /// `PRAGMA rekey` re-encrypts the DB in place under the new key, so the
-    /// sidecar must follow it; a crash between the two would otherwise brick
-    /// the vault (the committed sidecar's salt no longer matches the DB key).
-    /// Stage the new sidecar BEFORE rekey, rekey, then atomically commit it.
-    /// If we crash after rekey but before the commit, the staged sidecar
-    /// (whose salt matches the rekeyed DB) survives and `open` finalizes it —
-    /// see `recover_interrupted_rekey`.
+    /// Replaces only the password slot in the sidecar (preserving any recovery
+    /// slot) and writes it atomically (temp + rename). The DEK is unchanged, so
+    /// the database is always openable throughout: a crash before the rename
+    /// leaves the old passphrase working, after it the new one — never a brick.
     ///
     /// # Errors
     ///
     /// [`Error::Db`] / [`Error::Io`] / [`Error::Json`].
     pub fn apply_rotation(&mut self, plan: RotationPlan) -> Result<()> {
-        let staged = rekey_staging_path(&self.meta_path);
-        VaultMeta::new(&plan.new_salt, plan.params).write(&staged)?;
-        let literal = plan.new_key.expose_secret().pragma_literal();
-        self.conn
-            .pragma_update(None, "rekey", literal.as_str())
-            .map_err(map_cipher_err)?;
-        std::fs::rename(&staged, &self.meta_path)?;
-        self.key = plan.new_key;
+        let mut meta = self.read_v2_meta()?;
+        meta.slots.password = plan.new_password_slot;
+        meta.write(&self.meta_path)?;
         Ok(())
+    }
+
+    /// Cheaply snapshot the inputs for setting a passphrase **without** the old
+    /// one (after a recovery unlock). The returned value is `Send`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] / [`Error::Json`] / [`Error::MetaInvalid`] reading the sidecar.
+    pub fn set_passphrase_inputs(&self) -> Result<SetPassphraseInputs> {
+        let meta = self.read_v2_meta()?;
+        Ok(SetPassphraseInputs {
+            dek: self.derived_key(),
+            params: meta.slots.password.kdf_params,
+        })
+    }
+
+    /// The expensive half of a passphrase reset: derive a new password slot for
+    /// `new_passphrase`. No old-passphrase check — authorization came from
+    /// whatever unlocked the vault (typically a recovery code). Off-thread safe.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Kdf`] on invalid params.
+    pub fn plan_set_passphrase(
+        inputs: &SetPassphraseInputs,
+        new_passphrase: &str,
+    ) -> Result<RotationPlan> {
+        Ok(RotationPlan {
+            new_password_slot: reseal_password_slot(&inputs.dek, new_passphrase, inputs.params)?,
+        })
+    }
+
+    /// Set the passphrase without knowing the old one — for use right after a
+    /// recovery-code unlock to let the user choose a new passphrase. Re-wraps
+    /// the DEK under a fresh password slot; the DEK (and recovery slot) are
+    /// untouched. Commit via [`apply_rotation`](Self::apply_rotation).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Kdf`] / [`Error::Db`] / [`Error::Io`] / [`Error::Json`].
+    pub fn set_passphrase(&mut self, new_passphrase: &str) -> Result<()> {
+        let inputs = self.set_passphrase_inputs()?;
+        let plan = Self::plan_set_passphrase(&inputs, new_passphrase)?;
+        self.apply_rotation(plan)
+    }
+
+    /// Cheaply snapshot the input (the DEK) for enrolling a recovery code.
+    #[must_use]
+    pub fn recovery_enroll_inputs(&self) -> RecoveryEnrollInputs {
+        RecoveryEnrollInputs {
+            dek: self.derived_key(),
+        }
+    }
+
+    /// The expensive half of recovery enrollment: generate a fresh recovery
+    /// code and a key slot that wraps the DEK under it. Returns the code (to
+    /// show/print to the user) and the slot (to commit with
+    /// [`apply_enroll_recovery`](Self::apply_enroll_recovery)). Off-thread safe.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Kdf`] on invalid params.
+    pub fn plan_enroll_recovery(
+        inputs: &RecoveryEnrollInputs,
+        params: KdfParams,
+    ) -> Result<(RecoveryCode, KeySlot)> {
+        let code = RecoveryCode::generate();
+        let salt = random_salt();
+        let slot_key = derive_key_from_bytes(code.as_bytes(), &salt, params)?;
+        let wrap = keyslot::seal(
+            slot_key.expose_secret().expose_bytes(),
+            inputs.dek.expose_secret().expose_bytes(),
+            RECOVERY_SLOT,
+        );
+        Ok((code, KeySlot::new(&salt, params, wrap)))
+    }
+
+    /// Commit a recovery slot built by
+    /// [`plan_enroll_recovery`](Self::plan_enroll_recovery), replacing any
+    /// existing recovery slot. Atomic sidecar write.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] / [`Error::Json`] / [`Error::MetaInvalid`].
+    pub fn apply_enroll_recovery(&mut self, slot: KeySlot) -> Result<()> {
+        let mut meta = self.read_v2_meta()?;
+        meta.slots.recovery = Some(slot);
+        meta.write(&self.meta_path)
+    }
+
+    /// Enroll (or replace) a recovery code, returning the freshly generated
+    /// code to show the user. Synchronous all-in-one (runs Argon2id inline);
+    /// drive the [`recovery_enroll_inputs`](Self::recovery_enroll_inputs) →
+    /// [`plan_enroll_recovery`](Self::plan_enroll_recovery) →
+    /// [`apply_enroll_recovery`](Self::apply_enroll_recovery) split to keep a UI
+    /// responsive.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Kdf`] / [`Error::Io`] / [`Error::Json`].
+    pub fn enroll_recovery(&mut self, params: KdfParams) -> Result<RecoveryCode> {
+        let inputs = self.recovery_enroll_inputs();
+        let (code, slot) = Self::plan_enroll_recovery(&inputs, params)?;
+        self.apply_enroll_recovery(slot)?;
+        Ok(code)
+    }
+
+    /// Whether a recovery code is currently enrolled.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] / [`Error::Json`] / [`Error::MetaInvalid`] reading the sidecar.
+    pub fn has_recovery(&self) -> Result<bool> {
+        Ok(self.read_v2_meta()?.slots.recovery.is_some())
+    }
+
+    /// Remove the enrolled recovery slot. The recovery code stops working
+    /// immediately; the passphrase is unaffected.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoRecoverySlot`] if none is enrolled, otherwise
+    /// [`Error::Io`] / [`Error::Json`].
+    pub fn remove_recovery(&mut self) -> Result<()> {
+        let mut meta = self.read_v2_meta()?;
+        if meta.slots.recovery.is_none() {
+            return Err(Error::NoRecoverySlot);
+        }
+        meta.slots.recovery = None;
+        meta.write(&self.meta_path)
+    }
+
+    /// Open a vault using its **recovery code** instead of the passphrase.
+    ///
+    /// Unwraps the DEK from the recovery slot and opens the database with it.
+    /// The caller will typically follow with [`set_passphrase`](Self::set_passphrase)
+    /// to let the user choose a new passphrase (they forgot the old one).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoRecoverySlot`] if the vault has no recovery slot (incl. a
+    /// not-yet-migrated v1 vault), [`Error::WrongRecoveryCode`] if the code is
+    /// wrong, otherwise [`Error::MetaMissing`] / [`Error::Db`] / [`Error::Io`].
+    pub fn open_with_recovery<P: AsRef<Path>>(path: P, code: &RecoveryCode) -> Result<Self> {
+        let vault_path = path.as_ref().to_path_buf();
+        let meta_path = meta_path_for(&vault_path);
+
+        let StoredMeta::V2(meta) = StoredMeta::read(&meta_path)? else {
+            return Err(Error::NoRecoverySlot);
+        };
+        let slot = meta.slots.recovery.ok_or(Error::NoRecoverySlot)?;
+        let slot_key = derive_key_from_bytes(code.as_bytes(), &slot.salt()?, slot.kdf_params)?;
+        let Some(dek) = keyslot::open(
+            slot_key.expose_secret().expose_bytes(),
+            &slot.wrap,
+            RECOVERY_SLOT,
+        )?
+        else {
+            return Err(Error::WrongRecoveryCode);
+        };
+
+        let conn = open_keyed(&vault_path, &dek)?;
+        verify_key(&conn)?;
+        Ok(Self {
+            conn,
+            key: dek,
+            vault_path,
+            meta_path,
+        })
+    }
+
+    /// Read the sidecar and require it to be in v2 (DEK) format. Every
+    /// credential-management operation needs the slot model; a `Vault` opened
+    /// normally is always v2 (v1 is migrated on `open`), so a v1 here means it
+    /// was opened key-only without migrating — a clear, non-destructive error.
+    fn read_v2_meta(&self) -> Result<MetaV2> {
+        match StoredMeta::read(&self.meta_path)? {
+            StoredMeta::V2(m) => Ok(m),
+            StoredMeta::V1(_) => Err(Error::MetaInvalid(
+                "vault is still in legacy v1 format; reopen with the passphrase to migrate".into(),
+            )),
+        }
     }
 
     /// Run a closure with the open encrypted [`Connection`].
@@ -425,11 +653,102 @@ fn rekey_staging_path(meta_path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Recover a `rotate_key` interrupted after `PRAGMA rekey` but before the sidecar commit: the DB
-/// is keyed with the *staged* sidecar's salt. If a staged sidecar exists and opens the DB with
-/// `passphrase`, finalize it (rename into place) and return the open vault; otherwise `None` (a
-/// genuine wrong passphrase). The staged sidecar is validated by `VaultMeta::read` like any other.
-fn recover_interrupted_rekey(
+/// Open a v2 vault with `passphrase`: derive the password slot key, unwrap the
+/// DEK, open the database with it. A wrong passphrase fails AEAD authentication
+/// → [`Error::WrongPassphrase`].
+fn open_v2(
+    vault_path: PathBuf,
+    meta_path: PathBuf,
+    passphrase: &str,
+    meta: &MetaV2,
+) -> Result<Vault> {
+    let slot = &meta.slots.password;
+    let slot_key = derive_key(passphrase, &slot.salt()?, slot.kdf_params)?;
+    let Some(dek) = keyslot::open(
+        slot_key.expose_secret().expose_bytes(),
+        &slot.wrap,
+        PASSWORD_SLOT,
+    )?
+    else {
+        return Err(Error::WrongPassphrase);
+    };
+    let conn = open_keyed(&vault_path, &dek)?;
+    verify_key(&conn)?;
+    // The committed sidecar is already v2, so any staged sidecar is a moot
+    // migration orphan — clean it up, best-effort.
+    let _ = std::fs::remove_file(rekey_staging_path(&meta_path));
+    Ok(Vault {
+        conn,
+        key: dek,
+        vault_path,
+        meta_path,
+    })
+}
+
+/// Build a new **password** [`KeySlot`] that seals `dek` under a key derived
+/// from `passphrase` over a fresh salt. Shared by passphrase change and reset.
+fn reseal_password_slot(
+    dek: &SecretBox<DerivedKey>,
+    passphrase: &str,
+    params: KdfParams,
+) -> Result<KeySlot> {
+    let salt = random_salt();
+    let slot_key = derive_key(passphrase, &salt, params)?;
+    let wrap = keyslot::seal(
+        slot_key.expose_secret().expose_bytes(),
+        dek.expose_secret().expose_bytes(),
+        PASSWORD_SLOT,
+    );
+    Ok(KeySlot::new(&salt, params, wrap))
+}
+
+/// Migrate an open v1 vault to the v2 DEK format, crash-safely.
+///
+/// `conn` is the database opened with its v1 (salt-derived) key. Generate a
+/// random DEK, build a v2 password slot wrapping it, **stage** the v2 sidecar,
+/// `PRAGMA rekey` the database to the DEK, then atomically rename the staged
+/// sidecar over the v1 one. A crash after rekey but before the rename leaves
+/// the DB keyed by the DEK with a v1 committed sidecar + staged v2 sidecar →
+/// [`recover_interrupted_migration`] finishes it on the next unlock.
+fn migrate_v1_to_v2(
+    conn: Connection,
+    vault_path: PathBuf,
+    meta_path: PathBuf,
+    passphrase: &str,
+    v1: &VaultMeta,
+) -> Result<Vault> {
+    // Preserve the vault's chosen Argon2 cost for the new password slot.
+    let params = v1.kdf_params;
+    let dek = random_key();
+    let slot = reseal_password_slot(&dek, passphrase, params)?;
+    let staged_meta = MetaV2::new(slot);
+
+    // Stage the v2 sidecar BEFORE rekey (so a post-rekey crash is recoverable).
+    let staged = rekey_staging_path(&meta_path);
+    staged_meta.write(&staged)?;
+
+    // Re-encrypt the database in place from the v1 key to the DEK.
+    let literal = dek.expose_secret().pragma_literal();
+    conn.pragma_update(None, "rekey", literal.as_str())
+        .map_err(map_cipher_err)?;
+
+    // Commit: atomically replace the v1 sidecar with the staged v2 one.
+    std::fs::rename(&staged, &meta_path)?;
+
+    Ok(Vault {
+        conn,
+        key: dek,
+        vault_path,
+        meta_path,
+    })
+}
+
+/// Recover a migration (or a legacy v1 `rotate_key`) interrupted after
+/// `PRAGMA rekey` but before the sidecar commit: the database is keyed by the
+/// *staged* sidecar's key. If a staged sidecar exists and opens the database
+/// with `passphrase`, finalize it (rename into place) and return the open
+/// vault; otherwise `None` (a genuine wrong passphrase).
+fn recover_interrupted_migration(
     vault_path: &Path,
     meta_path: &Path,
     passphrase: &str,
@@ -438,20 +757,47 @@ fn recover_interrupted_rekey(
     if !staged.exists() {
         return Ok(None);
     }
-    let meta = VaultMeta::read(&staged)?;
-    let salt = meta.salt()?;
-    let key = derive_key(passphrase, &salt, meta.kdf_params)?;
-    let Ok(conn) = open_and_verify(vault_path, &key) else {
-        return Ok(None); // staged sidecar doesn't open it either → genuine wrong passphrase
-    };
-    // The staged sidecar opens the rekeyed DB: commit it as the canonical sidecar.
-    std::fs::rename(&staged, meta_path)?;
-    Ok(Some(Vault {
-        conn,
-        key,
-        vault_path: vault_path.to_path_buf(),
-        meta_path: meta_path.to_path_buf(),
-    }))
+    match StoredMeta::read(&staged)? {
+        // Interrupted v1→v2 migration: derive the staged password slot key,
+        // unwrap the DEK, confirm it opens the rekeyed DB, then commit.
+        StoredMeta::V2(meta) => {
+            let slot = &meta.slots.password;
+            let slot_key = derive_key(passphrase, &slot.salt()?, slot.kdf_params)?;
+            let Some(dek) = keyslot::open(
+                slot_key.expose_secret().expose_bytes(),
+                &slot.wrap,
+                PASSWORD_SLOT,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Ok(conn) = open_and_verify(vault_path, &dek) else {
+                return Ok(None);
+            };
+            std::fs::rename(&staged, meta_path)?;
+            Ok(Some(Vault {
+                conn,
+                key: dek,
+                vault_path: vault_path.to_path_buf(),
+                meta_path: meta_path.to_path_buf(),
+            }))
+        }
+        // Legacy: a v1 rotate_key from a pre-upgrade build crashed mid-rekey.
+        // Finalize it as v1; the next unlock migrates it to v2.
+        StoredMeta::V1(meta) => {
+            let key = derive_key(passphrase, &meta.salt()?, meta.kdf_params)?;
+            let Ok(conn) = open_and_verify(vault_path, &key) else {
+                return Ok(None);
+            };
+            std::fs::rename(&staged, meta_path)?;
+            Ok(Some(Vault {
+                conn,
+                key,
+                vault_path: vault_path.to_path_buf(),
+                meta_path: meta_path.to_path_buf(),
+            }))
+        }
+    }
 }
 
 /// Open the keyed connection and confirm the key with a cheap read. A wrong key reports
@@ -561,6 +907,22 @@ mod tests {
         KdfParams::fast_for_tests()
     }
 
+    /// Write a genuine **legacy v1** vault (salt directly derives the SQLCipher
+    /// key, v1 sidecar) with a `t(x)=7` row, mirroring the pre-DEK `create`.
+    /// Used to exercise the lazy v1→v2 migration on `open`.
+    fn create_v1_vault(path: &Path, pass: &str, params: KdfParams) {
+        let salt = random_salt();
+        let key = derive_key(pass, &salt, params).unwrap();
+        let conn = open_keyed(path, &key).unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (7);")
+            .unwrap();
+        VaultMeta::new(&salt, params)
+            .write(&meta_path_for(path))
+            .unwrap();
+        conn.close().unwrap();
+    }
+
     #[test]
     fn create_close_open_roundtrip() {
         let dir = TempDir::new().unwrap();
@@ -667,57 +1029,194 @@ mod tests {
     }
 
     #[test]
-    fn open_recovers_from_interrupted_rotate_no_brick() {
+    fn open_migrates_v1_vault_to_v2_preserving_data() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        create_v1_vault(&path, "pw", p());
+        let meta_path = meta_path_for(&path);
+        // Precondition: it really is a v1 sidecar.
+        assert!(matches!(
+            StoredMeta::read(&meta_path).unwrap(),
+            StoredMeta::V1(_)
+        ));
+        // First open migrates it to v2 and preserves the data.
+        {
+            let v = Vault::open(&path, "pw").unwrap();
+            let x: i64 = v
+                .with_connection(|c| c.query_row("SELECT x FROM t", [], |r| r.get(0)))
+                .unwrap();
+            assert_eq!(x, 7);
+            v.lock();
+        }
+        // It is now v2, the wrong passphrase is still rejected, and — the whole
+        // point — it can now enroll a recovery code.
+        assert!(matches!(
+            StoredMeta::read(&meta_path).unwrap(),
+            StoredMeta::V2(_)
+        ));
+        assert!(matches!(
+            Vault::open(&path, "nope").unwrap_err(),
+            Error::WrongPassphrase
+        ));
+        let mut v = Vault::open(&path, "pw").unwrap();
+        let code = v.enroll_recovery(p()).unwrap();
+        v.lock();
+        assert!(Vault::open_with_recovery(&path, &code).is_ok());
+    }
+
+    #[test]
+    fn open_recovers_from_interrupted_migration_no_brick() {
         use secrecy::ExposeSecret as _;
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
-        {
-            let v = Vault::create(&path, "old", p()).unwrap();
-            v.with_connection(|c| c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (42);"))
-                .unwrap();
-            v.lock();
-        }
-        // Simulate rotate_key crashing AFTER `PRAGMA rekey` but BEFORE committing the staged
-        // sidecar: rekey the DB to a fresh salt + write the staged sidecar, then drop without the
-        // rename (the "crash").
+        create_v1_vault(&path, "pw", p());
         let meta_path = meta_path_for(&path);
-        let new_salt = random_salt();
+
+        // Simulate migrate_v1_to_v2 crashing AFTER `PRAGMA rekey` but BEFORE the staged-sidecar
+        // rename: open with the v1 key, stage a v2 sidecar, rekey the DB to a fresh DEK, then leak
+        // the connection (the "crash") so the rekeyed pages persist in the `-wal`.
         {
-            let v = Vault::open(&path, "old").unwrap();
-            let new_key = derive_key("newpw", &new_salt, p()).unwrap();
-            VaultMeta::new(&new_salt, p())
+            let v1 = VaultMeta::read(&meta_path).unwrap();
+            let k1 = derive_key("pw", &v1.salt().unwrap(), v1.kdf_params).unwrap();
+            let conn = open_keyed(&path, &k1).unwrap();
+            let dek = random_key();
+            let slot = reseal_password_slot(&dek, "pw", p()).unwrap();
+            MetaV2::new(slot)
                 .write(&rekey_staging_path(&meta_path))
                 .unwrap();
-            v.conn
-                .pragma_update(
-                    None,
-                    "rekey",
-                    new_key.expose_secret().pragma_literal().as_str(),
-                )
-                .unwrap();
-            // Simulate a crash: leak the connection so it is NEVER closed — the rekeyed pages stay
-            // in the `-wal` on disk (a clean drop would instead checkpoint-and-discard or lose
-            // them), exactly as if the process had died right after `rekey`. Recovery's fresh
-            // connection then replays the WAL.
+            conn.pragma_update(
+                None,
+                "rekey",
+                dek.expose_secret().pragma_literal().as_str(),
+            )
+            .unwrap();
             #[allow(clippy::mem_forget)]
-            std::mem::forget(v);
+            std::mem::forget(conn);
         }
-        // The committed sidecar (old salt) no longer opens the rekeyed DB; opening with the NEW
-        // passphrase must recover via the staged sidecar and preserve the data — no brick.
-        let v = Vault::open(&path, "newpw").unwrap();
+        // The committed (v1) sidecar's key no longer opens the rekeyed DB; open must recover via
+        // the staged v2 sidecar, preserve data, and finalize the migration — no brick.
+        let v = Vault::open(&path, "pw").unwrap();
         let x: i64 = v
             .with_connection(|c| c.query_row("SELECT x FROM t", [], |r| r.get(0)))
             .unwrap();
-        assert_eq!(x, 42);
+        assert_eq!(x, 7);
         v.lock();
-        // Recovery finalized the staged sidecar: it's gone, the new passphrase opens normally, and
-        // the old passphrase no longer works.
         assert!(!rekey_staging_path(&meta_path).exists());
-        assert!(Vault::open(&path, "newpw").is_ok());
         assert!(matches!(
-            Vault::open(&path, "old"),
-            Err(Error::WrongPassphrase)
+            StoredMeta::read(&meta_path).unwrap(),
+            StoredMeta::V2(_)
         ));
+    }
+
+    #[test]
+    fn recovery_unlock_roundtrip_and_reset_passphrase() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        let code;
+        {
+            let mut v = Vault::create(&path, "orig", p()).unwrap();
+            v.with_connection(|c| c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (5);"))
+                .unwrap();
+            code = v.enroll_recovery(p()).unwrap();
+            assert!(v.has_recovery().unwrap());
+            v.lock();
+        }
+        // Forgot the passphrase: unlock with the recovery code, read data, set a new passphrase.
+        {
+            let mut v = Vault::open_with_recovery(&path, &code).unwrap();
+            let x: i64 = v
+                .with_connection(|c| c.query_row("SELECT x FROM t", [], |r| r.get(0)))
+                .unwrap();
+            assert_eq!(x, 5);
+            v.set_passphrase("brandnew").unwrap();
+            v.lock();
+        }
+        // Old passphrase dead; new one works; the recovery code STILL works (it survived the reset
+        // because the DEK never changed).
+        assert!(matches!(
+            Vault::open(&path, "orig").unwrap_err(),
+            Error::WrongPassphrase
+        ));
+        assert!(Vault::open(&path, "brandnew").is_ok());
+        assert!(Vault::open_with_recovery(&path, &code).is_ok());
+    }
+
+    #[test]
+    fn recovery_code_round_trips_through_printed_string() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        let printed;
+        {
+            let mut v = Vault::create(&path, "pw", p()).unwrap();
+            let code = v.enroll_recovery(p()).unwrap();
+            printed = code.format().to_string();
+            v.lock();
+        }
+        // The code as it would appear on the printed kit, re-parsed, unlocks the vault.
+        let parsed = RecoveryCode::parse(&printed).unwrap();
+        assert!(Vault::open_with_recovery(&path, &parsed).is_ok());
+    }
+
+    #[test]
+    fn wrong_recovery_code_is_distinct_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        let mut v = Vault::create(&path, "pw", p()).unwrap();
+        v.enroll_recovery(p()).unwrap();
+        v.lock();
+        assert!(matches!(
+            Vault::open_with_recovery(&path, &RecoveryCode::generate()).unwrap_err(),
+            Error::WrongRecoveryCode
+        ));
+    }
+
+    #[test]
+    fn open_with_recovery_without_enrollment_errors() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        Vault::create(&path, "pw", p()).unwrap().lock();
+        assert!(matches!(
+            Vault::open_with_recovery(&path, &RecoveryCode::generate()).unwrap_err(),
+            Error::NoRecoverySlot
+        ));
+    }
+
+    #[test]
+    fn remove_recovery_disables_the_code() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        let code;
+        {
+            let mut v = Vault::create(&path, "pw", p()).unwrap();
+            code = v.enroll_recovery(p()).unwrap();
+            assert!(v.has_recovery().unwrap());
+            v.remove_recovery().unwrap();
+            assert!(!v.has_recovery().unwrap());
+            // Removing again is a clear error, not a silent success.
+            assert!(matches!(v.remove_recovery().unwrap_err(), Error::NoRecoverySlot));
+            v.lock();
+        }
+        assert!(matches!(
+            Vault::open_with_recovery(&path, &code).unwrap_err(),
+            Error::NoRecoverySlot
+        ));
+        assert!(Vault::open(&path, "pw").is_ok()); // passphrase unaffected
+    }
+
+    #[test]
+    fn passphrase_change_preserves_recovery_slot() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        let code;
+        {
+            let mut v = Vault::create(&path, "old", p()).unwrap();
+            code = v.enroll_recovery(p()).unwrap();
+            v.rotate_key("old", "new").unwrap();
+            v.lock();
+        }
+        // The recovery code is untouched by the passphrase change.
+        assert!(Vault::open_with_recovery(&path, &code).is_ok());
+        assert!(Vault::open(&path, "new").is_ok());
     }
 
     #[test]
@@ -833,22 +1332,34 @@ mod tests {
     }
 
     #[test]
-    fn rotate_key_invalidates_old_derived_key() {
+    fn passphrase_change_keeps_dek_stable_but_kills_old_passphrase() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
-        let old_key;
+        let dek_before;
+        let dek_after;
         {
             let mut v = Vault::create(&path, "old", p()).unwrap();
-            old_key = *v.derived_key().expose_secret().expose_bytes();
+            dek_before = *v.derived_key().expose_secret().expose_bytes();
             v.rotate_key("old", "new").unwrap();
+            dek_after = *v.derived_key().expose_secret().expose_bytes();
             v.lock();
         }
-        // The pre-rotation key must no longer open the vault — this is the
-        // crypto guarantee the biometric-clear-on-rotate UX relies on.
+        // The DEK is STABLE across a passphrase change (v2 only re-wraps the
+        // password slot). This is the property that lets a recovery code — and
+        // a biometric-stashed DEK — survive a passphrase change. Biometric
+        // re-gating on passphrase change is now a UI policy, not implied by key
+        // invalidation (contrast the old v1 rekey behavior).
+        assert_eq!(dek_before, dek_after, "DEK must not change on passphrase rotation");
+        assert!(
+            Vault::open_with_key(&path, &dek_before).is_ok(),
+            "the stable DEK still opens the vault"
+        );
+        // The OLD passphrase no longer derives a working password slot.
         assert!(matches!(
-            Vault::open_with_key(&path, &old_key).unwrap_err(),
+            Vault::open(&path, "old").unwrap_err(),
             Error::WrongPassphrase
         ));
+        assert!(Vault::open(&path, "new").is_ok());
     }
 
     #[test]
