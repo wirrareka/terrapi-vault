@@ -166,6 +166,7 @@ pub fn router(state: AppState) -> Router {
             post(kms_rewrap),
         )
         .route("/v1/{group}/object-store/presign", post(presign))
+        .route("/v1/{group}/object-store/presign-get", post(presign_get))
         .route("/v1/sys/session", post(session_open))
         .route("/v1/sys/session/{id}", delete(session_end))
         .route("/v1/sys/store-snapshot", post(store_snapshot))
@@ -596,19 +597,57 @@ async fn creds(
     }))
 }
 
-/// Sign a short-TTL presigned `PUT` URL for a tile archive or its manifest pointer. **Stateless**
-/// — no lease: the URL authorises exactly one `PUT` to one server-constructed key until it
-/// expires, and nothing else (DO Spaces has no per-key API, so the per-tenant / write-only /
-/// single-object scoping lives in the signature). The `object-store` cap gates it; residency is
-/// enforced by the `Group` extractor (the bucket is per-instance). See `object_store.rs` +
-/// `inbox/vault/proximiio-outer-map-object-storage-creds.md`.
+/// Sign a short-TTL presigned **PUT** URL for a tile archive or its manifest pointer (the publish
+/// path, cap `object-store`; consumer proximiio-outer-map). See [`do_presign`].
 async fn presign(
     State(state): State<AppState>,
     principal: Principal,
     _group: Group,
     Json(req): Json<crate::dto::PresignRequest>,
 ) -> ApiResult<crate::dto::PresignResponse> {
-    require_cap(&principal, Capability::ObjectStore)?;
+    do_presign(
+        &state,
+        &principal,
+        &req,
+        Capability::ObjectStore,
+        "PUT",
+        "object_store.presign",
+    )
+}
+
+/// Sign a short-TTL presigned **GET** URL for the same keys (the serve/read path, cap
+/// `object-store-read`; consumer proximiio-belt). The `Range` header is unsigned, so the URL
+/// serves range-GETs unchanged. See [`do_presign`].
+async fn presign_get(
+    State(state): State<AppState>,
+    principal: Principal,
+    _group: Group,
+    Json(req): Json<crate::dto::PresignRequest>,
+) -> ApiResult<crate::dto::PresignResponse> {
+    do_presign(
+        &state,
+        &principal,
+        &req,
+        Capability::ObjectStoreRead,
+        "GET",
+        "object_store.presign_get",
+    )
+}
+
+/// Shared presign logic for the PUT (publish) and GET (serve) ops. **Stateless** — no lease: the
+/// URL authorises exactly one `method` request to one server-constructed key until it expires,
+/// and nothing else (DO Spaces has no per-key API, so the per-tenant / single-object scoping lives
+/// in the signature). `cap` gates it; residency is enforced by the `Group` extractor (the bucket
+/// is per-instance). See `object_store.rs` + `inbox/vault/proximiio-outer-map-object-storage-creds.md`.
+fn do_presign(
+    state: &AppState,
+    principal: &Principal,
+    req: &crate::dto::PresignRequest,
+    cap: Capability,
+    method: &str,
+    action: &'static str,
+) -> ApiResult<crate::dto::PresignResponse> {
+    require_cap(principal, cap)?;
     let Some(signer) = state.object_store.clone() else {
         return Err(err(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -650,15 +689,15 @@ async fn presign(
         &req.version,
     );
     let ttl = signer.clamp_ttl(req.ttl_secs);
-    let (url, expires) = signer.presign_put(&key, now_unix(), ttl);
+    let (url, expires) = signer.presign(method, &key, now_unix(), ttl);
 
     // Audit the issuance — the object key + tenant + expiry only. NEVER the URL or signature.
     state.emit(&AuditEvent::vault(
         AppState::now_ts(),
         state.cfg.node.clone(),
         Some(state.cfg.residency_group.as_str().to_owned()),
-        system_actor(&principal),
-        "object_store.presign",
+        system_actor(principal),
+        action,
         Target {
             kind: "object-store".into(),
             id: Some(format!("key={key};tenant={};expires={expires}", req.tenant_id)),
@@ -669,7 +708,7 @@ async fn presign(
 
     Ok(Json(crate::dto::PresignResponse {
         url,
-        method: "PUT".into(),
+        method: method.to_owned(),
         key,
         expires,
     }))

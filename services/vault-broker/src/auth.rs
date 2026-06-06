@@ -49,6 +49,8 @@ pub enum Capability {
     Kms,
     /// `POST /v1/{group}/object-store/presign` (short-TTL presigned PUT URL for tile publishing)
     ObjectStore,
+    /// `POST /v1/{group}/object-store/presign-get` (short-TTL presigned GET URL for tile serving)
+    ObjectStoreRead,
     /// `POST /v1/sys/store-snapshot` (consistent snapshot of vault's own at-rest store)
     Snapshot,
 }
@@ -65,6 +67,7 @@ impl Capability {
             Capability::Leases,
             Capability::Kms,
             Capability::ObjectStore,
+            Capability::ObjectStoreRead,
             Capability::Snapshot,
         ]
         .into_iter()
@@ -197,7 +200,7 @@ mod tests {
     #[test]
     fn dev_principal_holds_all_caps() {
         let all = Capability::all();
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 9);
         for c in [
             Capability::SshCa,
             Capability::SshSign,
@@ -206,6 +209,7 @@ mod tests {
             Capability::Leases,
             Capability::Kms,
             Capability::ObjectStore,
+            Capability::ObjectStoreRead,
             Capability::Snapshot,
         ] {
             assert!(all.contains(&c));

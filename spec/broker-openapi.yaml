@@ -9,7 +9,7 @@
 openapi: 3.1.0
 info:
   title: terrapi-vault broker
-  version: "1.1.0"
+  version: "1.2.0"
   summary: Network secrets broker for the proximi.io platform (one instance per residency group).
   description: |
     Network secrets broker for the proximi.io platform. **One instance per residency
@@ -39,7 +39,8 @@ info:
     | `ssh-sign` | `POST /v1/{group}/ssh/sign` |
     | `creds`    | `POST /v1/{group}/{tenant_id}/creds/{role}` |
     | `kms`      | `POST /v1/{group}/{tenant_id}/kms/{key_id}/{wrap,unwrap,rotate,rewrap}` |
-    | `object-store` | `POST /v1/{group}/object-store/presign` |
+    | `object-store` | `POST /v1/{group}/object-store/presign` (presigned PUT) |
+    | `object-store-read` | `POST /v1/{group}/object-store/presign-get` (presigned GET) |
     | `session`  | `POST /v1/sys/session`, `DELETE /v1/sys/session/{id}` |
     | `leases`   | `POST /v1/sys/leases/{renew,revoke}` |
     | `snapshot` | `POST /v1/sys/store-snapshot` |
@@ -655,6 +656,32 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/PresignRequest" } } } }
       responses:
         "200": { description: presigned PUT URL + expiry, content: { application/json: { schema: { $ref: "#/components/schemas/PresignResponse" } } } }
+        "400": { description: bad tenant_id (not lowercase UUIDv4) / map_id / version, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/GroupMismatch" }
+        "503": { description: object-store presign not configured on this instance (no Spaces key), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /v1/{group}/object-store/presign-get:
+    post:
+      tags: [object-store]
+      operationId: presignObjectGet
+      summary: Sign a short-TTL presigned GET URL for one tile-archive or manifest object.
+      description: |
+        Read mirror of the PUT presign (cap **`object-store-read`**, consumer `proximiio-belt`):
+        returns a presigned S3-style **GET** URL scoped to exactly one server-constructed key,
+        valid until `expires`. belt resolves `latest.json` → version → `<version>.pmtiles` and
+        **range-GETs direct from Spaces** — the `Range` header is not signed (`SignedHeaders=host`),
+        so range requests work unchanged. Same key templates as the PUT op; same stateless,
+        no-lease, per-group model. A distinct cap from `object-store` (write), so a read principal
+        can only ever sign GETs and a write principal only PUTs.
+      x-implementation-status: implemented
+      x-audit-action: object_store.presign_get
+      parameters:
+        - { $ref: "#/components/parameters/GroupParam" }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/PresignRequest" } } } }
+      responses:
+        "200": { description: presigned GET URL + expiry, content: { application/json: { schema: { $ref: "#/components/schemas/PresignResponse" } } } }
         "400": { description: bad tenant_id (not lowercase UUIDv4) / map_id / version, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }

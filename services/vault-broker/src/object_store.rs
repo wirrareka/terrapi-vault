@@ -107,11 +107,13 @@ impl ObjectStoreSigner {
         }
     }
 
-    /// Sign a presigned `PUT` URL for `key`, valid `ttl_secs` from `now_unix`. Returns the URL
-    /// and its absolute expiry (unix seconds). `now_unix` is injected (not read from the clock)
-    /// so the signing is deterministic and unit-testable.
+    /// Sign a presigned URL for `method` (`"PUT"` to publish, `"GET"` to read) on `key`, valid
+    /// `ttl_secs` from `now_unix`. Returns the URL and its absolute expiry (unix seconds).
+    /// `now_unix` is injected (not read from the clock) so the signing is deterministic and
+    /// unit-testable. The `Range` header is not signed (`SignedHeaders=host`), so a presigned
+    /// `GET` URL serves range requests unchanged.
     #[must_use]
-    pub fn presign_put(&self, key: &str, now_unix: u64, ttl_secs: u64) -> (String, u64) {
+    pub fn presign(&self, method: &str, key: &str, now_unix: u64, ttl_secs: u64) -> (String, u64) {
         // SigV4 timestamps. Derive from the injected unix time so tests are deterministic.
         let dt = OffsetDateTime::from_unix_timestamp(i64::try_from(now_unix).unwrap_or(0))
             .unwrap_or(OffsetDateTime::UNIX_EPOCH);
@@ -148,9 +150,9 @@ impl ObjectStoreSigner {
 
         let canonical_uri = canonical_path(key);
         // Canonical request: signed headers = just `host`; payload unsigned (the client streams
-        // the body straight to Spaces). Layout: METHOD\nURI\nQUERY\nHEADERS\n\nSIGNED\nPAYLOADHASH.
+        // the body straight to/from Spaces). Layout: METHOD\nURI\nQUERY\nHEADERS\n\nSIGNED\nPAYLOADHASH.
         let canonical_request = format!(
-            "PUT\n{canonical_uri}\n{canonical_query}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD",
+            "{method}\n{canonical_uri}\n{canonical_query}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD",
             host = self.host,
         );
 
@@ -296,8 +298,8 @@ mod tests {
         let s = signer();
         let key = ObjectStoreSigner::object_key(Kind::Archive, TENANT, "berlin", "v1");
         let now = 1_780_000_000; // fixed
-        let (url1, exp1) = s.presign_put(&key, now, 300);
-        let (url2, exp2) = s.presign_put(&key, now, 300);
+        let (url1, exp1) = s.presign("PUT", &key, now, 300);
+        let (url2, exp2) = s.presign("PUT", &key, now, 300);
         assert_eq!(url1, url2, "same inputs → identical signed URL");
         assert_eq!(exp1, exp2);
         assert_eq!(exp1, now + 300);
@@ -317,24 +319,43 @@ mod tests {
     fn different_tenant_or_kind_changes_url_and_signature() {
         let s = signer();
         let now = 1_780_000_000;
-        let a = s.presign_put(
+        let a = s.presign(
+            "PUT",
             &ObjectStoreSigner::object_key(Kind::Archive, TENANT, "berlin", "v1"),
             now,
             300,
         );
         let other = "22222222-2222-4222-8222-222222222222";
-        let b = s.presign_put(
+        let b = s.presign(
+            "PUT",
             &ObjectStoreSigner::object_key(Kind::Archive, other, "berlin", "v1"),
             now,
             300,
         );
-        let m = s.presign_put(
+        let m = s.presign(
+            "PUT",
             &ObjectStoreSigner::object_key(Kind::Manifest, TENANT, "berlin", "v1"),
             now,
             300,
         );
         assert_ne!(a.0, b.0, "tenant changes the signed path");
         assert_ne!(a.0, m.0, "kind changes the signed path");
+    }
+
+    #[test]
+    fn get_and_put_presign_differ_by_method() {
+        // The HTTP method is part of the SigV4 canonical request, so a GET presign on the
+        // same key has a distinct signature — a read URL can't be replayed as a write.
+        let s = signer();
+        let key = ObjectStoreSigner::object_key(Kind::Archive, TENANT, "berlin", "v1");
+        let now = 1_780_000_000;
+        let (put, _) = s.presign("PUT", &key, now, 300);
+        let (get, _) = s.presign("GET", &key, now, 300);
+        assert_ne!(put, get, "method changes the signature");
+        // both still target the same object key
+        let base = "https://proximi-outermap-eu.fra1.digitaloceanspaces.com/";
+        assert!(put.starts_with(&format!("{base}{key}?")));
+        assert!(get.starts_with(&format!("{base}{key}?")));
     }
 
     #[test]

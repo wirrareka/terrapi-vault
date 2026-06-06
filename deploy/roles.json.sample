@@ -1,5 +1,5 @@
 {
-  "_comment": "Production VAULT_ROLES_CONFIG for the EU broker. SAN(dNSName) -> {role, caps}. Capabilities: ssh-ca, ssh-sign, creds, session, leases, kms, snapshot. An unmapped/trusted SAN -> 403; a cap the role lacks -> 403. Mint client certs with these exact dNSNames (demon-mtls-san-matcher.md).",
+  "_comment": "Production VAULT_ROLES_CONFIG for the EU broker. SAN(dNSName) -> {role, caps}. Capabilities: ssh-ca, ssh-sign, creds, session, leases, kms, object-store, object-store-read, snapshot. An unmapped/trusted SAN -> 403; a cap the role lacks -> 403. Mint client certs with these exact dNSNames (demon-mtls-san-matcher.md). object-store = presigned PUT (tile publish, outer-map); object-store-read = presigned GET (tile serve, belt) — only wire these where VAULT_OBJECT_STORE_* is configured.",
   "roles": {
     "demon-operator.eu.proximi.internal": {
       "role": "demon-operator",
@@ -12,6 +12,14 @@
     "aether-backup.eu.proximi.internal": {
       "role": "aether-backup",
       "caps": ["kms", "snapshot"]
+    },
+    "proximiio-outer-map.eu.proximi.internal": {
+      "role": "outer-map-publish",
+      "caps": ["object-store"]
+    },
+    "belt.eu.proximi.internal": {
+      "role": "belt-serve",
+      "caps": ["object-store-read"]
     }
   }
 }

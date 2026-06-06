@@ -3,6 +3,32 @@
 terrapi-vault — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
+## 0.1.7 (2026-06-06)
+
+Object-store presign — the DO Spaces tile publish/serve path for proximiio-outer-map (publish)
+and proximiio-belt (serve). DO Spaces has no key-management API and only coarse per-bucket key
+scoping, so instead of leasing per-tenant keys the broker holds one long-lived per-group Spaces
+RWD key (env-held, **never exported**) and signs short-TTL, single-object presigned URLs; the
+per-tenant / method / single-object scoping lives in the SigV4 signature.
+
+- **`POST /v1/{group}/object-store/presign` (cap `object-store`)** — presigned **PUT** URL for a
+  tile archive or manifest pointer. `{tenant_id,map_id,version,kind:"archive|manifest",ttl_secs?}`
+  → `{url,method,key,expires}`. Keys are server-constructed (`t/<tenant>/<map>/<version>.pmtiles`
+  and `…/latest.json`); no client-supplied path (tenant_id UUIDv4, map_id/version `[A-Za-z0-9._-]`,
+  no traversal).
+- **`POST /v1/{group}/object-store/presign-get` (cap `object-store-read`)** — presigned **GET** URL
+  for the same keys (the serving side, belt). A distinct cap so a read principal can only sign GETs
+  and a writer only PUTs. The `Range` header is unsigned, so range-GETs work unchanged.
+- **Stateless — not a lease:** no `lease_id`/renew/revoke (a presigned URL can't be revoked); the
+  short TTL is the only bound (default 300 s, max 900 s).
+- **SigV4** query-presigning (`object_store.rs`, RustCrypto `hmac`/`sha2`), signing-key chain pinned
+  to an independent reference vector.
+- Config `VAULT_OBJECT_STORE_{KEY,SECRET,REGION,BUCKET}` (+ optional `HOST`/`TTL_SECS`/`MAX_TTL_SECS`);
+  unset ⇒ both ops `503 not_configured`. Audit `object_store.presign{,_get}` = key+tenant+expires
+  only (never the URL/signature). Per-group: an `eu` signer only ever signs `eu`-bucket URLs.
+- Broker OpenAPI → **1.2.0** (two new ops, `object-store`/`object-store-read` caps). `deploy/`
+  env + roles samples updated.
+
 ## 0.1.6 (2026-06-04)
 
 - **OpenSearch clients gain a CA-file TLS option (`opensearch.rs`, `audit_ship.rs`).** New
