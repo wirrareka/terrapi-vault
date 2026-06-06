@@ -22,6 +22,11 @@ mod jwt;
 mod kms;
 mod object_store;
 mod opensearch;
+// Enterprise-PKI issuance anchor — Phase 1 (leaf-issuance engine). Not yet wired to a route
+// (Phase 2 = sealed-store load + license gate + `/v1/pki/*`, gated on the operator license format),
+// so the engine's API is currently exercised only by its tests.
+#[allow(dead_code)]
+mod pki;
 mod seal;
 mod ssh_ca;
 mod state;

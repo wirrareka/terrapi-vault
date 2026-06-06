@@ -48,8 +48,10 @@ x509-parser = "0.16"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 tower = { version = "0.5", features = ["util"] }
-# Test-only certificate generation (dev/unit certs for the mTLS path).
-rcgen = "0.13"
+# X.509 issuance: dev/unit certs for the mTLS path AND the enterprise-PKI leaf-issuance
+# engine (`pki.rs`). The `x509-parser` feature enables `from_ca_cert_pem` (load the
+# operator-delivered intermediate to sign leaves under).
+rcgen = { version = "0.13", features = ["x509-parser"] }
 # SSH signed-certificate CA (Phase 2): ed25519 CA key + OpenSSH certificate signing.
 ssh-key = { version = "0.6", features = ["ed25519", "std"] }
 rand = "0.8"
