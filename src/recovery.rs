@@ -216,10 +216,7 @@ mod tests {
         // O/o → 0, I/i/L/l → 1: a code transcribed with look-alikes still parses.
         let code = RecoveryCode::generate();
         let canonical = code.format().to_string();
-        let folded = canonical
-            .replace('0', "O")
-            .replace('1', "I")
-            .to_lowercase();
+        let folded = canonical.replace('0', "O").replace('1', "I").to_lowercase();
         // Re-folding must recover the same bytes (the canonical form has no
         // O/I/L, so injecting them and folding back is lossless).
         let parsed = RecoveryCode::parse(&folded).unwrap();

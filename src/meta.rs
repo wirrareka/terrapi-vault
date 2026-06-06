@@ -131,8 +131,8 @@ impl VaultMeta {
 ///
 /// [`Error::MetaInvalid`] if the hex is malformed or not exactly [`SALT_LEN`] bytes.
 fn decode_salt(salt_hex: &str) -> Result<[u8; SALT_LEN]> {
-    let bytes =
-        hex::decode(salt_hex).ok_or_else(|| Error::MetaInvalid("salt_hex is not valid hex".into()))?;
+    let bytes = hex::decode(salt_hex)
+        .ok_or_else(|| Error::MetaInvalid("salt_hex is not valid hex".into()))?;
     if bytes.len() != SALT_LEN {
         return Err(Error::MetaInvalid(format!(
             "salt must be {SALT_LEN} bytes, got {}",
@@ -276,7 +276,10 @@ impl MetaV2 {
             });
         }
         if self.kdf != "argon2id" {
-            return Err(Error::MetaInvalid(format!("unsupported kdf {:?}", self.kdf)));
+            return Err(Error::MetaInvalid(format!(
+                "unsupported kdf {:?}",
+                self.kdf
+            )));
         }
         self.slots.password.validate()?;
         if let Some(r) = &self.slots.recovery {

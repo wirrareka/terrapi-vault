@@ -327,10 +327,7 @@ impl Vault {
             return Err(Error::WrongPassphrase);
         };
         // Defensive: the slot must unwrap to the very DEK the vault is using.
-        if !constant_time_eq(
-            &unwrapped.expose_secret().0,
-            &inputs.dek.expose_secret().0,
-        ) {
+        if !constant_time_eq(&unwrapped.expose_secret().0, &inputs.dek.expose_secret().0) {
             return Err(Error::WrongPassphrase);
         }
         Ok(RotationPlan {
@@ -1084,12 +1081,8 @@ mod tests {
             MetaV2::new(slot)
                 .write(&rekey_staging_path(&meta_path))
                 .unwrap();
-            conn.pragma_update(
-                None,
-                "rekey",
-                dek.expose_secret().pragma_literal().as_str(),
-            )
-            .unwrap();
+            conn.pragma_update(None, "rekey", dek.expose_secret().pragma_literal().as_str())
+                .unwrap();
             #[allow(clippy::mem_forget)]
             std::mem::forget(conn);
         }
@@ -1193,7 +1186,10 @@ mod tests {
             v.remove_recovery().unwrap();
             assert!(!v.has_recovery().unwrap());
             // Removing again is a clear error, not a silent success.
-            assert!(matches!(v.remove_recovery().unwrap_err(), Error::NoRecoverySlot));
+            assert!(matches!(
+                v.remove_recovery().unwrap_err(),
+                Error::NoRecoverySlot
+            ));
             v.lock();
         }
         assert!(matches!(
@@ -1349,7 +1345,10 @@ mod tests {
         // a biometric-stashed DEK — survive a passphrase change. Biometric
         // re-gating on passphrase change is now a UI policy, not implied by key
         // invalidation (contrast the old v1 rekey behavior).
-        assert_eq!(dek_before, dek_after, "DEK must not change on passphrase rotation");
+        assert_eq!(
+            dek_before, dek_after,
+            "DEK must not change on passphrase rotation"
+        );
         assert!(
             Vault::open_with_key(&path, &dek_before).is_ok(),
             "the stable DEK still opens the vault"

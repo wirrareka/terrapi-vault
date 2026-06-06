@@ -58,12 +58,12 @@ mod hex;
 mod kdf;
 mod keyslot;
 mod meta;
-mod recovery;
 /// The `.memento-note` single-note export format. Behind the default-on `note-export` feature so
 /// a neutral consumer (e.g. `probe`) can drop it with `default-features = false`; memento, which
 /// uses it, gets it by default.
 #[cfg(feature = "note-export")]
 mod note_export;
+mod recovery;
 mod vault;
 
 pub use error::{Error, Result};
@@ -76,9 +76,9 @@ pub use meta::{
     meta_path_for, KeySlot, KeySlots, MetaV2, StoredMeta, VaultMeta, CURRENT_FORMAT_VERSION,
     FORMAT_VERSION, META_SUFFIX,
 };
-pub use recovery::{RecoveryCode, RECOVERY_ENTROPY_BYTES};
 #[cfg(feature = "note-export")]
 pub use note_export::{export_note, import_note, ExportedNote, CONTAINER_VERSION, NOTE_MAGIC};
+pub use recovery::{RecoveryCode, RECOVERY_ENTROPY_BYTES};
 pub use vault::{RotationInputs, RotationPlan, Vault};
 
 /// Re-export of the `rusqlite` version this crate links, so downstream
