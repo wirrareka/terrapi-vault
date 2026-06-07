@@ -11,6 +11,13 @@ export function fmtUnix(secs: number): string {
   return new Date(secs * 1000).toLocaleString();
 }
 
+/** Case-insensitive substring match of `query` against any of `fields`; empty query matches all. */
+export function matches(query: string, ...fields: (string | undefined)[]): boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  return fields.some((f) => (f ?? "").toLowerCase().includes(q));
+}
+
 /** Seconds-from-now until `expires_at` (unix secs), as a compact "in 2h 5m" / "expired". */
 export function untilExpiry(expiresAt: number, now: number): string {
   const d = expiresAt - now;

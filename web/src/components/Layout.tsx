@@ -8,9 +8,11 @@ import {
   Lock,
   LogOut,
   type LucideIcon,
+  Moon,
   ScrollText,
   Server,
   ShieldCheck,
+  Sun,
   TerminalSquare,
   Users,
 } from "lucide-react";
@@ -18,6 +20,7 @@ import { cn } from "@/lib/utils";
 import { useBrokers } from "@/hooks/use-observe";
 import { logoutUrl, useMe } from "@/hooks/use-auth";
 import { useFilters } from "@/stores/filters";
+import { useTheme } from "@/stores/theme";
 import { Badge } from "@/components/ui";
 
 interface NavItem {
@@ -44,6 +47,8 @@ export function AppLayout() {
   const fetching = useIsFetching() > 0;
   const broker = useFilters((s) => s.broker);
   const setBroker = useFilters((s) => s.setBroker);
+  const theme = useTheme((s) => s.theme);
+  const toggleTheme = useTheme((s) => s.toggle);
   const group = brokers?.[0]?.group;
   const reachable = brokers?.filter((b) => b.reachable).length ?? 0;
   const total = brokers?.length ?? 0;
@@ -116,13 +121,24 @@ export function AppLayout() {
             <span className="truncate" title={me?.subject}>
               {me ? (me.email ?? me.subject) : "—"}
             </span>
-            <a
-              href={logoutUrl()}
-              className="flex items-center gap-1 rounded px-1.5 py-1 hover:bg-accent hover:text-foreground"
-              title="Sign out"
-            >
-              <LogOut className="h-3.5 w-3.5" />
-            </a>
+            <div className="flex items-center gap-0.5">
+              <button
+                type="button"
+                onClick={toggleTheme}
+                className="flex items-center rounded px-1.5 py-1 hover:bg-accent hover:text-foreground"
+                title={theme === "dark" ? "Switch to light" : "Switch to dark"}
+                aria-label="Toggle theme"
+              >
+                {theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
+              </button>
+              <a
+                href={logoutUrl()}
+                className="flex items-center rounded px-1.5 py-1 hover:bg-accent hover:text-foreground"
+                title="Sign out"
+              >
+                <LogOut className="h-3.5 w-3.5" />
+              </a>
+            </div>
           </div>
         </div>
       </aside>

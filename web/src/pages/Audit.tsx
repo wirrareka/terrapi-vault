@@ -1,8 +1,10 @@
+import { useMemo, useState } from "react";
 import { PageHeader } from "@/components/Layout";
 import { DataTable, type Column } from "@/components/DataTable";
-import { Badge } from "@/components/ui";
+import { Badge, SearchInput } from "@/components/ui";
 import { useAudit } from "@/hooks/use-observe";
 import { useFiltered } from "@/stores/filters";
+import { matches } from "@/lib/utils";
 import type { AuditRecord } from "@/lib/types";
 
 /** Safe string read of an unknown JSON value. */
@@ -14,12 +16,25 @@ function str(v: unknown): string {
 function field(ev: Record<string, unknown>, key: string): unknown {
   return ev[key];
 }
+/** The target id (B3 `target.id`) from an event, if present. */
+function targetId(ev: Record<string, unknown>): string {
+  const t = field(ev, "target");
+  return t && typeof t === "object" ? str((t as Record<string, unknown>).id) : "";
+}
 
 export default function Audit() {
   // P1: most-recent tail from seq 0 (the console aggregator caps + merges per broker). Cursor
   // paging (?since=next_seq) is a P1-follow refinement.
   const { data, isLoading, error } = useAudit(0, 200);
   const rows = useFiltered(data?.records);
+  const [q, setQ] = useState("");
+  const shown = useMemo(
+    () =>
+      (rows ?? []).filter((r) =>
+        matches(q, str(field(r.event, "action")), targetId(r.event), r.broker, str(field(r.event, "outcome"))),
+      ),
+    [rows, q],
+  );
 
   const columns: Column<AuditRecord>[] = [
     { header: "Seq", className: "tabular-nums text-muted-foreground", cell: (r) => r.seq },
@@ -27,11 +42,7 @@ export default function Audit() {
     { header: "Action", cell: (r) => <span className="font-medium">{str(field(r.event, "action"))}</span> },
     {
       header: "Target",
-      cell: (r) => {
-        const target = field(r.event, "target");
-        const id = target && typeof target === "object" ? (target as Record<string, unknown>).id : undefined;
-        return <span className="font-mono text-xs text-muted-foreground">{str(id)}</span>;
-      },
+      cell: (r) => <span className="font-mono text-xs text-muted-foreground">{targetId(r.event)}</span>,
     },
     {
       header: "Outcome",
@@ -45,11 +56,13 @@ export default function Audit() {
 
   return (
     <div className="flex h-full flex-col">
-      <PageHeader title="Audit" count={rows?.length} />
+      <PageHeader title="Audit" count={shown.length}>
+        <SearchInput value={q} onChange={setQ} placeholder="Filter audit…" />
+      </PageHeader>
       <div className="flex-1 overflow-auto">
         <DataTable
           columns={columns}
-          rows={rows}
+          rows={shown}
           rowKey={(r) => r.broker + r.seq}
           isLoading={isLoading}
           error={error}

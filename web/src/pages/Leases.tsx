@@ -1,14 +1,20 @@
+import { useMemo, useState } from "react";
 import { PageHeader } from "@/components/Layout";
 import { DataTable, type Column } from "@/components/DataTable";
-import { Badge } from "@/components/ui";
+import { Badge, SearchInput } from "@/components/ui";
 import { useLeases } from "@/hooks/use-observe";
 import { useFiltered } from "@/stores/filters";
-import { fmtUnix, untilExpiry } from "@/lib/utils";
+import { fmtUnix, matches, untilExpiry } from "@/lib/utils";
 import type { Lease } from "@/lib/types";
 
 export default function Leases() {
   const { data, isLoading, error } = useLeases();
   const rows = useFiltered(data?.leases);
+  const [q, setQ] = useState("");
+  const shown = useMemo(
+    () => (rows ?? []).filter((l) => matches(q, l.lease_id, l.role, l.parent_session, l.broker)),
+    [rows, q],
+  );
   const now = data?.now ?? Math.floor(Date.now() / 1000);
 
   const columns: Column<Lease>[] = [
@@ -29,11 +35,13 @@ export default function Leases() {
 
   return (
     <div className="flex h-full flex-col">
-      <PageHeader title="Leases" count={rows?.length} />
+      <PageHeader title="Leases" count={shown.length}>
+        <SearchInput value={q} onChange={setQ} placeholder="Filter leases…" />
+      </PageHeader>
       <div className="flex-1 overflow-auto">
         <DataTable
           columns={columns}
-          rows={rows}
+          rows={shown}
           rowKey={(l) => l.broker + l.lease_id}
           isLoading={isLoading}
           error={error}

@@ -1,4 +1,5 @@
 import * as React from "react";
+import { Search } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // Lightweight primitives (shadcn New York look, hand-rolled to keep the skeleton dependency-light
@@ -50,6 +51,31 @@ export function Spinner({ className }: { className?: string }) {
       role="status"
       aria-label="loading"
     />
+  );
+}
+
+export function SearchInput({
+  value,
+  onChange,
+  placeholder = "Search…",
+  className,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  className?: string;
+}) {
+  return (
+    <div className={cn("relative", className)}>
+      <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+      <input
+        type="search"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        className="flex h-9 w-56 rounded-md border border-input bg-transparent pl-9 pr-3 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+      />
+    </div>
   );
 }
 
