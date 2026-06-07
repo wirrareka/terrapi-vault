@@ -256,6 +256,39 @@ fn recover_tip(path: &Path) -> (u64, [u8; 32]) {
     tip.map_or((0, GENESIS), |(seq, h)| (seq + 1, h))
 }
 
+/// One audit record for the read-only observe API: its sequence + the canonical B3 event.
+/// (Chain `prev`/`hash` are omitted — integrity is `verify_chain`'s concern, not the view's.)
+pub struct AuditTail {
+    pub seq: u64,
+    pub event: serde_json::Value,
+}
+
+/// Read up to `limit` records with `seq >= since` from the chain file at `path`, in file order.
+/// Best-effort: a missing/partial file yields whatever is parseable (no error) — this is a
+/// read-only operator view, not the integrity check. Already-redacted B3 events.
+#[must_use]
+pub fn read_tail(path: &Path, since: u64, limit: usize) -> Vec<AuditTail> {
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in data.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(r) = serde_json::from_str::<RecordIn>(line) else {
+            continue;
+        };
+        if r.seq < since {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(r.event.get()) {
+            out.push(AuditTail { seq: r.seq, event });
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    out
+}
+
 impl AuditSink for HashChainSink {
     fn emit(&self, event: &AuditEvent) {
         let Ok(event_bytes) = serde_json::to_vec(event) else {

@@ -161,6 +161,53 @@ pub struct ObserveRolesResponse {
     pub roles: Vec<ObserveRole>,
 }
 
+#[derive(Serialize)]
+pub struct ObserveSshSerial {
+    pub lease_id: String,
+    pub serial: u64,
+}
+
+#[derive(Serialize)]
+pub struct ObserveSshResponse {
+    /// Serials of issued SSH certs still tracked against a live lease.
+    pub issued: Vec<ObserveSshSerial>,
+    /// Revoked serials (the CA's revocation list). Empty if the broker is sealed (store closed).
+    pub revoked: Vec<u64>,
+}
+
+#[derive(Serialize)]
+pub struct ObserveKmsKey {
+    pub tenant_id: String,
+    pub key_id: String,
+    pub current_version: u32,
+}
+
+#[derive(Serialize)]
+pub struct ObserveKmsResponse {
+    /// KEK targets in this group — identity + current version only, NEVER key bytes. Empty if sealed.
+    pub keys: Vec<ObserveKmsKey>,
+}
+
+#[derive(Serialize)]
+pub struct ObserveObjectStoreResponse {
+    /// Whether object-store presign is configured on this broker (a per-group Spaces key is set).
+    pub configured: bool,
+}
+
+#[derive(Serialize)]
+pub struct ObserveAuditRecord {
+    pub seq: u64,
+    /// The canonical B3 event (already redacted at emit — no secret material).
+    pub event: serde_json::Value,
+}
+
+#[derive(Serialize)]
+pub struct ObserveAuditResponse {
+    pub records: Vec<ObserveAuditRecord>,
+    /// `seq` to pass as `?since=` next poll (one past the last returned record).
+    pub next_seq: u64,
+}
+
 // --- Sessions + leases ----------------------------------------------------------
 
 #[derive(Debug, Deserialize)]

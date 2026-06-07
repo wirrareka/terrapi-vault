@@ -287,6 +287,17 @@ impl AppState {
             .collect()
     }
 
+    /// Snapshot of issued SSH cert serials by lease (lease_id → serial), for the observe API.
+    #[must_use]
+    pub fn list_ssh_serials(&self) -> Vec<(String, u64)> {
+        self.ssh_serials
+            .lock()
+            .expect("ssh serials lock")
+            .iter()
+            .map(|(lease_id, serial)| (lease_id.clone(), *serial))
+            .collect()
+    }
+
     /// Drop any principal bindings pointing at `session_id` (called on session end).
     pub fn unbind_session(&self, session_id: &str) {
         self.sessions

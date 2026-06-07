@@ -15,7 +15,7 @@ use crate::state::{
     DEFAULT_SESSION_TTL_SECS, MAX_SESSION_TTL_SECS, SSH_CERT_MAX_TTL_SECS,
     SSH_CERT_TTL_INTERACTIVE_SECS,
 };
-use axum::extract::{FromRequestParts, Path, RawPathParams, State};
+use axum::extract::{FromRequestParts, Path, Query, RawPathParams, State};
 use axum::http::{header::AUTHORIZATION, request::Parts, HeaderMap, StatusCode};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -170,6 +170,13 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sys/observe/leases", get(observe_leases))
         .route("/v1/sys/observe/sessions", get(observe_sessions))
         .route("/v1/sys/observe/roles", get(observe_roles))
+        .route("/v1/sys/observe/audit", get(observe_audit))
+        .route("/v1/{group}/observe/ssh", get(observe_ssh))
+        .route("/v1/{group}/observe/kms", get(observe_kms))
+        .route(
+            "/v1/{group}/observe/object-store",
+            get(observe_object_store),
+        )
         .route("/v1/sys/session", post(session_open))
         .route("/v1/sys/session/{id}", delete(session_end))
         .route("/v1/sys/store-snapshot", post(store_snapshot))
@@ -812,6 +819,98 @@ async fn observe_roles(
         .collect();
     roles.sort_by(|a, b| a.san.cmp(&b.san));
     Ok(Json(crate::dto::ObserveRolesResponse { roles }))
+}
+
+/// Issued SSH cert serials (tracked against live leases) + the CA revocation list. Group-scoped.
+async fn observe_ssh(
+    State(state): State<AppState>,
+    principal: Principal,
+    _group: Group,
+) -> ApiResult<crate::dto::ObserveSshResponse> {
+    require_cap(&principal, Capability::Observe)?;
+    let issued = state
+        .list_ssh_serials()
+        .into_iter()
+        .map(|(lease_id, serial)| crate::dto::ObserveSshSerial { lease_id, serial })
+        .collect();
+    let revoked = match &state.store {
+        Some(s) => {
+            let v = s.lock().expect("store lock");
+            crate::ssh_ca::list_revoked(&v)
+                .map_err(|e| internal("store_error", "ssh revoked", e))?
+        }
+        None => Vec::new(), // sealed → store closed → nothing to list
+    };
+    Ok(Json(crate::dto::ObserveSshResponse { issued, revoked }))
+}
+
+/// KMS KEK inventory for this group — identity + current version only, never key bytes. Group-scoped.
+async fn observe_kms(
+    State(state): State<AppState>,
+    principal: Principal,
+    _group: Group,
+) -> ApiResult<crate::dto::ObserveKmsResponse> {
+    require_cap(&principal, Capability::Observe)?;
+    let group = state.cfg.residency_group.as_str();
+    let raw = match &state.store {
+        Some(s) => {
+            let v = s.lock().expect("store lock");
+            crate::kms::list_keys(&v, group).map_err(|e| internal("store_error", "kms list", e))?
+        }
+        None => Vec::new(),
+    };
+    let keys = raw
+        .into_iter()
+        .map(
+            |(tenant_id, key_id, current_version)| crate::dto::ObserveKmsKey {
+                tenant_id,
+                key_id,
+                current_version,
+            },
+        )
+        .collect();
+    Ok(Json(crate::dto::ObserveKmsResponse { keys }))
+}
+
+/// Whether object-store presign is configured on this broker. Group-scoped.
+async fn observe_object_store(
+    State(state): State<AppState>,
+    principal: Principal,
+    _group: Group,
+) -> ApiResult<crate::dto::ObserveObjectStoreResponse> {
+    require_cap(&principal, Capability::Observe)?;
+    Ok(Json(crate::dto::ObserveObjectStoreResponse {
+        configured: state.object_store.is_some(),
+    }))
+}
+
+/// Query for the audit tail: `?since=<seq>&limit=<n>`.
+#[derive(serde::Deserialize)]
+struct AuditQuery {
+    #[serde(default)]
+    since: u64,
+    limit: Option<usize>,
+}
+
+/// Tail of the local hash-chained B3 audit (`seq >= since`, capped). Already redacted at emit —
+/// never secret material. Reads the broker's own chain file directly (source of truth).
+async fn observe_audit(
+    State(state): State<AppState>,
+    principal: Principal,
+    Query(q): Query<AuditQuery>,
+) -> ApiResult<crate::dto::ObserveAuditResponse> {
+    require_cap(&principal, Capability::Observe)?;
+    let limit = q.limit.unwrap_or(100).clamp(1, 500);
+    let records: Vec<crate::dto::ObserveAuditRecord> =
+        vault_transport::audit::read_tail(&state.cfg.audit_path, q.since, limit)
+            .into_iter()
+            .map(|t| crate::dto::ObserveAuditRecord {
+                seq: t.seq,
+                event: t.event,
+            })
+            .collect();
+    let next_seq = records.last().map_or(q.since, |r| r.seq + 1);
+    Ok(Json(crate::dto::ObserveAuditResponse { records, next_seq }))
 }
 
 /// Backup-target key id: a short, filesystem/DB-safe token (the aether `target_id`).
@@ -1620,5 +1719,65 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v = json_body(resp).await;
         assert!(v["roles"].is_array());
+    }
+
+    /// `observe/ssh` (group-scoped): 200 with empty issued/revoked on a fresh sealed broker.
+    #[tokio::test]
+    async fn observe_ssh_ok() {
+        let resp = eu_dev_router()
+            .oneshot(get("/v1/eu/observe/ssh"))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert_eq!(v["issued"].as_array().expect("issued").len(), 0);
+        assert!(v["revoked"].is_array());
+    }
+
+    /// `observe/kms` (group-scoped): 200; keys empty when sealed (no store).
+    #[tokio::test]
+    async fn observe_kms_ok_empty_when_sealed() {
+        let resp = eu_dev_router()
+            .oneshot(get("/v1/eu/observe/kms"))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert_eq!(v["keys"].as_array().expect("keys").len(), 0);
+    }
+
+    /// `observe/object-store` (group-scoped): 200 with a boolean `configured`.
+    #[tokio::test]
+    async fn observe_object_store_ok() {
+        let resp = eu_dev_router()
+            .oneshot(get("/v1/eu/observe/object-store"))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert!(v["configured"].is_boolean());
+    }
+
+    /// `observe/audit`: 200 with a `records` array + `next_seq` (the dev sink writes nothing).
+    #[tokio::test]
+    async fn observe_audit_ok() {
+        let resp = eu_dev_router()
+            .oneshot(get("/v1/sys/observe/audit?since=0&limit=10"))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert!(v["records"].is_array());
+        assert!(v["next_seq"].as_u64().is_some());
+    }
+
+    /// A wrong-group observe path 404s (residency air-gap) like every other `{group}` route.
+    #[tokio::test]
+    async fn observe_ssh_wrong_group_is_404() {
+        let resp = eu_dev_router()
+            .oneshot(get("/v1/uae/observe/ssh"))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

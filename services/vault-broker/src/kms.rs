@@ -69,6 +69,31 @@ fn ensure_table(vault: &Vault) -> Result<(), KmsError> {
         .map_err(|e| KmsError::Store(e.to_string()))
 }
 
+/// Metadata-only KEK inventory for `group` (observe API): `(tenant_id, key_id, current_version)`.
+/// **Never** returns KEK bytes — only the identity tuple + the current (highest) version.
+///
+/// # Errors
+/// `Store` on a DB error.
+pub fn list_keys(vault: &Vault, group: &str) -> Result<Vec<(String, String, u32)>, KmsError> {
+    ensure_table(vault)?;
+    vault
+        .with_connection(|c| {
+            let mut stmt = c.prepare(
+                "SELECT tenant_id, key_id, MAX(version) FROM kms_keks WHERE group_name=?1 \
+                 GROUP BY tenant_id, key_id ORDER BY tenant_id, key_id",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![group], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    u32::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|e| KmsError::Store(e.to_string()))
+}
+
 fn gen_kek() -> [u8; 32] {
     // 32 bytes of OS randomness (two 16-byte CSPRNG draws).
     let mut kek = [0u8; 32];

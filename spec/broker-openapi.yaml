@@ -9,7 +9,7 @@
 openapi: 3.1.0
 info:
   title: terrapi-vault broker
-  version: "1.3.0"
+  version: "1.4.0"
   summary: Network secrets broker for the proximi.io platform (one instance per residency group).
   description: |
     Network secrets broker for the proximi.io platform. **One instance per residency
@@ -41,7 +41,7 @@ info:
     | `kms`      | `POST /v1/{group}/{tenant_id}/kms/{key_id}/{wrap,unwrap,rotate,rewrap}` |
     | `object-store` | `POST /v1/{group}/object-store/presign` (presigned PUT) |
     | `object-store-read` | `POST /v1/{group}/object-store/presign-get` (presigned GET) |
-    | `observe` | `GET /v1/sys/observe/{leases,sessions,roles}` (read-only operator view; vault-console) |
+    | `observe` | `GET /v1/sys/observe/{leases,sessions,roles,audit}` + `/v1/{group}/observe/{ssh,kms,object-store}` (read-only operator view; vault-console) |
     | `session`  | `POST /v1/sys/session`, `DELETE /v1/sys/session/{id}` |
     | `leases`   | `POST /v1/sys/leases/{renew,revoke}` |
     | `snapshot` | `POST /v1/sys/store-snapshot` |
@@ -340,6 +340,51 @@ components:
       required: [roles]
       properties:
         roles: { type: array, items: { $ref: "#/components/schemas/ObserveRole" } }
+    ObserveSshResponse:
+      type: object
+      required: [issued, revoked]
+      properties:
+        issued:
+          type: array
+          items:
+            type: object
+            required: [lease_id, serial]
+            properties:
+              lease_id: { type: string }
+              serial: { type: integer, description: SSH cert serial }
+        revoked: { type: array, items: { type: integer }, description: revoked serials (CA revocation list; empty if sealed) }
+    ObserveKmsResponse:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            type: object
+            required: [tenant_id, key_id, current_version]
+            properties:
+              tenant_id: { type: string }
+              key_id: { type: string }
+              current_version: { type: integer }
+          description: KEK targets in this group — NEVER key bytes; empty if sealed
+    ObserveObjectStoreResponse:
+      type: object
+      required: [configured]
+      properties:
+        configured: { type: boolean, description: whether a per-group Spaces key is set (presign enabled) }
+    ObserveAuditResponse:
+      type: object
+      required: [records, next_seq]
+      properties:
+        records:
+          type: array
+          items:
+            type: object
+            required: [seq, event]
+            properties:
+              seq: { type: integer }
+              event: { type: object, description: the canonical B3 audit event (already redacted) }
+        next_seq: { type: integer, description: "pass as ?since= on the next poll" }
 
     KmsWrapRequest:
       type: object
@@ -772,6 +817,66 @@ paths:
         "200": { description: registered roles, content: { application/json: { schema: { $ref: "#/components/schemas/ObserveRolesResponse" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/sys/observe/audit:
+    get:
+      tags: [observe]
+      operationId: observeAudit
+      summary: Tail of the local hash-chained B3 audit (read-only).
+      description: "Read-only; cap `observe`. Records with `seq >= since` (query `?since=&limit=`, limit capped 500), from the broker's own chain file. Events are already redacted at emit — never secret material. Poll with the returned `next_seq`."
+      x-implementation-status: implemented
+      parameters:
+        - { name: since, in: query, required: false, schema: { type: integer, default: 0 }, description: return records with seq >= this }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 100, maximum: 500 }, description: max records }
+      responses:
+        "200": { description: audit tail, content: { application/json: { schema: { $ref: "#/components/schemas/ObserveAuditResponse" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/{group}/observe/ssh:
+    get:
+      tags: [observe]
+      operationId: observeSsh
+      summary: Issued SSH cert serials + revocation list (read-only).
+      description: "Read-only; cap `observe`. Issued serials tracked against live leases + the CA revocation list. `revoked` is empty when the broker is sealed (store closed)."
+      x-implementation-status: implemented
+      parameters:
+        - { $ref: "#/components/parameters/GroupParam" }
+      responses:
+        "200": { description: ssh serials, content: { application/json: { schema: { $ref: "#/components/schemas/ObserveSshResponse" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/GroupMismatch" }
+
+  /v1/{group}/observe/kms:
+    get:
+      tags: [observe]
+      operationId: observeKms
+      summary: KMS KEK inventory — identity + current version only (read-only).
+      description: "Read-only; cap `observe`. KEK targets in this group: (tenant_id, key_id, current_version). **Never** key bytes. Empty when sealed."
+      x-implementation-status: implemented
+      parameters:
+        - { $ref: "#/components/parameters/GroupParam" }
+      responses:
+        "200": { description: kms inventory, content: { application/json: { schema: { $ref: "#/components/schemas/ObserveKmsResponse" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/GroupMismatch" }
+
+  /v1/{group}/observe/object-store:
+    get:
+      tags: [observe]
+      operationId: observeObjectStore
+      summary: Whether object-store presign is configured (read-only).
+      description: "Read-only; cap `observe`. Reports whether a per-group Spaces key is configured (presign enabled) on this broker."
+      x-implementation-status: implemented
+      parameters:
+        - { $ref: "#/components/parameters/GroupParam" }
+      responses:
+        "200": { description: object-store status, content: { application/json: { schema: { $ref: "#/components/schemas/ObserveObjectStoreResponse" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/GroupMismatch" }
 
   /v1/sys/session:
     post:
