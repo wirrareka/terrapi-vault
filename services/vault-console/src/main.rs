@@ -8,6 +8,7 @@
 mod broker;
 mod config;
 mod http;
+mod ui;
 
 use std::sync::Arc;
 

@@ -36,6 +36,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/observe/kms", get(obs_kms))
         .route("/api/v1/observe/object-store", get(obs_object_store))
         .route("/api/v1/observe/audit", get(obs_audit))
+        // Everything else → the SPA (embedded in release, a stub otherwise). API 404s stay 404.
+        .fallback(crate::ui::fallback)
         .with_state(state)
 }
 

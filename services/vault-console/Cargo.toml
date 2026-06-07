@@ -18,6 +18,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 # Outbound mTLS client to the group's brokers (presents the console's fleet-CA client cert).
 reqwest.workspace = true
+# SPA embed (single binary). OPTIONAL + behind the `embed-ui` feature so the default build (CI)
+# needs no built `web/dist`; the release builds the web app first then `--features embed-ui`.
+rust-embed = { version = "8", features = ["mime-guess"], optional = true }
+
+[features]
+# Compile `web/dist/` into the binary (release). Off by default → CI compiles without the SPA.
+embed-ui = ["dep:rust-embed"]
 
 [lints]
 workspace = true
