@@ -1,0 +1,11 @@
+node_modules
+dist
+*.local
+.DS_Store
+.eslintcache
+*.tsbuildinfo
+# pnpm is the package manager (Kalista standard); don't commit npm's lock.
+package-lock.json
+# emitted by `tsc -b` from the composite node config — build artifacts, not source.
+vite.config.js
+vite.config.d.ts
