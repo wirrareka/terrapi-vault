@@ -11,6 +11,7 @@ import Ssh from "@/pages/Ssh";
 import Kms from "@/pages/Kms";
 import ObjectStore from "@/pages/ObjectStore";
 import Audit from "@/pages/Audit";
+import { NotFound, RouteError } from "@/components/RouteError";
 import "@/index.css";
 
 const queryClient = new QueryClient({
@@ -21,6 +22,7 @@ const router = createBrowserRouter([
   {
     path: "/",
     element: <AppLayout />,
+    errorElement: <RouteError />,
     children: [
       { index: true, element: <Dashboard /> },
       { path: "leases", element: <Leases /> },
@@ -30,6 +32,7 @@ const router = createBrowserRouter([
       { path: "kms", element: <Kms /> },
       { path: "object-store", element: <ObjectStore /> },
       { path: "audit", element: <Audit /> },
+      { path: "*", element: <NotFound /> },
     ],
   },
 ]);

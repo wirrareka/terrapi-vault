@@ -1,10 +1,12 @@
 import * as React from "react";
 import { NavLink, Outlet } from "react-router-dom";
+import { useIsFetching } from "@tanstack/react-query";
 import {
   Activity,
   KeyRound,
   ListTree,
   Lock,
+  LogOut,
   type LucideIcon,
   ScrollText,
   Server,
@@ -14,6 +16,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useBrokers } from "@/hooks/use-observe";
+import { logoutUrl, useMe } from "@/hooks/use-auth";
 import { Badge } from "@/components/ui";
 
 interface NavItem {
@@ -36,6 +39,8 @@ const NAV: NavItem[] = [
 
 export function AppLayout() {
   const { data: brokers } = useBrokers();
+  const { data: me } = useMe();
+  const fetching = useIsFetching() > 0;
   const group = brokers?.[0]?.group;
   const reachable = brokers?.filter((b) => b.reachable).length ?? 0;
   const total = brokers?.length ?? 0;
@@ -45,12 +50,21 @@ export function AppLayout() {
       <aside className="flex w-60 shrink-0 flex-col border-r">
         <div className="flex items-center gap-2 border-b px-5 py-4">
           <Lock className="h-5 w-5" />
-          <div className="leading-tight">
+          <div className="flex-1 leading-tight">
             <div className="text-sm font-semibold tracking-tight">vault-console</div>
             <div className="text-xs text-muted-foreground">
               {group ? `${group} group` : "operator view"}
             </div>
           </div>
+          {/* Global activity: any in-flight query → a soft pulse. */}
+          <span
+            className={cn(
+              "h-2 w-2 rounded-full transition-opacity",
+              fetching ? "animate-pulse bg-green-500 opacity-100" : "opacity-0",
+            )}
+            aria-label={fetching ? "syncing" : undefined}
+            title="syncing"
+          />
         </div>
         <nav className="flex-1 space-y-0.5 p-2">
           {NAV.map(({ to, label, icon: Icon, end }) => (
@@ -72,12 +86,24 @@ export function AppLayout() {
             </NavLink>
           ))}
         </nav>
-        <div className="border-t px-4 py-3 text-xs text-muted-foreground">
+        <div className="space-y-2 border-t px-4 py-3 text-xs text-muted-foreground">
           <div className="flex items-center justify-between">
             <span>Brokers</span>
             <Badge variant={total > 0 && reachable === total ? "success" : "secondary"}>
               {reachable}/{total}
             </Badge>
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <span className="truncate" title={me?.subject}>
+              {me ? (me.email ?? me.subject) : "—"}
+            </span>
+            <a
+              href={logoutUrl()}
+              className="flex items-center gap-1 rounded px-1.5 py-1 hover:bg-accent hover:text-foreground"
+              title="Sign out"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+            </a>
           </div>
         </div>
       </aside>
