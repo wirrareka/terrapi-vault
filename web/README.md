@@ -14,6 +14,7 @@ React 18 · TypeScript · Vite · Tailwind + shadcn/ui (New York) · TanStack Qu
 · lucide-react · date-fns. EN-only. Dark by default.
 
 ## Develop
+Requires **Node 24** (`.nvmrc`; `nvm use`). pnpm is the package manager.
 ```bash
 pnpm install
 pnpm dev          # Vite on :5273, proxies /api → http://127.0.0.1:8203 (override VITE_API_PROXY)
