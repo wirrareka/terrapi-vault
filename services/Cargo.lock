@@ -2268,6 +2268,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vault-console"
+version = "0.1.7"
+dependencies = [
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "vault-sync"
 version = "0.1.7"
 dependencies = [

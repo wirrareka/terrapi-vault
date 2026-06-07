@@ -5,7 +5,7 @@
 # Services consume the lib as a plain path dependency, NOT as a workspace member.
 [workspace]
 resolver = "2"
-members = ["vault-transport", "vault-broker", "vault-sync"]
+members = ["vault-transport", "vault-broker", "vault-sync", "vault-console"]
 
 [workspace.package]
 version = "0.1.7"
