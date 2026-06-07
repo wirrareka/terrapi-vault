@@ -167,6 +167,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/{group}/object-store/presign", post(presign))
         .route("/v1/{group}/object-store/presign-get", post(presign_get))
+        .route("/v1/sys/observe/leases", get(observe_leases))
+        .route("/v1/sys/observe/sessions", get(observe_sessions))
+        .route("/v1/sys/observe/roles", get(observe_roles))
         .route("/v1/sys/session", post(session_open))
         .route("/v1/sys/session/{id}", delete(session_end))
         .route("/v1/sys/store-snapshot", post(store_snapshot))
@@ -726,6 +729,89 @@ fn is_safe_segment(s: &str) -> bool {
         && s != ".."
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+// --- Observe (read-only operator observability; the vault-console plane) --------------
+// All `observe`-capped, read-only, NOT seal-gated (observing a sealed broker is valid). These
+// surface in-process STATE only — never a secret value.
+
+/// Active leases: id, parent session, expiry/ceiling, renewable, and (for cred leases) the role.
+async fn observe_leases(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> ApiResult<crate::dto::ObserveLeasesResponse> {
+    require_cap(&principal, Capability::Observe)?;
+    let now = now_unix();
+    let roles = state.cred_roles();
+    let active = {
+        let eng = state.leases.lock().expect("lease lock");
+        eng.active_leases(now)
+    };
+    let leases = active
+        .into_iter()
+        .map(|l| crate::dto::ObserveLease {
+            role: roles.get(&l.id).cloned(),
+            lease_id: l.id,
+            parent_session: l.parent_session,
+            expires_at: l.expires_at,
+            max_deadline: l.max_deadline,
+            renewable: l.renewable,
+        })
+        .collect();
+    Ok(Json(crate::dto::ObserveLeasesResponse { now, leases }))
+}
+
+/// Active operator sessions: id, bound principal SAN (if known), expiry/idle, child-lease count.
+async fn observe_sessions(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> ApiResult<crate::dto::ObserveSessionsResponse> {
+    require_cap(&principal, Capability::Observe)?;
+    let now = now_unix();
+    let san_by_sid: std::collections::HashMap<String, String> = state
+        .list_sessions()
+        .into_iter()
+        .map(|(san, sid)| (sid, san))
+        .collect();
+    let active = {
+        let eng = state.leases.lock().expect("lease lock");
+        eng.active_sessions(now)
+    };
+    let sessions = active
+        .into_iter()
+        .map(|s| crate::dto::ObserveSession {
+            principal: san_by_sid.get(&s.id).cloned(),
+            session_id: s.id,
+            expires_at: s.expires_at,
+            idle_deadline: s.idle_deadline,
+            child_count: s.child_count,
+        })
+        .collect();
+    Ok(Json(crate::dto::ObserveSessionsResponse { now, sessions }))
+}
+
+/// Registered principals: SAN → {role, caps} (the loaded `VAULT_ROLES_CONFIG`). Non-secret.
+async fn observe_roles(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> ApiResult<crate::dto::ObserveRolesResponse> {
+    require_cap(&principal, Capability::Observe)?;
+    let mut roles: Vec<crate::dto::ObserveRole> = state
+        .cfg
+        .roles
+        .iter()
+        .map(|(san, rp)| {
+            let mut caps: Vec<String> = rp.caps.iter().map(|c| c.as_str().to_owned()).collect();
+            caps.sort();
+            crate::dto::ObserveRole {
+                san: san.clone(),
+                role: rp.role.clone(),
+                caps,
+            }
+        })
+        .collect();
+    roles.sort_by(|a, b| a.san.cmp(&b.san));
+    Ok(Json(crate::dto::ObserveRolesResponse { roles }))
 }
 
 /// Backup-target key id: a short, filesystem/DB-safe token (the aether `target_id`).
@@ -1488,5 +1574,51 @@ mod tests {
             !dump.contains("11111111-1111-4111-8111-111111111111"),
             "the concrete tenant id must NOT appear in metrics; got:\n{dump}"
         );
+    }
+
+    // ---- observe (read-only operator observability) ----
+
+    async fn json_body(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
+    /// `observe/leases` is `observe`-capped (dev principal has it), read-only, NOT seal-gated:
+    /// a fresh broker returns 200 with `now` + an empty lease list.
+    #[tokio::test]
+    async fn observe_leases_ok_and_empty_on_fresh_state() {
+        let resp = eu_dev_router()
+            .oneshot(get("/v1/sys/observe/leases"))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert!(v.get("now").and_then(serde_json::Value::as_u64).is_some());
+        assert_eq!(v["leases"].as_array().expect("leases array").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn observe_sessions_ok_and_empty_on_fresh_state() {
+        let resp = eu_dev_router()
+            .oneshot(get("/v1/sys/observe/sessions"))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert_eq!(v["sessions"].as_array().expect("sessions array").len(), 0);
+    }
+
+    /// `observe/roles` returns the loaded role map (empty in dev_state) — never secret material.
+    #[tokio::test]
+    async fn observe_roles_ok() {
+        let resp = eu_dev_router()
+            .oneshot(get("/v1/sys/observe/roles"))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert!(v["roles"].is_array());
     }
 }

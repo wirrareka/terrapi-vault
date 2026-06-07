@@ -111,6 +111,56 @@ pub struct PresignResponse {
     pub expires: u64,
 }
 
+// --- Observe (read-only operator observability; vault-console plane) ------------
+// State only — these shapes NEVER carry a secret value (no keys, passwords, certs, DEKs).
+
+#[derive(Serialize)]
+pub struct ObserveLease {
+    pub lease_id: String,
+    pub parent_session: String,
+    pub expires_at: u64,
+    pub max_deadline: u64,
+    pub renewable: bool,
+    /// Role the lease's backend cred owns, if it is a cred lease (absent for SSH leases).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ObserveLeasesResponse {
+    pub now: u64,
+    pub leases: Vec<ObserveLease>,
+}
+
+#[derive(Serialize)]
+pub struct ObserveSession {
+    pub session_id: String,
+    /// Principal SAN bound to this session, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    pub expires_at: u64,
+    pub idle_deadline: u64,
+    pub child_count: usize,
+}
+
+#[derive(Serialize)]
+pub struct ObserveSessionsResponse {
+    pub now: u64,
+    pub sessions: Vec<ObserveSession>,
+}
+
+#[derive(Serialize)]
+pub struct ObserveRole {
+    pub san: String,
+    pub role: String,
+    pub caps: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct ObserveRolesResponse {
+    pub roles: Vec<ObserveRole>,
+}
+
 // --- Sessions + leases ----------------------------------------------------------
 
 #[derive(Debug, Deserialize)]

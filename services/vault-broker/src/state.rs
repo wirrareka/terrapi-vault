@@ -263,6 +263,30 @@ impl AppState {
             .cloned()
     }
 
+    /// Snapshot of the principal→session bindings (SAN, session_id), for the read-only observe
+    /// API. The console joins this onto the lease engine's session list to label sessions by SAN.
+    #[must_use]
+    pub fn list_sessions(&self) -> Vec<(String, String)> {
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .iter()
+            .map(|(san, sid)| (san.clone(), sid.clone()))
+            .collect()
+    }
+
+    /// Snapshot of the role each active cred lease owns (lease_id → role), for the observe API's
+    /// lease view. Username is deliberately excluded (it is the backend secret's handle).
+    #[must_use]
+    pub fn cred_roles(&self) -> std::collections::HashMap<String, String> {
+        self.cred_handles
+            .lock()
+            .expect("cred handles lock")
+            .iter()
+            .map(|(lease_id, h)| (lease_id.clone(), h.role.clone()))
+            .collect()
+    }
+
     /// Drop any principal bindings pointing at `session_id` (called on session end).
     pub fn unbind_session(&self, session_id: &str) {
         self.sessions

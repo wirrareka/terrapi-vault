@@ -51,11 +51,32 @@ pub enum Capability {
     ObjectStore,
     /// `POST /v1/{group}/object-store/presign-get` (short-TTL presigned GET URL for tile serving)
     ObjectStoreRead,
+    /// `GET /v1/sys/observe/*` + `/v1/{group}/observe/*` (read-only operator observability — the
+    /// vault-console plane; state only, never secret values)
+    Observe,
     /// `POST /v1/sys/store-snapshot` (consistent snapshot of vault's own at-rest store)
     Snapshot,
 }
 
 impl Capability {
+    /// The kebab-case wire name (matches the `Deserialize` rename + `VAULT_ROLES_CONFIG`). Used
+    /// by the observe API to surface a role's caps as strings without leaking the enum.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Capability::SshCa => "ssh-ca",
+            Capability::SshSign => "ssh-sign",
+            Capability::Creds => "creds",
+            Capability::Session => "session",
+            Capability::Leases => "leases",
+            Capability::Kms => "kms",
+            Capability::ObjectStore => "object-store",
+            Capability::ObjectStoreRead => "object-store-read",
+            Capability::Observe => "observe",
+            Capability::Snapshot => "snapshot",
+        }
+    }
+
     /// Every capability — granted to the `dev` principal only.
     #[must_use]
     pub fn all() -> HashSet<Capability> {
@@ -68,6 +89,7 @@ impl Capability {
             Capability::Kms,
             Capability::ObjectStore,
             Capability::ObjectStoreRead,
+            Capability::Observe,
             Capability::Snapshot,
         ]
         .into_iter()
@@ -200,7 +222,7 @@ mod tests {
     #[test]
     fn dev_principal_holds_all_caps() {
         let all = Capability::all();
-        assert_eq!(all.len(), 9);
+        assert_eq!(all.len(), 10);
         for c in [
             Capability::SshCa,
             Capability::SshSign,
@@ -210,6 +232,7 @@ mod tests {
             Capability::Kms,
             Capability::ObjectStore,
             Capability::ObjectStoreRead,
+            Capability::Observe,
             Capability::Snapshot,
         ] {
             assert!(all.contains(&c));

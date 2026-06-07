@@ -44,6 +44,16 @@ pub struct Lease {
     pub revoked: bool,
 }
 
+/// A read-only snapshot of a live session for the observe API — no internals (child-lease
+/// list, idle-timeout config).
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub id: SessionId,
+    pub expires_at: u64,
+    pub idle_deadline: u64,
+    pub child_count: usize,
+}
+
 /// What a `sweep` expired, so the broker can unbind sessions + tear down backend users.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Swept {
@@ -271,6 +281,32 @@ impl<F: FnMut() -> String> LeaseEngine<F> {
     #[must_use]
     pub fn lease(&self, id: &LeaseId) -> Option<&Lease> {
         self.leases.get(id)
+    }
+
+    /// Snapshot of leases live at `now` (not revoked, not expired) — for the read-only observe
+    /// API. Clones; ordering is unspecified (callers sort for display).
+    #[must_use]
+    pub fn active_leases(&self, now: u64) -> Vec<Lease> {
+        self.leases
+            .values()
+            .filter(|l| !l.revoked && now < l.expires_at)
+            .cloned()
+            .collect()
+    }
+
+    /// Snapshot of sessions live at `now` — for the read-only observe API.
+    #[must_use]
+    pub fn active_sessions(&self, now: u64) -> Vec<SessionInfo> {
+        self.sessions
+            .values()
+            .filter(|s| Self::session_live(s, now))
+            .map(|s| SessionInfo {
+                id: s.id.clone(),
+                expires_at: s.expires_at,
+                idle_deadline: s.idle_deadline,
+                child_count: s.children.len(),
+            })
+            .collect()
     }
 }
 

@@ -9,7 +9,7 @@
 openapi: 3.1.0
 info:
   title: terrapi-vault broker
-  version: "1.2.0"
+  version: "1.3.0"
   summary: Network secrets broker for the proximi.io platform (one instance per residency group).
   description: |
     Network secrets broker for the proximi.io platform. **One instance per residency
@@ -41,6 +41,7 @@ info:
     | `kms`      | `POST /v1/{group}/{tenant_id}/kms/{key_id}/{wrap,unwrap,rotate,rewrap}` |
     | `object-store` | `POST /v1/{group}/object-store/presign` (presigned PUT) |
     | `object-store-read` | `POST /v1/{group}/object-store/presign-get` (presigned GET) |
+    | `observe` | `GET /v1/sys/observe/{leases,sessions,roles}` (read-only operator view; vault-console) |
     | `session`  | `POST /v1/sys/session`, `DELETE /v1/sys/session/{id}` |
     | `leases`   | `POST /v1/sys/leases/{renew,revoke}` |
     | `snapshot` | `POST /v1/sys/store-snapshot` |
@@ -85,6 +86,7 @@ tags:
   - { name: creds, description: Leased, ephemeral service-admin credentials (tenant-scoped). }
   - { name: kms, description: Per-target KEK wrap/unwrap (envelope encryption; KEK never leaves the broker). }
   - { name: object-store, description: Short-TTL presigned PUT URLs for tile publishing (stateless; the Spaces key never leaves the broker). }
+  - { name: observe, description: Read-only operator observability (the vault-console plane). State only — never secret values. }
 
 security:
   - mtlsWireGuard: []
@@ -294,6 +296,50 @@ components:
         method: { type: string, enum: [PUT], description: the only method the URL is signed for }
         key: { type: string, description: the object key the URL is scoped to (non-secret; echoes the target) }
         expires: { type: integer, description: absolute expiry, unix seconds }
+
+    ObserveLease:
+      type: object
+      required: [lease_id, parent_session, expires_at, max_deadline, renewable]
+      properties:
+        lease_id: { type: string }
+        parent_session: { type: string, description: the session this lease is a child of }
+        expires_at: { type: integer, description: absolute expiry, unix seconds }
+        max_deadline: { type: integer, description: hard ceiling (issue + max_ttl), unix seconds }
+        renewable: { type: boolean }
+        role: { type: string, description: "role the lease's backend cred owns (cred leases only; absent for SSH). NEVER the username/secret." }
+    ObserveLeasesResponse:
+      type: object
+      required: [now, leases]
+      properties:
+        now: { type: integer, description: broker clock at snapshot, unix seconds }
+        leases: { type: array, items: { $ref: "#/components/schemas/ObserveLease" } }
+    ObserveSession:
+      type: object
+      required: [session_id, expires_at, idle_deadline, child_count]
+      properties:
+        session_id: { type: string }
+        principal: { type: string, description: bound principal cert SAN, if known }
+        expires_at: { type: integer, description: absolute hard expiry, unix seconds }
+        idle_deadline: { type: integer, description: absolute idle deadline, unix seconds }
+        child_count: { type: integer, description: number of child leases }
+    ObserveSessionsResponse:
+      type: object
+      required: [now, sessions]
+      properties:
+        now: { type: integer, description: broker clock at snapshot, unix seconds }
+        sessions: { type: array, items: { $ref: "#/components/schemas/ObserveSession" } }
+    ObserveRole:
+      type: object
+      required: [san, role, caps]
+      properties:
+        san: { type: string, description: client-cert SAN (dNSName) }
+        role: { type: string }
+        caps: { type: array, items: { type: string }, description: granted capability names (kebab-case) }
+    ObserveRolesResponse:
+      type: object
+      required: [roles]
+      properties:
+        roles: { type: array, items: { $ref: "#/components/schemas/ObserveRole" } }
 
     KmsWrapRequest:
       type: object
@@ -687,6 +733,45 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/GroupMismatch" }
         "503": { description: object-store presign not configured on this instance (no Spaces key), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /v1/sys/observe/leases:
+    get:
+      tags: [observe]
+      operationId: observeLeases
+      summary: Active leases (read-only operator view).
+      description: |
+        Read-only; cap `observe`. Lists leases live now (not revoked/expired): id, parent
+        session, expiry, hard ceiling, renewable, and — for cred leases — the role. **No secret
+        values** (no username/password/cert). Not seal-gated (observing a sealed broker is valid).
+      x-implementation-status: implemented
+      responses:
+        "200": { description: active leases, content: { application/json: { schema: { $ref: "#/components/schemas/ObserveLeasesResponse" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/sys/observe/sessions:
+    get:
+      tags: [observe]
+      operationId: observeSessions
+      summary: Active operator sessions (read-only).
+      description: "Read-only; cap `observe`. Live sessions: id, bound principal SAN (if known), expiry, idle deadline, child-lease count."
+      x-implementation-status: implemented
+      responses:
+        "200": { description: active sessions, content: { application/json: { schema: { $ref: "#/components/schemas/ObserveSessionsResponse" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/sys/observe/roles:
+    get:
+      tags: [observe]
+      operationId: observeRoles
+      summary: Registered principals → {role, caps} (read-only).
+      description: "Read-only; cap `observe`. The loaded `VAULT_ROLES_CONFIG`: cert SAN → role + capability list. Non-secret config."
+      x-implementation-status: implemented
+      responses:
+        "200": { description: registered roles, content: { application/json: { schema: { $ref: "#/components/schemas/ObserveRolesResponse" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
 
   /v1/sys/session:
     post:
