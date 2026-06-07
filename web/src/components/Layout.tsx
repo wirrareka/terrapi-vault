@@ -17,6 +17,7 @@ import {
 import { cn } from "@/lib/utils";
 import { useBrokers } from "@/hooks/use-observe";
 import { logoutUrl, useMe } from "@/hooks/use-auth";
+import { useFilters } from "@/stores/filters";
 import { Badge } from "@/components/ui";
 
 interface NavItem {
@@ -41,6 +42,8 @@ export function AppLayout() {
   const { data: brokers } = useBrokers();
   const { data: me } = useMe();
   const fetching = useIsFetching() > 0;
+  const broker = useFilters((s) => s.broker);
+  const setBroker = useFilters((s) => s.setBroker);
   const group = brokers?.[0]?.group;
   const reachable = brokers?.filter((b) => b.reachable).length ?? 0;
   const total = brokers?.length ?? 0;
@@ -86,6 +89,22 @@ export function AppLayout() {
             </NavLink>
           ))}
         </nav>
+        <div className="border-t px-3 py-2">
+          <label className="px-1 text-[11px] uppercase tracking-wide text-muted-foreground">Broker</label>
+          <select
+            value={broker}
+            onChange={(e) => setBroker(e.target.value)}
+            className="mt-1 flex h-8 w-full rounded-md border border-input bg-transparent px-2 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          >
+            <option value="all">All brokers</option>
+            {(brokers ?? []).map((b) => (
+              <option key={b.id} value={b.id}>
+                {b.id}
+              </option>
+            ))}
+          </select>
+        </div>
+
         <div className="space-y-2 border-t px-4 py-3 text-xs text-muted-foreground">
           <div className="flex items-center justify-between">
             <span>Brokers</span>

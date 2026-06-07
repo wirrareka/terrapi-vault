@@ -2,6 +2,7 @@ import { PageHeader } from "@/components/Layout";
 import { DataTable, type Column } from "@/components/DataTable";
 import { Badge } from "@/components/ui";
 import { useAudit } from "@/hooks/use-observe";
+import { useFiltered } from "@/stores/filters";
 import type { AuditRecord } from "@/lib/types";
 
 /** Safe string read of an unknown JSON value. */
@@ -18,6 +19,7 @@ export default function Audit() {
   // P1: most-recent tail from seq 0 (the console aggregator caps + merges per broker). Cursor
   // paging (?since=next_seq) is a P1-follow refinement.
   const { data, isLoading, error } = useAudit(0, 200);
+  const rows = useFiltered(data?.records);
 
   const columns: Column<AuditRecord>[] = [
     { header: "Seq", className: "tabular-nums text-muted-foreground", cell: (r) => r.seq },
@@ -43,11 +45,11 @@ export default function Audit() {
 
   return (
     <div className="flex h-full flex-col">
-      <PageHeader title="Audit" count={data?.records.length} />
+      <PageHeader title="Audit" count={rows?.length} />
       <div className="flex-1 overflow-auto">
         <DataTable
           columns={columns}
-          rows={data?.records}
+          rows={rows}
           rowKey={(r) => r.broker + r.seq}
           isLoading={isLoading}
           error={error}

@@ -18,6 +18,7 @@ Requires **Node 24** (`.nvmrc`; `nvm use`). pnpm is the package manager.
 ```bash
 pnpm install
 pnpm dev          # Vite on :5273, proxies /api → http://127.0.0.1:8203 (override VITE_API_PROXY)
+VITE_MOCK=1 pnpm dev   # standalone demo — fixture data from src/lib/mock.ts, no backend needed
 pnpm typecheck
 pnpm build        # → dist/  (embedded into the vault-console binary via rust-embed)
 pnpm gen:api      # regenerate raw broker types from ../spec/broker-openapi.yaml

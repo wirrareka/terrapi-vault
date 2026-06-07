@@ -1,11 +1,13 @@
 import { PageHeader } from "@/components/Layout";
 import { DataTable, type Column } from "@/components/DataTable";
 import { useSessions } from "@/hooks/use-observe";
+import { useFiltered } from "@/stores/filters";
 import { fmtUnix, untilExpiry } from "@/lib/utils";
 import type { Session } from "@/lib/types";
 
 export default function Sessions() {
   const { data, isLoading, error } = useSessions();
+  const rows = useFiltered(data?.sessions);
   const now = data?.now ?? Math.floor(Date.now() / 1000);
 
   const columns: Column<Session>[] = [
@@ -25,11 +27,11 @@ export default function Sessions() {
 
   return (
     <div className="flex h-full flex-col">
-      <PageHeader title="Sessions" count={data?.sessions.length} />
+      <PageHeader title="Sessions" count={rows?.length} />
       <div className="flex-1 overflow-auto">
         <DataTable
           columns={columns}
-          rows={data?.sessions}
+          rows={rows}
           rowKey={(s) => s.broker + s.session_id}
           isLoading={isLoading}
           error={error}

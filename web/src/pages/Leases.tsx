@@ -2,11 +2,13 @@ import { PageHeader } from "@/components/Layout";
 import { DataTable, type Column } from "@/components/DataTable";
 import { Badge } from "@/components/ui";
 import { useLeases } from "@/hooks/use-observe";
+import { useFiltered } from "@/stores/filters";
 import { fmtUnix, untilExpiry } from "@/lib/utils";
 import type { Lease } from "@/lib/types";
 
 export default function Leases() {
   const { data, isLoading, error } = useLeases();
+  const rows = useFiltered(data?.leases);
   const now = data?.now ?? Math.floor(Date.now() / 1000);
 
   const columns: Column<Lease>[] = [
@@ -27,11 +29,11 @@ export default function Leases() {
 
   return (
     <div className="flex h-full flex-col">
-      <PageHeader title="Leases" count={data?.leases.length} />
+      <PageHeader title="Leases" count={rows?.length} />
       <div className="flex-1 overflow-auto">
         <DataTable
           columns={columns}
-          rows={data?.leases}
+          rows={rows}
           rowKey={(l) => l.broker + l.lease_id}
           isLoading={isLoading}
           error={error}
