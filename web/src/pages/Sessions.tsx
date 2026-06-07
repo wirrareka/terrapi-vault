@@ -1,13 +1,20 @@
+import { useMemo, useState } from "react";
 import { PageHeader } from "@/components/Layout";
 import { DataTable, type Column } from "@/components/DataTable";
+import { SearchInput } from "@/components/ui";
 import { useSessions } from "@/hooks/use-observe";
 import { useFiltered } from "@/stores/filters";
-import { fmtUnix, untilExpiry } from "@/lib/utils";
+import { fmtUnix, matches, untilExpiry } from "@/lib/utils";
 import type { Session } from "@/lib/types";
 
 export default function Sessions() {
   const { data, isLoading, error } = useSessions();
   const rows = useFiltered(data?.sessions);
+  const [q, setQ] = useState("");
+  const shown = useMemo(
+    () => (rows ?? []).filter((s) => matches(q, s.session_id, s.principal, s.broker)),
+    [rows, q],
+  );
   const now = data?.now ?? Math.floor(Date.now() / 1000);
 
   const columns: Column<Session>[] = [
@@ -27,11 +34,13 @@ export default function Sessions() {
 
   return (
     <div className="flex h-full flex-col">
-      <PageHeader title="Sessions" count={rows?.length} />
+      <PageHeader title="Sessions" count={shown.length}>
+        <SearchInput value={q} onChange={setQ} placeholder="Filter sessions…" />
+      </PageHeader>
       <div className="flex-1 overflow-auto">
         <DataTable
           columns={columns}
-          rows={rows}
+          rows={shown}
           rowKey={(s) => s.broker + s.session_id}
           isLoading={isLoading}
           error={error}

@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { PageHeader } from "@/components/Layout";
 import { DataTable, type Column } from "@/components/DataTable";
-import { Badge, SearchInput } from "@/components/ui";
+import { Badge, Button, SearchInput } from "@/components/ui";
 import { useAudit } from "@/hooks/use-observe";
 import { useFiltered } from "@/stores/filters";
 import { matches } from "@/lib/utils";
@@ -23,10 +23,12 @@ function targetId(ev: Record<string, unknown>): string {
 }
 
 export default function Audit() {
-  // P1: most-recent tail from seq 0 (the console aggregator caps + merges per broker). Cursor
-  // paging (?since=next_seq) is a P1-follow refinement.
-  const { data, isLoading, error } = useAudit(0, 200);
+  // The console aggregator caps + merges per broker. "Load more" grows the limit (the backend
+  // returns the most-recent `limit` per its merge); when it returns a full page there may be more.
+  const [limit, setLimit] = useState(200);
+  const { data, isLoading, error } = useAudit(0, limit);
   const rows = useFiltered(data?.records);
+  const hasMore = (data?.records.length ?? 0) >= limit;
   const [q, setQ] = useState("");
   const shown = useMemo(
     () =>
@@ -68,6 +70,13 @@ export default function Audit() {
           error={error}
           emptyText="No audit records"
         />
+        {hasMore && (
+          <div className="flex justify-center p-4">
+            <Button variant="outline" onClick={() => setLimit((l) => l + 200)}>
+              Load more
+            </Button>
+          </div>
+        )}
       </div>
     </div>
   );

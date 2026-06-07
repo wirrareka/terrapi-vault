@@ -44,6 +44,29 @@ export function Badge({
   );
 }
 
+type ButtonVariant = "default" | "outline" | "ghost";
+const buttonVariants: Record<ButtonVariant, string> = {
+  default: "bg-primary text-primary-foreground shadow-sm hover:bg-primary/90",
+  outline: "border border-input bg-transparent shadow-sm hover:bg-accent hover:text-accent-foreground",
+  ghost: "hover:bg-accent hover:text-accent-foreground",
+};
+export function Button({
+  variant = "default",
+  className,
+  ...props
+}: React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: ButtonVariant }) {
+  return (
+    <button
+      className={cn(
+        "inline-flex h-9 items-center justify-center rounded-md px-3 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
+        buttonVariants[variant],
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
 export function Spinner({ className }: { className?: string }) {
   return (
     <div
