@@ -189,3 +189,148 @@ jobs:
             vault-broker-*-x86_64-unknown-linux-gnu.tar.gz
             vault-broker-*-x86_64-unknown-linux-gnu.tar.gz.sha256
           fail_on_unmatched_files: true
+
+  # --- vault-console (single binary with the SPA embedded) ---------------------------------
+  # The SPA is built first (Node 24, infra-confirmed in the runner tool-cache) → `web/dist`,
+  # then embedded via `cargo build --features embed-ui`. The FreeBSD VM has no node, so its
+  # `web/dist` is built here on the Linux side and carried into the rsync.
+
+  console-linux:
+    name: Build Linux console binary
+    runs-on: [self-hosted, medina]
+    needs: create-release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build the SPA (web/dist)
+        run: |
+          corepack enable
+          pnpm --dir web install
+          pnpm --dir web build
+          test -f web/dist/index.html || { echo "::error::web/dist not built"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services
+          shared-key: release-linux-console
+      - name: Build (SPA embedded)
+        run: cargo build --release -p vault-console --features embed-ui
+        working-directory: services
+      - name: Package
+        run: |
+          VERSION="${{ inputs.tag || github.ref_name }}"
+          TARGET="x86_64-unknown-linux-gnu"
+          STAGING="vault-console-${VERSION}-${TARGET}"
+          mkdir -p "$STAGING"
+          cp services/target/release/vault-console "$STAGING/"
+          cp LICENSE-APACHE LICENSE-MIT "$STAGING/" || true
+          cp -R deploy/console "$STAGING/deploy-console"
+          tar -czf "${STAGING}.tar.gz" "$STAGING"
+          sha256sum "${STAGING}.tar.gz" > "${STAGING}.tar.gz.sha256"
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            vault-console-*-x86_64-unknown-linux-gnu.tar.gz
+            vault-console-*-x86_64-unknown-linux-gnu.tar.gz.sha256
+          fail_on_unmatched_files: true
+
+  console-freebsd:
+    name: Build FreeBSD console binary
+    runs-on: [self-hosted, medina]
+    needs: create-release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 180
+    concurrency:
+      group: freebsd-release-vm
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build the SPA (web/dist) on the Linux side (the fbsd VM has no node)
+        run: |
+          corepack enable
+          pnpm --dir web install
+          pnpm --dir web build
+          test -f web/dist/index.html || { echo "::error::web/dist not built"; exit 1; }
+      - name: Sync source (incl. web/dist) into the FreeBSD VM
+        run: |
+          set -euo pipefail
+          ssh runner-fbsd 'mkdir -p build/terrapi-vault'
+          rsync -az --delete \
+            --exclude '/target' \
+            --exclude '/services/target' \
+            --exclude '/.git' \
+            --exclude '/web/node_modules' \
+            -e ssh \
+            ./ runner-fbsd:build/terrapi-vault/
+      - name: Build + package on the FreeBSD VM
+        env:
+          VERSION: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          ssh runner-fbsd "VERSION='${VERSION}'; "'
+            set -eu
+            : "${VERSION:?VERSION not set on VM session}"
+            export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:"$HOME/.cargo/bin"
+            cd "$HOME/build/terrapi-vault"
+            # rust-embed needs a pre-built web/dist (the VM has no node — it was built + rsynced).
+            test -f web/dist/index.html || { echo "::error::web/dist missing on VM"; exit 1; }
+            cd services
+            cargo build --release -p vault-console --features embed-ui
+            cd "$HOME/build/terrapi-vault"
+            TARGET="x86_64-unknown-freebsd"
+            STAGING="vault-console-${VERSION}-${TARGET}"
+            rm -rf "$STAGING" "${STAGING}.tar.gz" "${STAGING}.tar.gz.sha256"
+            mkdir -p "$STAGING"
+            cp -v services/target/release/vault-console "$STAGING/vault-console"
+            [ -s "$STAGING/vault-console" ] || { echo "::error::staged binary missing/empty"; exit 1; }
+            cp LICENSE-APACHE LICENSE-MIT "$STAGING/" || true
+            cp -R deploy/console "$STAGING/deploy-console"
+            tar -czf "${STAGING}.tar.gz" "$STAGING"
+            sha256sum "${STAGING}.tar.gz" > "${STAGING}.tar.gz.sha256"
+            sz=$(gzip -dc "${STAGING}.tar.gz" | wc -c)
+            echo "unpacked tar size: ${sz} bytes"
+            [ "$sz" -gt 3000000 ] || { echo "::error::FreeBSD console tarball too small (${sz}B)"; exit 1; }
+          '
+      - name: Pull tarball back from the VM
+        env:
+          VERSION: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          STAGING="vault-console-${VERSION}-x86_64-unknown-freebsd"
+          rsync -az -e ssh \
+            "runner-fbsd:build/terrapi-vault/${STAGING}.tar.gz" \
+            "runner-fbsd:build/terrapi-vault/${STAGING}.tar.gz.sha256" \
+            ./
+      - name: Verify packaged tarball on host
+        run: |
+          ls -l vault-console-*-x86_64-unknown-freebsd.tar.gz
+          sz=$(stat -c%s vault-console-*-x86_64-unknown-freebsd.tar.gz)
+          echo "host tarball size: ${sz} bytes"
+          [ "$sz" -gt 2000000 ] || { echo "::error::synced FreeBSD console tarball too small (${sz}B)"; exit 1; }
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            vault-console-*-x86_64-unknown-freebsd.tar.gz
+            vault-console-*-x86_64-unknown-freebsd.tar.gz.sha256
+          fail_on_unmatched_files: true
