@@ -35,9 +35,12 @@ rust-embed = { version = "8", features = ["mime-guess"], optional = true }
 embed-ui = ["dep:rust-embed"]
 
 [dev-dependencies]
-# Tests only: generate a throwaway RSA keypair at runtime (RS256 sign/verify round-trips) — so no
-# private key is ever committed to this secrets-boundary repo. rcgen can't generate RSA keys.
+# Tests only: generate throwaway keypairs at runtime (RS256 for the client-assertion path, ES256
+# for the id_token path — identity signs id_tokens ES256) — so no private key is committed to this
+# secrets-boundary repo. rcgen generates the EC (P-256) key; rsa generates the RSA key.
 rsa = { version = "0.9", features = ["pem"] }
+rcgen.workspace = true
+base64.workspace = true
 rand.workspace = true
 
 [lints]

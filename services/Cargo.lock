@@ -2298,7 +2298,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "vault-broker"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "async-trait",
  "axum",
@@ -2330,12 +2330,13 @@ dependencies = [
 
 [[package]]
 name = "vault-console"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "axum",
  "base64",
  "jsonwebtoken",
  "rand 0.8.6",
+ "rcgen",
  "reqwest",
  "rsa",
  "rust-embed",
@@ -2348,7 +2349,7 @@ dependencies = [
 
 [[package]]
 name = "vault-sync"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "axum",
  "base64",
@@ -2369,7 +2370,7 @@ dependencies = [
 
 [[package]]
 name = "vault-transport"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "serde",
  "serde_json",

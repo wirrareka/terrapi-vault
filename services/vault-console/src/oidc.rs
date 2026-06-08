@@ -38,6 +38,40 @@ const ASSERTION_TTL_SECS: u64 = 300;
 /// Minimum spacing between JWKS (re)fetches on a `kid` miss — mirrors `vault-broker::jwt`, so a
 /// flood of unknown-`kid` id_tokens can't amplify 1:1 into outbound fetches against identity.
 const MIN_JWKS_REFETCH: Duration = Duration::from_secs(30);
+/// id_token signature algs we will verify — **asymmetric only**. This is the allow-list that keeps
+/// us safe from alg-confusion (`none`, or an HMAC alg verified against the public key): a header
+/// alg outside this set is rejected before any key lookup. Intersected with the OP's advertised
+/// `id_token_signing_alg_values_supported` when discovery provides one.
+const SUPPORTED_ID_TOKEN_ALGS: [Algorithm; 2] = [Algorithm::ES256, Algorithm::RS256];
+
+/// JOSE `alg` name for the algs we support (to compare against the OP's advertised string list).
+fn alg_name(alg: Algorithm) -> &'static str {
+    match alg {
+        Algorithm::ES256 => "ES256",
+        Algorithm::RS256 => "RS256",
+        _ => "",
+    }
+}
+
+/// Validate an id_token header `alg` against our supported set ∩ the OP's advertised set. The alg
+/// must be asymmetric & supported (rejects `none`/HMAC alg-confusion) and, when `advertised` is
+/// non-empty, listed there. Pure — unit-tested. Returns the alg to verify with.
+fn accept_id_token_alg(
+    advertised: &[String],
+    header_alg: Algorithm,
+) -> Result<Algorithm, OidcError> {
+    if !SUPPORTED_ID_TOKEN_ALGS.contains(&header_alg) {
+        return Err(OidcError::IdToken(format!(
+            "unsupported id_token alg {header_alg:?} (we verify {SUPPORTED_ID_TOKEN_ALGS:?})"
+        )));
+    }
+    if !advertised.is_empty() && !advertised.iter().any(|a| a == alg_name(header_alg)) {
+        return Err(OidcError::IdToken(format!(
+            "id_token alg {header_alg:?} not advertised by the issuer ({advertised:?})"
+        )));
+    }
+    Ok(header_alg)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum OidcError {
@@ -65,6 +99,11 @@ pub struct OidcEndpoints {
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     pub jwks_uri: String,
+    /// The id_token signing algs the OP advertises. We honor this rather than pinning one alg —
+    /// identity signs id_tokens with **ES256** (EC P-256), while our *client assertion* is RS256
+    /// (our RSA cert). Empty if the OP omits it (then we fall back to [`SUPPORTED_ID_TOKEN_ALGS`]).
+    #[serde(default)]
+    pub id_token_signing_alg_values_supported: Vec<String>,
 }
 
 /// A started login: the URL to redirect the browser to, plus the per-attempt secrets we stash
@@ -227,18 +266,28 @@ impl OidcClient {
         }
         let tr: TokenResponse =
             serde_json::from_str(&body).map_err(|e| OidcError::Token(e.to_string()))?;
-        let key = self.key_for_id_token(&tr.id_token).await?;
-        let claims = decode_id_token(&tr.id_token, &key, &self.cfg.issuer, &self.cfg.client_id)?;
+        let (key, alg) = self.key_for_id_token(&tr.id_token).await?;
+        let claims = decode_id_token(
+            &tr.id_token,
+            &key,
+            alg,
+            &self.cfg.issuer,
+            &self.cfg.client_id,
+        )?;
         check_id_claims(&claims, expected_nonce, &self.cfg.acr)
     }
 
     /// Resolve the id_token's signing key from identity's JWKS (cache + refetch-on-miss, throttled
-    /// like `vault-broker::jwt`). The header alg MUST be RS256 (no alg-confusion/`none`).
-    async fn key_for_id_token(&self, token: &str) -> Result<DecodingKey, OidcError> {
+    /// like `vault-broker::jwt`) and the alg to verify it with. The header alg must be in
+    /// [`SUPPORTED_ID_TOKEN_ALGS`] (asymmetric only — rejects `none`/HMAC alg-confusion) and, when
+    /// the OP advertises `id_token_signing_alg_values_supported`, must be one of those — NOT a
+    /// single pinned alg (identity signs ES256; our RSA cert is only for the client assertion).
+    async fn key_for_id_token(&self, token: &str) -> Result<(DecodingKey, Algorithm), OidcError> {
         let header = decode_header(token).map_err(|e| OidcError::IdToken(e.to_string()))?;
-        if header.alg != Algorithm::RS256 {
-            return Err(OidcError::IdToken("alg must be RS256".into()));
-        }
+        let alg = accept_id_token_alg(
+            &self.endpoints.id_token_signing_alg_values_supported,
+            header.alg,
+        )?;
         let kid = header
             .kid
             .ok_or_else(|| OidcError::IdToken("missing kid".into()))?;
@@ -246,7 +295,9 @@ impl OidcClient {
             let cache = self.jwks.lock().expect("jwks lock");
             if let Some(set) = cache.set.as_ref() {
                 if let Some(jwk) = set.find(&kid) {
-                    return DecodingKey::from_jwk(jwk).map_err(|e| OidcError::Jwks(e.to_string()));
+                    let key =
+                        DecodingKey::from_jwk(jwk).map_err(|e| OidcError::Jwks(e.to_string()))?;
+                    return Ok((key, alg));
                 }
             }
             if let Some(last) = cache.last_fetch {
@@ -264,7 +315,7 @@ impl OidcClient {
             None => Err(OidcError::UnknownKid),
         };
         cache.set = Some(set);
-        key
+        Ok((key?, alg))
     }
 
     async fn fetch_jwks(&self) -> Result<JwkSet, OidcError> {
@@ -360,15 +411,17 @@ fn build_client_assertion(
     encode(&header, &claims, key).map_err(|e| OidcError::IdToken(e.to_string()))
 }
 
-/// Verify an id_token's signature + `iss`/`aud`/`exp` (jsonwebtoken). Pure (no network) given the
-/// decoding `key`, so the policy is unit-testable. `nonce`/`acr` are checked by [`check_id_claims`].
+/// Verify an id_token's signature (with `alg` — ES256 for identity, RS256 supported too) + `iss`/
+/// `aud`/`exp` (jsonwebtoken). Pure (no network) given the decoding `key` + `alg`, so the policy is
+/// unit-testable. `nonce`/`acr` are checked by [`check_id_claims`].
 fn decode_id_token(
     token: &str,
     key: &DecodingKey,
+    alg: Algorithm,
     issuer: &str,
     client_id: &str,
 ) -> Result<IdClaims, OidcError> {
-    let mut v = Validation::new(Algorithm::RS256);
+    let mut v = Validation::new(alg);
     v.set_issuer(&[issuer]);
     v.set_audience(&[client_id]);
     v.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
@@ -468,6 +521,34 @@ mod tests {
         .unwrap()
     }
 
+    /// A throwaway EC P-256 keypair (PKCS#8 priv PEM + SPKI pub PEM) — identity's id_token alg.
+    fn ec_keys() -> &'static (Vec<u8>, Vec<u8>) {
+        static KEYS: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
+        KEYS.get_or_init(|| {
+            use base64::Engine as _;
+            let kp = rcgen::KeyPair::generate().expect("ec keygen"); // defaults to ECDSA P-256
+            let priv_pem = kp.serialize_pem().into_bytes();
+            let der = kp.public_key_der();
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&der);
+            let pub_pem = format!("-----BEGIN PUBLIC KEY-----\n{b64}\n-----END PUBLIC KEY-----\n")
+                .into_bytes();
+            (priv_pem, pub_pem)
+        })
+    }
+
+    /// Sign an id_token with **ES256** (identity's real alg) — the exact path that the RS256
+    /// hardcode broke at the live round-trip.
+    fn sign_id_token_es256(claims: &serde_json::Value) -> String {
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some("eu-01KSNB0RQ".into());
+        encode(
+            &header,
+            claims,
+            &EncodingKey::from_ec_pem(&ec_keys().0).unwrap(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn pkce_challenge_is_s256_of_verifier() {
         // Known RFC 7636 Appendix B vector.
@@ -547,6 +628,7 @@ mod tests {
         let claims = decode_id_token(
             &token,
             &key,
+            Algorithm::RS256,
             "https://identity.eu.proximi.fi/",
             "vault-console",
         )
@@ -570,6 +652,7 @@ mod tests {
         let claims = decode_id_token(
             &token,
             &key,
+            Algorithm::RS256,
             "https://identity.eu.proximi.fi/",
             "vault-console",
         )
@@ -593,6 +676,7 @@ mod tests {
         let claims = decode_id_token(
             &token,
             &key,
+            Algorithm::RS256,
             "https://identity.eu.proximi.fi/",
             "vault-console",
         )
@@ -617,6 +701,7 @@ mod tests {
         let claims = decode_id_token(
             &token,
             &key,
+            Algorithm::RS256,
             "https://identity.eu.proximi.fi/",
             "vault-console",
         )
@@ -643,10 +728,79 @@ mod tests {
             decode_id_token(
                 &token,
                 &key,
+                Algorithm::RS256,
                 "https://identity.eu.proximi.fi/",
                 "vault-console"
             ),
             Err(OidcError::IdToken(_))
         ));
+    }
+
+    /// Regression for the live-login bug: identity signs id_tokens with **ES256**, so the verifier
+    /// must accept + verify ES256 (the RS256 hardcode rejected every real login at this step).
+    #[test]
+    fn id_token_es256_verifies_end_to_end() {
+        let token = sign_id_token_es256(&serde_json::json!({
+            "iss": "https://identity.eu.proximi.fi/",
+            "aud": "vault-console",
+            "sub": "op-es",
+            "email": "op@proximi.io",
+            "nonce": "NONCE1",
+            "acr": "mfa",
+            "exp": now_unix() + 3600,
+        }));
+        let alg = accept_id_token_alg(&["ES256".to_string()], decode_header(&token).unwrap().alg)
+            .unwrap();
+        assert_eq!(alg, Algorithm::ES256);
+        let key = DecodingKey::from_ec_pem(&ec_keys().1).unwrap();
+        let claims = decode_id_token(
+            &token,
+            &key,
+            Algorithm::ES256,
+            "https://identity.eu.proximi.fi/",
+            "vault-console",
+        )
+        .unwrap();
+        let op = check_id_claims(&claims, "NONCE1", "mfa").unwrap();
+        assert_eq!(op.subject, "op-es");
+    }
+
+    #[test]
+    fn accept_alg_honors_advertised_set() {
+        // identity advertises only ES256 → ES256 ok, RS256 (our client-assertion alg) NOT for the
+        // id_token, since it isn't advertised.
+        let adv = vec!["ES256".to_string()];
+        assert_eq!(
+            accept_id_token_alg(&adv, Algorithm::ES256).unwrap(),
+            Algorithm::ES256
+        );
+        assert!(matches!(
+            accept_id_token_alg(&adv, Algorithm::RS256),
+            Err(OidcError::IdToken(_))
+        ));
+    }
+
+    #[test]
+    fn accept_alg_rejects_confusion_algs() {
+        // none/HMAC are never in SUPPORTED_ID_TOKEN_ALGS → rejected even if (absurdly) advertised.
+        for bad in [Algorithm::HS256, Algorithm::HS384] {
+            assert!(matches!(
+                accept_id_token_alg(&[], bad),
+                Err(OidcError::IdToken(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn accept_alg_empty_advertised_falls_back_to_supported() {
+        // No advertised list (OP omitted it) → accept any supported alg.
+        assert_eq!(
+            accept_id_token_alg(&[], Algorithm::ES256).unwrap(),
+            Algorithm::ES256
+        );
+        assert_eq!(
+            accept_id_token_alg(&[], Algorithm::RS256).unwrap(),
+            Algorithm::RS256
+        );
     }
 }

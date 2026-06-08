@@ -3,6 +3,22 @@
 terrapi-vault — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
+## 0.1.10 (2026-06-08)
+
+vault-console **id_token verification alg fix** — found at the live `acr=mfa` round-trip (the whole
+chain — `private_key_jwt` client auth, MFA, the authorization-code callback — passed, then failed on
+id_token verification). The id_token verifier **hardcoded RS256**, but identity signs id_tokens with
+**ES256** (EC P-256); the RSA cert is only the *client-assertion* signing key. The two algs were
+conflated.
+
+- The id_token verifier now **honors the OP's `id_token_signing_alg_values_supported`** from
+  discovery instead of pinning one alg, against an asymmetric-only allow-list (`ES256`, `RS256`) so
+  alg-confusion (`none` / an HMAC alg verified with the public key) is still rejected before any key
+  lookup. The client-assertion alg (RS256, our cert) is unchanged.
+- Tests: an **ES256 end-to-end** id_token verification (identity's real alg, the exact regression) +
+  alg-acceptance unit tests (advertised-set honored, confusion algs rejected, empty-advertised
+  fallback). 23 green, clippy pedantic clean. No env/contract change — binary-swap redeploy only.
+
 ## 0.1.9 (2026-06-08)
 
 Release-CI fix for the vault-console artifacts — **supersedes 0.1.8**, which built the broker but
