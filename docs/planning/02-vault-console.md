@@ -1,7 +1,11 @@
 # 02 — vault-console (operator web view) — planning
 
-Status: **APPROVED** (2026-06-06). All decisions + the 5 derived items ratified. Build next:
-P1a = broker `observe` API/cap, then the `vault-console` crate. No code yet at time of approval.
+Status: **BUILT — eu enablement pending** (2026-06-08). P1a (broker `observe` API/cap) +
+the `vault-console` crate (SPA + backend fan-out + embed + deploy module) **and P1b (OIDC RP:
+authorization_code+PKCE, `private_key_jwt` RS256 with the cert key + bound kid, `acr=mfa`
+enforced)** are all shipped in **v0.1.8**. Remaining = the eu host window (infra: jail/WG `.110`/
+cert/edge + broker `roles.json` `observe` entry; operator: Route53 + create the staged identity
+client + bind JWK) and the closing **live `acr=mfa` round-trip**. Originally APPROVED 2026-06-06.
 
 ## Purpose
 
