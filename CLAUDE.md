@@ -36,17 +36,26 @@ You own — and must publish to `coordination/` + this repo — this boundary
 - **Short-TTL issuance**: SSH signed-cert CA + leased service-admin creds (OpenSearch
   RBAC / DB) — publish method + path + req/resp in the broker OpenAPI under `spec/`.
 - **Lease model**: TTL / renew / revoke + session-bound child-lease cascade.
+- **Object-store presign**: SigV4 presigned-URL signer for DO Spaces — `object-store` cap
+  (PUT, publish) + `object-store-read` cap (GET, serve); stateless, per-tenant/single-object
+  scoping in the signature, the Spaces key never leaves the broker.
+- **Observe API**: read-only operator plane (`observe` cap) — `GET /v1/sys|{group}/observe/*`;
+  state only (leases/sessions/roles/ssh/kms/object-store/audit), never secret values.
 - **Namespace / residency**: per-group instance + `<group>/<tenant_id UUIDv4>/<role>`;
   a cred must not resolve another tenant/region. Honour `conventions/residency.md`
   (EU/UAE physical air-gap — one broker per group).
 - **Audit**: emit canonical B3 (`source:"vault"`) to group-local OpenSearch; consumers
   do not double-record. Redact at emitter.
 
-Two services, one workspace (do not merge their data models):
+Services, one workspace (do not merge their data models):
 - **vault-broker** — the above (fleet creds), per residency group, port `8200`.
 - **vault-sync** — personal multi-device sync for memento/probe: E2E/server-blind,
   device-keypair auth, row-level oplog (CRDT/LWW). Not multi-tenant; not under the
   residency air-gap as scoped today (revisit if it ever serves tenant data).
+- **vault-console** — operator web/API console, one per group, port `8203`; read-only,
+  aggregates the group's brokers' `observe` API over mTLS; React SPA in `web/`. Never
+  surfaces a secret value. Plan: `docs/planning/02-vault-console.md`.
+- **vault-transport** — shared transport/audit types for the services (no data model of its own).
 
 Rules specific to you:
 - Source of truth = spec/OpenAPI in this repo; `CONTRACTS.md` only points at it. When a

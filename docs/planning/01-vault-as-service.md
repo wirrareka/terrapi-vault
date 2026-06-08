@@ -1,9 +1,11 @@
 # terrapi-vault → service(s): planning doc
 
-> **Status:** DRAFT for owner approval (2026-05-26). Nothing in this doc is yet
-> committed to `coordination/`. Once approved, the "Coordination writes" section
-> (§8) is executed: inbox answers, `CONTRACTS.md`, `ports-env.md`, demon notify,
-> and the `CLAUDE.md` role block.
+> **Status:** COMMITTED + largely shipped (this was the original 2026-05-26 plan; approved and
+> executed). The broker is **RELEASED through v0.1.7** (Path A: mTLS+authz, SSH-CA, leased creds,
+> KMS wrap/unwrap + root-of-trust, object-store presign, read-only `observe` API). For the **current
+> state** see `CHANGELOG.md` + `spec/broker-openapi.yaml`; for the operator console see
+> `docs/planning/02-vault-console.md`. This file is kept as the historical design record — read it
+> for the *why*, not the current surface.
 
 ## 0. Decisions taken (owner, 2026-05-26)
 

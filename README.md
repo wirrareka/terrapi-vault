@@ -16,11 +16,35 @@ database behind a small, safe lifecycle API:
   salt and KDF parameters — no secret material.
 - In-place **key rotation** via SQLCipher `PRAGMA rekey`.
 - Robust **partial-state recovery** on create (orphan DB / orphan sidecar).
+- **Recovery codes** — passphrase and a high-entropy recovery code are independent
+  key-slots that each wrap a random data key, so a lost passphrase is recoverable and
+  changing one slot never invalidates the other (see
+  [`spec/vault-format.md`](spec/vault-format.md) §13).
 
 It is fully self-contained: **no** dependency on any UI, GPUI, or
 application types. The on-disk format is documented in
 [`spec/vault-format.md`](spec/vault-format.md) precisely enough for an
 independent compatible reader.
+
+## Repository layout
+
+This repo is the at-rest **library** (this crate, at the root — what `memento` and `probe`
+consume as a path dependency) plus the network **services** it has grown into, under
+[`services/`](services/):
+
+- **`vault-broker`** — the stack's network **secrets broker** (Path A): mTLS-over-WireGuard,
+  one instance per residency group, port `8200`. SSH signed-cert CA, leased service-admin
+  creds, KMS wrap/unwrap, object-store presigned URLs, and a read-only `observe` API.
+  Contract: [`spec/broker-openapi.yaml`](spec/broker-openapi.yaml).
+- **`vault-sync`** — personal multi-device, **end-to-end / server-blind** sync for memento/probe
+  (device-keypair auth, row-level oplog). Contract: [`spec/sync-openapi.yaml`](spec/sync-openapi.yaml).
+- **`vault-console`** — operator web/API console (read-only observability), one per group,
+  port `8203`; aggregates the brokers' `observe` API. SPA in [`web/`](web/). Plan:
+  [`docs/planning/02-vault-console.md`](docs/planning/02-vault-console.md).
+- **`vault-transport`** — shared transport/audit types for the services.
+
+The library stays platform-neutral (no networking/UI deps) so memento/probe are never
+constrained; the services are a separate workspace under `services/`.
 
 ## Usage
 
