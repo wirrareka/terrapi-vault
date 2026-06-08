@@ -3,6 +3,34 @@
 terrapi-vault — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
+## 0.1.8 (2026-06-08)
+
+vault-console **P1b — OIDC RP login**. The operator console now authenticates humans against
+terrapi-identity; this tag is the trigger for the eu console go-live (infra creates the jail / WG
+`.110` / dual-EKU cert + edge, identity creates the staged `vault-console` client, then a live
+`acr=mfa` round-trip closes it). The broker binary is **unchanged from 0.1.7** (only the console
+and a deploy sample changed); medina's live broker need not move.
+
+- **OIDC Relying Party** (`vault-console/src/oidc.rs`) — `authorization_code` + **PKCE (S256)**,
+  **`private_key_jwt`** client auth signed **RS256** with the console cert's RSA key (header `kid`
+  = the RFC 7638 thumbprint identity bound — one dual-EKU cert, two uses: broker mTLS + assertion
+  signing, no shared secret), and **`acr=mfa` enforced** (we request `acr_values=mfa` AND reject
+  any id_token whose `acr` claim is not `mfa`). id_token verified against identity's JWKS
+  (discovered from the issuer, kid-miss refetch throttled like the broker's `jwt.rs`), `iss`/`aud`/
+  `exp` by jsonwebtoken, `nonce` + `acr` checked in pure unit-tested code. `sub`/`email` → the
+  single `operator` role (no per-tenant RBAC).
+- **Cookie session** (`vault-console/src/session.rs`) — in-memory operator sessions (stateless
+  across restarts, matching the no-DB P1) + a one-shot `state`→PKCE-verifier/nonce store (defeats
+  `state` replay). Cookie is `HttpOnly; Secure; SameSite=Lax`.
+- `/api/v1/auth/{login,callback,logout}` are now wired (were `501`); the dev stub remains only
+  under `VAULT_CONSOLE_ALLOW_INSECURE_DEV`. New env: `VAULT_CONSOLE_OIDC_{ISSUER,REDIRECT_URI,KID}`
+  (required to enable login) + optional `CLIENT_ID`/`SCOPES`/`ACR`; the signing key is the existing
+  `VAULT_CONSOLE_TLS_KEY`. Unset issuer ⇒ login disabled (dev or all-401).
+- **`deploy/roles.json.sample`**: added `vault-console.eu.proximi.internal` → **`observe`** (the
+  broker grant the console's mTLS cert needs; absent ⇒ the console reads 403).
+- Unit-tested end-to-end against a mock IdP key (PKCE S256 vector, assertion RS256+kid round-trip,
+  id_token happy-path + `acr`/nonce/audience rejection). Live `acr=mfa` round-trip runs at deploy.
+
 ## 0.1.7 (2026-06-06)
 
 Object-store presign — the DO Spaces tile publish/serve path for proximiio-outer-map (publish)

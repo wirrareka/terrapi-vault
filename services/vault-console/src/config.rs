@@ -23,6 +23,28 @@ pub struct ConsoleTls {
     pub client_ca: PathBuf,
 }
 
+/// OIDC RP (P1b) parameters: operator login via terrapi-identity, `authorization_code` + PKCE,
+/// `private_key_jwt` client auth keyed by the **console cert's key** (so the signing key = the
+/// mTLS key — see [`ConsoleTls::key`]), `acr=mfa` enforced. `Some` only when
+/// `VAULT_CONSOLE_OIDC_ISSUER` is set; absent → login is unavailable (dev stub or all-401).
+#[derive(Debug, Clone)]
+pub struct OidcConfig {
+    /// OP issuer, exact incl. trailing slash (e.g. `https://identity.eu.proximi.fi/`).
+    pub issuer: String,
+    pub client_id: String,
+    /// Exact-match redirect URI registered with identity (`…/api/v1/auth/callback`).
+    pub redirect_uri: String,
+    /// PEM of the RSA private key the client-assertion JWT is signed with — the **same** cert key
+    /// presented for broker mTLS ([`ConsoleTls::key`]); RS256, header `kid` = [`Self::kid`].
+    pub signing_key: PathBuf,
+    /// RFC 7638 thumbprint of the public key identity bound to the client (the assertion `kid`).
+    pub kid: String,
+    /// Space-delimited scopes (default `openid profile email`).
+    pub scopes: String,
+    /// Required `acr` value enforced on the id_token (default `mfa`).
+    pub acr: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConsoleConfig {
     pub bind: SocketAddr,
@@ -30,6 +52,8 @@ pub struct ConsoleConfig {
     pub brokers: Vec<BrokerEndpoint>,
     /// `Some` in production (mTLS to brokers). `None` only in `allow_insecure_dev`.
     pub tls: Option<ConsoleTls>,
+    /// `Some` when OIDC is configured (`VAULT_CONSOLE_OIDC_ISSUER` set). The RP (P1b).
+    pub oidc: Option<OidcConfig>,
     /// Local dev only: skip broker-cert verification + grant a `dev` operator session (no OIDC).
     pub allow_insecure_dev: bool,
 }
@@ -61,14 +85,52 @@ impl ConsoleConfig {
             }),
             _ => None,
         };
+        let oidc = oidc_from_env(tls.as_ref())?;
         Ok(Self {
             bind,
             residency_group,
             brokers,
             tls,
+            oidc,
             allow_insecure_dev,
         })
     }
+}
+
+/// Build the OIDC RP config from env. Returns `Ok(None)` when `VAULT_CONSOLE_OIDC_ISSUER` is unset
+/// (login disabled). The client-assertion signing key is the console cert key ([`ConsoleTls::key`]),
+/// so OIDC requires `VAULT_CONSOLE_TLS_*` to be present too.
+///
+/// # Errors
+/// `String` if the issuer is set but a required field (`redirect_uri`, `kid`) or the cert key is missing.
+fn oidc_from_env(tls: Option<&ConsoleTls>) -> Result<Option<OidcConfig>, String> {
+    let Ok(issuer) = std::env::var("VAULT_CONSOLE_OIDC_ISSUER") else {
+        return Ok(None);
+    };
+    if issuer.is_empty() {
+        return Ok(None);
+    }
+    let redirect_uri = std::env::var("VAULT_CONSOLE_OIDC_REDIRECT_URI")
+        .map_err(|_| "VAULT_CONSOLE_OIDC_ISSUER set but VAULT_CONSOLE_OIDC_REDIRECT_URI missing")?;
+    let kid = std::env::var("VAULT_CONSOLE_OIDC_KID")
+        .map_err(|_| "VAULT_CONSOLE_OIDC_ISSUER set but VAULT_CONSOLE_OIDC_KID missing")?;
+    let signing_key = tls
+        .map(|t| t.key.clone())
+        .ok_or("OIDC needs VAULT_CONSOLE_TLS_KEY (the cert key signs the client assertion)")?;
+    let client_id = std::env::var("VAULT_CONSOLE_OIDC_CLIENT_ID")
+        .unwrap_or_else(|_| "vault-console".to_string());
+    let scopes = std::env::var("VAULT_CONSOLE_OIDC_SCOPES")
+        .unwrap_or_else(|_| "openid profile email".to_string());
+    let acr = std::env::var("VAULT_CONSOLE_OIDC_ACR").unwrap_or_else(|_| "mfa".to_string());
+    Ok(Some(OidcConfig {
+        issuer,
+        client_id,
+        redirect_uri,
+        signing_key,
+        kid,
+        scopes,
+        acr,
+    }))
 }
 
 /// Parse `VAULT_CONSOLE_BROKERS` = comma-separated `id@host:port` (e.g.

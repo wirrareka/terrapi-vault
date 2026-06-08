@@ -375,6 +375,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid",
+ "pem-rfc7468",
  "zeroize",
 ]
 
@@ -2297,7 +2298,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "vault-broker"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-trait",
  "axum",
@@ -2329,20 +2330,25 @@ dependencies = [
 
 [[package]]
 name = "vault-console"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "axum",
+ "base64",
+ "jsonwebtoken",
+ "rand 0.8.6",
  "reqwest",
+ "rsa",
  "rust-embed",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
 ]
 
 [[package]]
 name = "vault-sync"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "axum",
  "base64",
@@ -2363,7 +2369,7 @@ dependencies = [
 
 [[package]]
 name = "vault-transport"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "serde",
  "serde_json",

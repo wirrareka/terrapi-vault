@@ -18,6 +18,14 @@ serde_json.workspace = true
 thiserror.workspace = true
 # Outbound mTLS client to the group's brokers (presents the console's fleet-CA client cert).
 reqwest.workspace = true
+# OIDC RP (P1b): sign the `private_key_jwt` client assertion (RS256, the cert's kid) + verify the
+# id_token against identity's JWKS. Same crate the broker uses for KMS-cap tokens (jwt.rs).
+jsonwebtoken.workspace = true
+# PKCE challenge (S256) + base64url for code-verifier / state / nonce / jti.
+sha2.workspace = true
+base64.workspace = true
+# CSPRNG for the code-verifier, state, nonce, jti, and session ids.
+rand.workspace = true
 # SPA embed (single binary). OPTIONAL + behind the `embed-ui` feature so the default build (CI)
 # needs no built `web/dist`; the release builds the web app first then `--features embed-ui`.
 rust-embed = { version = "8", features = ["mime-guess"], optional = true }
@@ -25,6 +33,12 @@ rust-embed = { version = "8", features = ["mime-guess"], optional = true }
 [features]
 # Compile `web/dist/` into the binary (release). Off by default → CI compiles without the SPA.
 embed-ui = ["dep:rust-embed"]
+
+[dev-dependencies]
+# Tests only: generate a throwaway RSA keypair at runtime (RS256 sign/verify round-trips) — so no
+# private key is ever committed to this secrets-boundary repo. rcgen can't generate RSA keys.
+rsa = { version = "0.9", features = ["pem"] }
+rand.workspace = true
 
 [lints]
 workspace = true
