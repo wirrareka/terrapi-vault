@@ -3,6 +3,11 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "packageManager": "pnpm@10.6.5",
+  "pnpm": {
+    "comment": "pnpm 10+ blocks dependency build scripts unless approved; esbuild/@swc/core need theirs to place their native binaries, so vite build fails without this. pnpm 11 makes the ignored-build a hard error (CI). List them here so any pnpm version builds cleanly.",
+    "onlyBuiltDependencies": ["@swc/core", "esbuild"]
+  },
   "description": "Operator web console for terrapi-vault (read-only observability, one per residency group). Mirrors the Kalista web standard.",
   "engines": {
     "node": ">=24"

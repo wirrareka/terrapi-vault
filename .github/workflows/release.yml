@@ -214,6 +214,9 @@ jobs:
       - name: Build the SPA (web/dist)
         run: |
           corepack enable
+          # Pin pnpm (corepack defaults to floating-latest from repo root, which has no
+          # packageManager pin; pnpm 11 turned ignored build scripts into a hard CI error).
+          corepack prepare pnpm@10.6.5 --activate
           pnpm --dir web install
           pnpm --dir web build
           test -f web/dist/index.html || { echo "::error::web/dist not built"; exit 1; }
@@ -267,6 +270,9 @@ jobs:
       - name: Build the SPA (web/dist) on the Linux side (the fbsd VM has no node)
         run: |
           corepack enable
+          # Pin pnpm (corepack defaults to floating-latest from repo root, which has no
+          # packageManager pin; pnpm 11 turned ignored build scripts into a hard CI error).
+          corepack prepare pnpm@10.6.5 --activate
           pnpm --dir web install
           pnpm --dir web build
           test -f web/dist/index.html || { echo "::error::web/dist not built"; exit 1; }
