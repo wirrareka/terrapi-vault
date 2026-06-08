@@ -3,6 +3,18 @@
 terrapi-vault — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
+## 0.1.9 (2026-06-08)
+
+Release-CI fix for the vault-console artifacts — **supersedes 0.1.8**, which built the broker but
+failed to publish the console tarballs (corepack pulled floating-latest pnpm 11, which turns
+ignored dependency build scripts into a hard error, so `vite build` had no esbuild/@swc toolchain).
+Carries the **same P1b OIDC RP** as 0.1.8 (below); deploy `vault-console-0.1.9-{linux,freebsd}`.
+
+- `web/package.json`: `pnpm.onlyBuiltDependencies = [@swc/core, esbuild]` (fixes the ignored-builds
+  error on any pnpm 10/11) + `packageManager` pin `pnpm@10.6.5`.
+- `release.yml` (both console jobs): `corepack prepare pnpm@10.6.5 --activate` before install.
+- Committed `web/pnpm-lock.yaml` (was never tracked → CI resolved fresh each run).
+
 ## 0.1.8 (2026-06-08)
 
 vault-console **P1b — OIDC RP login**. The operator console now authenticates humans against

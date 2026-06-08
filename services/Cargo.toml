@@ -8,7 +8,7 @@ resolver = "2"
 members = ["vault-transport", "vault-broker", "vault-sync", "vault-console"]
 
 [workspace.package]
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 rust-version = "1.83"
 license = "MIT OR Apache-2.0"
