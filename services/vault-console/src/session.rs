@@ -18,9 +18,16 @@ use crate::oidc::Operator;
 const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
 /// How long a started login may sit before the callback must arrive.
 const PENDING_TTL: Duration = Duration::from_secs(600);
+/// Hard cap on concurrent pending logins. `/auth/login` is unauthenticated, so without a bound an
+/// attacker could insert entries faster than the 600 s TTL evicts them and grow the map without
+/// limit. At the cap the oldest pending entry is evicted to make room (a never-completed login is
+/// disposable). Sized far above any real concurrent-operator login burst.
+const MAX_PENDING: usize = 4096;
 
-/// The session cookie name (HttpOnly, Secure, SameSite=Lax — set in `http`).
-pub const COOKIE_NAME: &str = "vc_session";
+/// The session cookie name (HttpOnly, Secure, SameSite=Lax — set in `http`). The `__Host-`
+/// prefix host-locks the cookie: browsers only accept it when set with `Secure`, `Path=/`, and
+/// no `Domain` (all true here), so a sibling/sub-domain can't plant or override the session.
+pub const COOKIE_NAME: &str = "__Host-vc_session";
 
 struct SessionEntry {
     op: Operator,
@@ -75,11 +82,20 @@ pub struct PendingAuth {
 }
 
 impl PendingAuth {
-    /// Stash a started login keyed by its `state`.
+    /// Stash a started login keyed by its `state`. Bounded by [`MAX_PENDING`]: expired entries are
+    /// swept first, then — if still at the cap — the single oldest entry is evicted before insert,
+    /// so an unauthenticated `/auth/login` flood cannot grow the map without limit.
     pub fn put(&self, state: String, verifier: String, nonce: String) {
         let mut map = self.map.lock().expect("pending lock");
         let now = Instant::now();
         map.retain(|_, e| e.expires > now);
+        // At the cap (after sweeping expired): REFUSE the new login rather than evict an existing
+        // one. Under an unauthenticated /auth/login flood this keeps an in-flight legitimate login
+        // from being knocked out before its callback returns, and is O(1) (no full-map scan). The
+        // dropped attempt simply fails at the callback ("unknown or expired state") and retries.
+        if map.len() >= MAX_PENDING {
+            return;
+        }
         map.insert(
             state,
             PendingEntry {
@@ -130,6 +146,21 @@ mod tests {
     #[test]
     fn unknown_session_is_none() {
         assert!(Sessions::default().get("nope").is_none());
+    }
+
+    #[test]
+    fn pending_is_capped_refusing_new_not_evicting_inflight() {
+        let p = PendingAuth::default();
+        for i in 0..(MAX_PENDING + 100) {
+            p.put(format!("state-{i}"), "v".into(), "n".into());
+        }
+        let map = p.map.lock().unwrap();
+        assert!(map.len() <= MAX_PENDING, "pending map must stay bounded");
+        drop(map);
+        // Refuse-new at the cap: an early (in-flight) login is preserved, late ones are refused —
+        // a flood cannot knock out a login that was already pending.
+        assert!(p.take("state-0").is_some());
+        assert!(p.take(&format!("state-{}", MAX_PENDING + 99)).is_none());
     }
 
     #[test]
