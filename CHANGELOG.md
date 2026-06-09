@@ -3,6 +3,48 @@
 terrapi-vault — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
+## Unreleased — security hardening (2026-06-09)
+
+Multi-agent security analysis (`docs/security/security-analysis-2026-06-09.md`) → a phased
+remediation across the lib + all services. No data-model or wire-breaking changes; the broker
+roles config gained one optional field. All Rust + web tests green; `cargo deny check` fully green.
+
+- **Phase 0 — CI / supply chain:** `cargo deny` advisories gate fixed (the `rsa` dev-dep ignore
+  re-justified for both `deny.toml` + `audit.toml`); all GitHub Actions SHA-pinned + a Dependabot
+  config; web toolchain bumped (vite 6 / vitest 3 / esbuild 0.25.12 — 0 prod & dev vulns) and the
+  duplicate npm lockfile removed. Broker: `VAULT_AUDIT_OS_INSECURE_TLS` dev-gated; insecure-dev +
+  TLS refused (no prod downgrade); production refuses to default the store/audit paths into a temp
+  dir. Console: CSP + nosniff + frame-deny + `no-store` headers, logout → POST, `__Host-` session
+  cookie, generic 401 (no IdP-internal leak).
+- **Phase 1 — authz correctness:** Console OIDC `state` bound to a `__Host-vc_auth` pre-auth cookie
+  (login-CSRF / fixation), bounded pending-auth map, loopback-gated + anti-downgrade insecure-dev.
+  Broker: lease renew/revoke + session-end are owner-bound; `kms` cap required even with a JWT;
+  per-role `ssh_principals` allowlist; session-rebind ends the prior session; single-SAN client
+  certs enforced.
+- **Phase 2 — broker resilience:** boot reconciliation sweeps this node's orphaned OpenSearch
+  users (node-scoped); issuance audit is fail-closed (no cred without a durable record); mTLS
+  handshake timeout + connection cap. CRL vs short-lived certs raised with infra; per-tenant
+  OpenSearch role isolation documented as accepted risk.
+- **Phase 3 — vault-sync:** rate-limited `/account` + `/enroll`; `deny_unknown_fields` + id length
+  caps + per-push op cap; refuses a non-loopback bind without `VAULT_SYNC_DB_KEY`; device list +
+  revoke endpoints; key-replacement logged distinctly. Protocol-v2 (AEAD-bound LWW metadata, op
+  hash-chain) proposed to memento/probe.
+- **Phase 4 — defense-in-depth:** KDF params floored to the RFC 9106 minimum when migrating a v1
+  vault (untrusted sidecar can't weaken the new slot); recovery-code intermediates zeroized;
+  sidecar/export temp writes use `create_new` (no symlink-follow); `deny.toml` gained
+  licenses/bans/sources policy; audit chain readers stream line-by-line (flat memory).
+- **Review follow-up (xhigh code review):** extended fail-closed audit to KMS wrap/unwrap/rotate/
+  rewrap, object-store presign, and session-open (a shared `require_audit` 503 helper); the audit
+  chain now refuses all appends if its tip can't be cleanly recovered (mid-file read error →
+  fail-closed, no chain fork). Boot orphan-reconcile moved to a background task with HTTP
+  connect/request timeouts so a slow OpenSearch can't stall startup, and it now also reclaims
+  legacy users that predate node-tagging. vault-sync: separate rate bucket for account/enroll vs
+  enroll-challenge; `revoke_device` won't remove the last device and bounds the device-id length;
+  `Op` is now `deny_unknown_fields` (StoredOp un-flattened to keep the response forward-compatible).
+  Console pending-auth refuses new logins at the cap instead of evicting in-flight ones, and the
+  OIDC error path clears the binding cookie. ssh-sign roles without an allowlist now still refuse
+  privileged principals (root/admin/…) unless explicitly listed.
+
 ## 0.1.10 (2026-06-08)
 
 vault-console **id_token verification alg fix** — found at the live `acr=mfa` round-trip (the whole

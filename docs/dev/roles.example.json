@@ -1,13 +1,15 @@
 {
-  "_comment": "Example VAULT_ROLES_CONFIG for the EU broker. Maps each client cert's first SAN dNSName to a role + its granted capabilities (least privilege). Capabilities: ssh-ca, ssh-sign, creds, session, leases, kms, snapshot. An unmapped/trusted SAN gets 403; a cap the role lacks gets 403.",
+  "_comment": "Example VAULT_ROLES_CONFIG for the EU broker. Maps each client cert's single SAN dNSName to a role + its granted capabilities (least privilege). Capabilities: ssh-ca, ssh-sign, creds, session, leases, kms, snapshot. An unmapped/trusted SAN gets 403; a cap the role lacks gets 403. Client certs MUST carry exactly one dNSName SAN (multi-SAN refused). Optional per-role `ssh_principals` allowlist restricts which SSH cert subject principals an ssh-sign role may request (omit = unconstrained).",
   "roles": {
     "demon-operator.eu.proximi.internal": {
       "role": "demon-operator",
-      "caps": ["ssh-sign", "creds", "session", "leases"]
+      "caps": ["ssh-sign", "creds", "session", "leases"],
+      "ssh_principals": ["ops", "deploy"]
     },
     "demon-system.eu.proximi.internal": {
       "role": "demon-system",
-      "caps": ["ssh-sign", "session", "leases"]
+      "caps": ["ssh-sign", "session", "leases"],
+      "ssh_principals": ["svc-demon"]
     },
     "aether-backup.eu.proximi.internal": {
       "role": "aether-backup",

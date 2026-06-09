@@ -1,13 +1,15 @@
 {
-  "_comment": "Production VAULT_ROLES_CONFIG for the EU broker. SAN(dNSName) -> {role, caps}. Capabilities: ssh-ca, ssh-sign, creds, session, leases, kms, object-store, object-store-read, observe, snapshot. An unmapped/trusted SAN -> 403; a cap the role lacks -> 403. Mint client certs with these exact dNSNames (demon-mtls-san-matcher.md). object-store = presigned PUT (tile publish, outer-map); object-store-read = presigned GET (tile serve, belt) — only wire these where VAULT_OBJECT_STORE_* is configured. observe = read-only broker state for vault-console (state only, NEVER a secret value).",
+  "_comment": "Production VAULT_ROLES_CONFIG for the EU broker. SAN(dNSName) -> {role, caps, ssh_principals?}. Capabilities: ssh-ca, ssh-sign, creds, session, leases, kms, object-store, object-store-read, observe, snapshot. An unmapped/trusted SAN -> 403; a cap the role lacks -> 403. Mint client certs with these exact dNSNames AND exactly one dNSName SAN (multi-SAN certs are refused). object-store = presigned PUT (tile publish, outer-map); object-store-read = presigned GET (tile serve, belt) — only wire these where VAULT_OBJECT_STORE_* is configured. observe = read-only broker state for vault-console (state only, NEVER a secret value). kms ALWAYS requires the kms cap, even when an identity-minted bearer JWT is presented (the JWT is an additional per-tenant proof, not a replacement). ssh_principals (optional, RECOMMENDED for ssh-sign roles): the exact SSH cert subject principals the role may request — a role with an allowlist cannot mint a cert for any other user/host; omit for unconstrained EXCEPT a built-in denylist (root/admin/administrator/sudo/wheel) is always refused unless explicitly allowlisted.",
   "roles": {
     "demon-operator.eu.proximi.internal": {
       "role": "demon-operator",
-      "caps": ["ssh-sign", "creds", "session", "leases"]
+      "caps": ["ssh-sign", "creds", "session", "leases"],
+      "ssh_principals": ["ops", "deploy"]
     },
     "demon-system.eu.proximi.internal": {
       "role": "demon-system",
-      "caps": ["ssh-sign", "session", "leases"]
+      "caps": ["ssh-sign", "session", "leases"],
+      "ssh_principals": ["svc-demon"]
     },
     "aether-backup.eu.proximi.internal": {
       "role": "aether-backup",

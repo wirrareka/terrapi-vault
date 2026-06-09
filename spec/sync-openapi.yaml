@@ -284,6 +284,39 @@ paths:
           content: { application/json: { schema: { type: object, properties: { latest_seq: { type: integer }, op_count: { type: integer }, device_count: { type: integer } } } } }
         '401': { description: unauthenticated }
 
+  /v1/sync/{vault_id}/devices:
+    get:
+      summary: List enrolled devices (device-signed). Sign over an empty body.
+      description: >
+        Returns the vault's enrolled devices (id + enrolment time; no public keys). Lets a client
+        show its devices and spot one it does not recognise (a candidate for revocation).
+      parameters: [ { $ref: '#/components/parameters/VaultId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
+      responses:
+        '200':
+          description: devices
+          content: { application/json: { schema: { type: object, properties: { devices: { type: array, items: { type: object, properties: { device_id: { type: string }, enrolled_at: { type: integer } } } } } } } }
+        '401': { description: unauthenticated }
+
+  /v1/sync/{vault_id}/devices/{device_id}:
+    delete:
+      summary: Revoke a device (device-signed). Sign over an empty body.
+      description: >
+        Deletes the target device's key so it can no longer sign requests (it must re-enrol with
+        the passphrase proof to return). Any enrolled device of this single-user vault may revoke a
+        lost/compromised one (including itself). Idempotent only in effect — an unknown device is
+        `404`.
+      parameters:
+        - { $ref: '#/components/parameters/VaultId' }
+        - { name: device_id, in: path, required: true, schema: { type: string }, description: the device id to revoke }
+        - { $ref: '#/components/parameters/DeviceId' }
+        - { $ref: '#/components/parameters/SyncTs' }
+        - { $ref: '#/components/parameters/SyncNonce' }
+        - { $ref: '#/components/parameters/SyncSig' }
+      responses:
+        '200': { description: revoked, content: { application/json: { schema: { $ref: '#/components/schemas/Ack' } } } }
+        '401': { description: unauthenticated }
+        '404': { description: no_such_device, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
+
   /v1/sync/{vault_id}/tail:
     get:
       summary: WebSocket live tail (device-signed upgrade).
