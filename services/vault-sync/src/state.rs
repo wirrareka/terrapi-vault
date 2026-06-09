@@ -23,8 +23,12 @@ pub struct AppState {
     /// `spawn_blocking`, off the async runtime.
     pub store: Arc<Store>,
     pub replay: Arc<ReplayGuard>,
-    /// Token bucket guarding the unauthenticated `enroll-challenge` endpoint.
+    /// Token bucket guarding the unauthenticated `enroll-challenge` (read) endpoint.
     pub challenge_rl: Arc<RateBucket>,
+    /// Separate token bucket for the unauthenticated `account` + `enroll` (write) endpoints, so a
+    /// flood of cheap `enroll-challenge` probes cannot starve the owner's actual account/enrol
+    /// requests (their availability is decoupled from the challenge surface).
+    pub enroll_rl: Arc<RateBucket>,
     /// Global concurrency permits — bounds requests executing against the serialised store.
     pub sem: Arc<tokio::sync::Semaphore>,
     /// Prometheus metrics, scraped on the loopback metrics listener.
@@ -43,6 +47,7 @@ impl AppState {
             store: Arc::new(store),
             replay: Arc::new(ReplayGuard::default()),
             challenge_rl: Arc::new(RateBucket::default()),
+            enroll_rl: Arc::new(RateBucket::default()),
             sem,
             metrics: Arc::new(Metrics::default()),
             tails: Arc::new(Mutex::new(HashMap::new())),

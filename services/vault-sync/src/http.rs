@@ -5,8 +5,8 @@
 
 use crate::auth::{self, SignedHeaders};
 use crate::dto::{
-    Ack, CreateAccountRequest, EnrollChallenge, EnrollRequest, ErrorBody, PullResponse,
-    PushRequest, PushResponse, StatusResponse,
+    Ack, CreateAccountRequest, DeviceInfo, DevicesResponse, EnrollChallenge, EnrollRequest,
+    ErrorBody, PullResponse, PushRequest, PushResponse, StatusResponse,
 };
 use crate::state::AppState;
 use crate::store::{now_unix, AccountError, PushError, Store};
@@ -16,7 +16,7 @@ use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Path, Query
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use serde::Deserialize;
@@ -145,6 +145,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sync/{vault_id}/push", post(push))
         .route("/v1/sync/{vault_id}/pull", get(pull))
         .route("/v1/sync/{vault_id}/status", get(status))
+        .route("/v1/sync/{vault_id}/devices", get(list_devices))
+        .route("/v1/sync/{vault_id}/devices/{device_id}", delete(revoke_device))
         .route("/v1/sync/{vault_id}/tail", get(tail))
         // Per-route so metrics run after routing and see the `MatchedPath` template (id-free).
         .route_layer(axum::middleware::from_fn_with_state(
@@ -369,6 +371,16 @@ async fn create_account(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Ack>), ErrResp> {
+    // Unauthenticated surface (only a self-signed proof): rate-limit so an attacker can't cheaply
+    // mass-create accounts (disk-fill) or flood the replay-nonce guard. Shared with the challenge
+    // bucket; a TLS proxy does per-IP limiting in front, this is the in-process backstop.
+    if !state.enroll_rl.allow() {
+        return Err(err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "too many account/enrol attempts; slow down",
+        ));
+    }
     let req: CreateAccountRequest = serde_json::from_slice(&body)
         .map_err(|e| err(StatusCode::BAD_REQUEST, "bad_body", &e.to_string()))?;
     // Self-signed: the first device proves possession of the key it is registering.
@@ -446,6 +458,15 @@ async fn enroll(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Ack>), ErrResp> {
+    // Unauthenticated surface (proof + self-signed key only): rate-limit like /account so device
+    // enrolment can't be used to flood the account/nonce state.
+    if !state.enroll_rl.allow() {
+        return Err(err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "too many account/enrol attempts; slow down",
+        ));
+    }
     let req: EnrollRequest = serde_json::from_slice(&body)
         .map_err(|e| err(StatusCode::BAD_REQUEST, "bad_body", &e.to_string()))?;
     // Gate on the enrolment proof (server holds only SHA-256 of the secret).
@@ -482,9 +503,19 @@ async fn enroll(
         &req.device.pubkey_b64,
     )?;
     let (vid2, did) = (vault_id.clone(), req.device.device_id.clone());
-    store_op(&state, move |s| s.register_device(&vid2, &did, &pubkey))
+    let dev_log = req.device.device_id.clone();
+    let upsert = store_op(&state, move |s| s.register_device(&vid2, &did, &pubkey))
         .await?
         .map_err(db_err)?;
+    // A key replacement on an existing device_id is security-relevant (possible hijack of the id),
+    // not a routine enrol — surface it loudly so it isn't silent. (Op/device counts are the
+    // metadata the at-rest model guards, so this stays a local log, not an emitted record.)
+    if upsert == crate::store::DeviceUpsert::KeyReplaced {
+        eprintln!(
+            "vault-sync: WARNING device '{dev_log}' key REPLACED on vault {vault_id} — verify this \
+             was an intentional re-key, not a hijack of an existing device id."
+        );
+    }
     Ok((StatusCode::OK, Json(Ack { ok: true })))
 }
 
@@ -541,6 +572,27 @@ async fn push(
         auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, &body).await?;
     let req: PushRequest = serde_json::from_slice(&body)
         .map_err(|e| err(StatusCode::BAD_REQUEST, "bad_body", &e.to_string()))?;
+    // Bound the batch size and reject oversized/empty identifier fields before they hit the store.
+    if req.ops.len() > crate::dto::MAX_OPS_PER_PUSH {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "too_many_ops",
+            "push batch exceeds the per-request op limit",
+        ));
+    }
+    if req.ops.iter().any(|o| {
+        o.op_id.is_empty()
+            || o.op_id.len() > crate::dto::MAX_OP_ID_LEN
+            || o.device_id.is_empty()
+            || o.device_id.len() > crate::dto::MAX_OP_ID_LEN
+            || o.collection_id.len() > crate::dto::MAX_OP_ID_LEN
+    }) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "bad_op_field",
+            "op_id/device_id/collection_id is empty or exceeds the length limit",
+        ));
+    }
     // A device may only author ops under its own id.
     if req.ops.iter().any(|o| o.device_id != device_id) {
         return Err(err(
@@ -624,6 +676,91 @@ async fn status(
         op_count,
         device_count,
     }))
+}
+
+/// `GET /v1/sync/{vault_id}/devices` — list the vault's enrolled devices (id + enrolment time).
+/// Device-signed like any read; lets a client show its devices and spot one it doesn't recognise.
+async fn list_devices(
+    State(state): State<AppState>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    VaultId(vault_id): VaultId,
+    headers: HeaderMap,
+) -> ApiResult<DevicesResponse> {
+    auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"").await?;
+    let vid = vault_id.clone();
+    let rows = store_op(&state, move |s| s.list_devices(&vid))
+        .await?
+        .map_err(db_err)?;
+    let devices = rows
+        .into_iter()
+        .map(|(device_id, enrolled_at)| DeviceInfo {
+            device_id,
+            enrolled_at,
+        })
+        .collect();
+    Ok(Json(DevicesResponse { devices }))
+}
+
+/// `DELETE /v1/sync/{vault_id}/devices/{device_id}` — revoke a device's key so it can no longer
+/// sign requests (it must re-enrol with the passphrase proof to return). Device-signed; any
+/// enrolled device of this (single-user) vault may revoke a lost/compromised one. `404` if the
+/// device is unknown.
+async fn revoke_device(
+    State(state): State<AppState>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    Path((vault_id, target_device_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Ack> {
+    if !is_uuid_v4_lower(&vault_id) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "bad_vault_id",
+            "vault_id must be a lowercase UUIDv4",
+        ));
+    }
+    // Bound the path-supplied device id (consistent with the push op-id caps) before it reaches
+    // the store / logs.
+    if target_device_id.is_empty() || target_device_id.len() > crate::dto::MAX_OP_ID_LEN {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "bad_device_id",
+            "device_id is empty or exceeds the length limit",
+        ));
+    }
+    let caller =
+        auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"").await?;
+    // Refuse to revoke the LAST remaining device — that would lock the vault out of all signing
+    // (a new device could only return via the passphrase enrol path). A compromised device can
+    // still revoke its siblings (any device is the single user in this model), but never strand
+    // the vault with zero keys.
+    let vid_count = vault_id.clone();
+    let devices = store_op(&state, move |s| s.list_devices(&vid_count))
+        .await?
+        .map_err(db_err)?;
+    if devices.len() <= 1 && devices.iter().any(|(id, _)| id == &target_device_id) {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "last_device",
+            "cannot revoke the last remaining device; enrol another device first",
+        ));
+    }
+    let (vid, did) = (vault_id.clone(), target_device_id.clone());
+    let removed = store_op(&state, move |s| s.revoke_device(&vid, &did))
+        .await?
+        .map_err(db_err)?;
+    if !removed {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "no_such_device",
+            "no such device for this vault",
+        ));
+    }
+    eprintln!(
+        "vault-sync: device '{target_device_id}' revoked on vault {vault_id} by device '{caller}'"
+    );
+    Ok(Json(Ack { ok: true }))
 }
 
 /// `GET /v1/sync/{vault_id}/tail` — WebSocket live tail. The upgrade request is device-signed
@@ -852,7 +989,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let pull: PullResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(pull.ops.len(), 1);
-        assert_eq!(pull.ops[0].op.op_id, "op-1");
+        assert_eq!(pull.ops[0].op_id, "op-1");
         assert_eq!(pull.ops[0].seq, 1);
 
         // 6. Status.
@@ -929,7 +1066,7 @@ mod tests {
             .try_recv()
             .expect("subscriber should have received the op");
         let stored: crate::dto::StoredOp = serde_json::from_str(&json).unwrap();
-        assert_eq!(stored.op.op_id, "op-1");
+        assert_eq!(stored.op_id, "op-1");
         assert_eq!(stored.seq, 1);
     }
 
@@ -972,7 +1109,7 @@ mod tests {
         // The subscriber receives exactly op-2 (seq 2) — never the pre-seeded op-1 — and nothing more.
         let stored: crate::dto::StoredOp =
             serde_json::from_str(&rx.try_recv().expect("the new op")).unwrap();
-        assert_eq!((stored.op.op_id.as_str(), stored.seq), ("op-2", 2));
+        assert_eq!((stored.op_id.as_str(), stored.seq), ("op-2", 2));
         assert!(
             rx.try_recv().is_err(),
             "only this push's single op should have been published"
@@ -1065,10 +1202,7 @@ mod tests {
         let (mut ws, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
 
         // The handshake completed → the handler subscribed. Now fan an op out (as push does).
-        let stored = crate::dto::StoredOp {
-            seq: 1,
-            op: op("A", "op-1"),
-        };
+        let stored = crate::dto::StoredOp::from_op(1, op("A", "op-1"));
         st.publish(VID, &[serde_json::to_string(&stored).unwrap()]);
 
         // The socket receives the op as a JSON text frame.
@@ -1082,7 +1216,7 @@ mod tests {
             other => panic!("expected text frame, got {other:?}"),
         };
         let got: crate::dto::StoredOp = serde_json::from_str(&txt).unwrap();
-        assert_eq!(got.op.op_id, "op-1");
+        assert_eq!(got.op_id, "op-1");
         assert_eq!(got.seq, 1);
     }
 }

@@ -24,6 +24,22 @@ use store::Store;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::from_env();
+    // Refuse to run unencrypted-at-rest on a routable (production) bind: the metadata DB then
+    // exposes op/device counts, timing, cleartext collection_ids + device pubkeys to a stolen
+    // disk (the content stays E2E-encrypted regardless). Loopback/dev is allowed with a loud
+    // warning; set VAULT_SYNC_ALLOW_PLAINTEXT_DB=1 to acknowledge an intentional plaintext run.
+    if cfg.db_key.is_none()
+        && !cfg.bind.ip().is_loopback()
+        && std::env::var("VAULT_SYNC_ALLOW_PLAINTEXT_DB").as_deref() != Ok("1")
+    {
+        return Err(format!(
+            "vault-sync: refusing a non-loopback bind ({}) without VAULT_SYNC_DB_KEY[_FILE] — the \
+             metadata DB would be unencrypted at rest. Set the key, bind 127.0.0.1 for dev, or set \
+             VAULT_SYNC_ALLOW_PLAINTEXT_DB=1 to intentionally run plaintext.",
+            cfg.bind
+        )
+        .into());
+    }
     let at_rest = if cfg.db_key.is_some() {
         "encrypted (SQLCipher)"
     } else {

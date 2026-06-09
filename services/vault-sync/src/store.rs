@@ -34,6 +34,17 @@ fn apply_key(conn: &Connection, key: Option<&str>) -> rusqlite::Result<()> {
 /// hash: `(enroll_salt, params, enroll_hash)`.
 pub type EnrollRecord = (Vec<u8>, terrapi_vault::KdfParams, Vec<u8>);
 
+/// Outcome of [`Store::register_device`] — so the caller can audit a key replacement distinctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceUpsert {
+    /// A new `device_id` was registered.
+    Created,
+    /// An existing `device_id` re-enrolled with the **same** key (idempotent).
+    Reenrolled,
+    /// An existing `device_id`'s key was **replaced** with a different one (security-relevant).
+    KeyReplaced,
+}
+
 /// The op store. WAL mode gives one writer + many concurrent readers, so the store keeps a
 /// dedicated writer connection plus a small pool of read-only connections: writes serialise on
 /// the writer; reads (`pull`/`status`/the tail fan-out read) fan across the readers and run in
@@ -207,20 +218,58 @@ impl Store {
         })
     }
 
-    /// Register (or replace, for key rotation) a device's public key.
+    /// Register (or replace, for key rotation) a device's public key. Returns how the row
+    /// changed so the caller can audit a **key replacement** distinctly — silently rebinding an
+    /// existing `device_id` to a new key is a security-relevant event (possible hijack), not a
+    /// routine enrol.
     pub fn register_device(
         &self,
         vault_id: &str,
         device_id: &str,
         pubkey: &[u8; 32],
-    ) -> rusqlite::Result<()> {
+    ) -> rusqlite::Result<DeviceUpsert> {
         let conn = self.writer.lock().expect("writer lock");
+        let existing: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT pubkey FROM devices WHERE vault_id = ?1 AND device_id = ?2",
+                params![vault_id, device_id],
+                |r| r.get(0),
+            )
+            .optional()?;
         conn.execute(
             "INSERT OR REPLACE INTO devices (vault_id, device_id, pubkey, enrolled_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![vault_id, device_id, pubkey.as_slice(), now_unix()],
         )?;
-        Ok(())
+        Ok(match existing {
+            None => DeviceUpsert::Created,
+            Some(old) if old.as_slice() == pubkey.as_slice() => DeviceUpsert::Reenrolled,
+            Some(_) => DeviceUpsert::KeyReplaced,
+        })
+    }
+
+    /// Revoke (delete) a device's key. Returns `true` if a device was removed, `false` if no such
+    /// device existed (idempotent). A revoked device can no longer sign requests (its pubkey is
+    /// gone) until it re-enrols with the passphrase proof.
+    pub fn revoke_device(&self, vault_id: &str, device_id: &str) -> rusqlite::Result<bool> {
+        let conn = self.writer.lock().expect("writer lock");
+        let n = conn.execute(
+            "DELETE FROM devices WHERE vault_id = ?1 AND device_id = ?2",
+            params![vault_id, device_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// List a vault's registered devices (id + enrolment time). The pubkey is public but omitted
+    /// here — the operator view only needs which devices exist and when they enrolled.
+    pub fn list_devices(&self, vault_id: &str) -> rusqlite::Result<Vec<(String, i64)>> {
+        self.with_reader(|c| {
+            let mut stmt = c.prepare(
+                "SELECT device_id, enrolled_at FROM devices WHERE vault_id = ?1 ORDER BY enrolled_at",
+            )?;
+            let rows = stmt.query_map([vault_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
     }
 
     /// A registered device's ed25519 public key, if any.
@@ -301,10 +350,10 @@ impl Store {
                     now,
                 ])?;
                 accepted += 1;
-                stored.push(StoredOp {
-                    seq: u64::try_from(seq).unwrap_or(0),
-                    op: op.clone(),
-                });
+                stored.push(StoredOp::from_op(
+                    u64::try_from(seq).unwrap_or(0),
+                    op.clone(),
+                ));
             }
         }
         tx.commit()?;
@@ -337,9 +386,9 @@ impl Store {
                 |r| {
                     let seq: i64 = r.get(0)?;
                     let payload: Vec<u8> = r.get(6)?;
-                    Ok(StoredOp {
-                        seq: u64::try_from(seq).unwrap_or(0),
-                        op: Op {
+                    Ok(StoredOp::from_op(
+                        u64::try_from(seq).unwrap_or(0),
+                        Op {
                             op_id: r.get(1)?,
                             device_id: r.get(2)?,
                             hlc: Hlc {
@@ -350,7 +399,7 @@ impl Store {
                             collection_id: r.get(5)?,
                             encrypted_payload: b64().encode(payload),
                         },
-                    })
+                    ))
                 },
             )?;
             rows.collect::<rusqlite::Result<_>>()
@@ -426,13 +475,13 @@ mod tests {
         assert_eq!((acc, dup, latest), (2, 0, 2));
         // push_ops returns exactly the accepted ops with their assigned seq (for tail fan-out).
         assert_eq!(stored.len(), 2);
-        assert_eq!((stored[0].seq, stored[0].op.op_id.as_str()), (1, "a"));
-        assert_eq!((stored[1].seq, stored[1].op.op_id.as_str()), (2, "b"));
+        assert_eq!((stored[0].seq, stored[0].op_id.as_str()), (1, "a"));
+        assert_eq!((stored[1].seq, stored[1].op_id.as_str()), (2, "b"));
         // Re-pushing "a" plus a new "c": one dup, one accepted, seq advances to 3.
         let (acc, dup, latest, stored) = s.push_ops("v1", &[op("a", 1), op("c", 3)]).unwrap();
         assert_eq!((acc, dup, latest), (1, 1, 3));
         assert_eq!(stored.len(), 1); // only the newly-accepted "c", not the duplicate "a"
-        assert_eq!((stored[0].seq, stored[0].op.op_id.as_str()), (3, "c"));
+        assert_eq!((stored[0].seq, stored[0].op_id.as_str()), (3, "c"));
     }
 
     #[test]
@@ -444,8 +493,8 @@ mod tests {
         assert_eq!(latest, 3);
         assert_eq!(ops.len(), 2); // seq 2,3
         assert_eq!(ops[0].seq, 2);
-        assert_eq!(ops[0].op.op_id, "b");
-        assert_eq!(ops[0].op.encrypted_payload, b64().encode(b"ciphertext"));
+        assert_eq!(ops[0].op_id, "b");
+        assert_eq!(ops[0].encrypted_payload, b64().encode(b"ciphertext"));
     }
 
     #[test]
@@ -472,6 +521,35 @@ mod tests {
         assert_eq!(s.device_pubkey("v1", "dev-a").unwrap(), Some(pk));
         let (_, _, dev_count) = s.status("v1").unwrap();
         assert_eq!(dev_count, 1);
+    }
+
+    #[test]
+    fn device_upsert_revoke_and_list() {
+        let s = Store::open_memory().unwrap();
+        let (ka, kb) = ([1u8; 32], [2u8; 32]);
+        // First registration → Created; same key again → Reenrolled; different key → KeyReplaced.
+        assert_eq!(
+            s.register_device("v1", "dev-a", &ka).unwrap(),
+            DeviceUpsert::Created
+        );
+        assert_eq!(
+            s.register_device("v1", "dev-a", &ka).unwrap(),
+            DeviceUpsert::Reenrolled
+        );
+        assert_eq!(
+            s.register_device("v1", "dev-a", &kb).unwrap(),
+            DeviceUpsert::KeyReplaced
+        );
+        s.register_device("v1", "dev-b", &ka).unwrap();
+        // List shows both devices.
+        let devs = s.list_devices("v1").unwrap();
+        assert_eq!(devs.len(), 2);
+        assert!(devs.iter().any(|(id, _)| id == "dev-a"));
+        // Revoke is idempotent and removes the key (signing then fails — no pubkey).
+        assert!(s.revoke_device("v1", "dev-a").unwrap());
+        assert!(!s.revoke_device("v1", "dev-a").unwrap()); // already gone
+        assert_eq!(s.device_pubkey("v1", "dev-a").unwrap(), None);
+        assert_eq!(s.list_devices("v1").unwrap().len(), 1);
     }
 
     #[test]

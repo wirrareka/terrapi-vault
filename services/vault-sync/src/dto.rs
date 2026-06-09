@@ -8,6 +8,7 @@ use vault_transport::Hlc;
 /// A single row-level operation as it travels on the wire (client → server → client).
 /// `seq` is added by the server (see [`StoredOp`]); the client never sends it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)] // strict: reject unknown fields on a pushed op (request input)
 #[allow(clippy::struct_field_names)] // `op_id` is the fixed wire field name (the contract).
 pub struct Op {
     /// Globally-unique client id (ULID / UUIDv7). Dedupe + idempotency key.
@@ -22,17 +23,39 @@ pub struct Op {
     pub encrypted_payload: String,
 }
 
-/// An op as returned by `pull`, carrying the server-assigned monotonic `seq` (the pull
-/// cursor). `seq` is per-`vault_id`.
+/// An op as returned by `pull`/`tail`, carrying the server-assigned monotonic `seq` (the pull
+/// cursor). `seq` is per-`vault_id`. Fields are explicit (not `#[serde(flatten)] op: Op`) so that
+/// `Op` can carry `deny_unknown_fields` for its request use — flatten is incompatible with it. The
+/// serialized JSON is identical (flat: `{seq, op_id, …}`). This is a RESPONSE type, so it is
+/// deliberately NOT `deny_unknown_fields` (forward-compat for older clients).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredOp {
     pub seq: u64,
-    #[serde(flatten)]
-    pub op: Op,
+    pub op_id: String,
+    pub device_id: String,
+    pub hlc: Hlc,
+    pub collection_id: String,
+    pub encrypted_payload: String,
+}
+
+impl StoredOp {
+    /// Build a stored op from a server-assigned `seq` and the wire `Op`.
+    #[must_use]
+    pub fn from_op(seq: u64, op: Op) -> Self {
+        Self {
+            seq,
+            op_id: op.op_id,
+            device_id: op.device_id,
+            hlc: op.hlc,
+            collection_id: op.collection_id,
+            encrypted_payload: op.encrypted_payload,
+        }
+    }
 }
 
 /// A device registering itself: its id and its raw ed25519 public key (base64, 32 bytes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceRegistration {
     pub device_id: String,
     /// Base64 of the 32-byte ed25519 public key.
@@ -44,6 +67,7 @@ pub struct DeviceRegistration {
 /// (`hash` = SHA-256 of the client-side Argon2 enrolment secret). The server stores this and
 /// never learns the secret.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnrollVerifier {
     /// Base64 of the enrolment salt (account-level, distinct from the vault's at-rest salt).
     pub salt_b64: String,
@@ -55,6 +79,7 @@ pub struct EnrollVerifier {
 
 /// `POST /v1/sync/{vault_id}/account` — first device creates the sync account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateAccountRequest {
     pub enroll: EnrollVerifier,
     /// Base64 of the client-side enrolment secret (same value a later device sends as the
@@ -78,6 +103,7 @@ pub struct EnrollChallenge {
 /// its key. The request is self-signed by the *new* device key (proves key possession); the
 /// `proof` gates the enrolment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnrollRequest {
     /// Base64 of the enrolment secret (the client-side Argon2 output). The server checks
     /// SHA-256(proof) == stored hash and then discards it — never persisted.
@@ -85,8 +111,17 @@ pub struct EnrollRequest {
     pub device: DeviceRegistration,
 }
 
+/// Upper bounds on op identifier fields (`op_id`, `device_id`, `collection_id`). These are
+/// short ids / HMACs in practice; the cap rejects an oversized field cheaply (the big
+/// `encrypted_payload` is bounded by the request body limit). Enforced in the push handler.
+pub const MAX_OP_ID_LEN: usize = 128;
+/// Max ops accepted in one push batch (bounds a single request's work + row insert count; the
+/// body byte-limit is the coarser cap).
+pub const MAX_OPS_PER_PUSH: usize = 1000;
+
 /// `POST /v1/sync/{vault_id}/push`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PushRequest {
     pub ops: Vec<Op>,
 }
@@ -104,6 +139,21 @@ pub struct PushResponse {
 pub struct PullResponse {
     pub ops: Vec<StoredOp>,
     pub latest_seq: u64,
+}
+
+/// One enrolled device in the `GET /v1/sync/{vault_id}/devices` listing (no pubkey — the view
+/// only needs which devices exist and when they enrolled).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub device_id: String,
+    /// Unix seconds the device (re-)enrolled.
+    pub enrolled_at: i64,
+}
+
+/// `GET /v1/sync/{vault_id}/devices` — the vault's enrolled devices.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevicesResponse {
+    pub devices: Vec<DeviceInfo>,
 }
 
 /// `GET /v1/sync/{vault_id}/status`.
