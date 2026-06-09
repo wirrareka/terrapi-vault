@@ -714,8 +714,10 @@ fn migrate_v1_to_v2(
     passphrase: &str,
     v1: &VaultMeta,
 ) -> Result<Vault> {
-    // Preserve the vault's chosen Argon2 cost for the new password slot.
-    let params = v1.kdf_params;
+    // Preserve the vault's chosen Argon2 cost for the new password slot, but raise it to at least
+    // the RFC 9106 floor: the v1 cost comes from the plaintext, unauthenticated sidecar, so a
+    // tampered/legacy low value must not silently weaken the freshly-wrapped v2 slot.
+    let params = v1.kdf_params.floored();
     let dek = random_key();
     let slot = reseal_password_slot(&dek, passphrase, params)?;
     let staged_meta = MetaV2::new(slot);

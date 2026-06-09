@@ -149,9 +149,18 @@ fn decode_salt(salt_hex: &str) -> Result<[u8; SALT_LEN]> {
 /// crash-safety property (a reader never sees a half-written sidecar) holds
 /// uniformly across v1 and v2.
 fn atomic_write_json<T: Serialize>(value: &T, meta_path: &Path) -> Result<()> {
+    use std::io::Write as _;
     let json = serde_json::to_vec_pretty(value)?;
     let tmp = meta_path.with_extension("meta.json.tmp");
-    std::fs::write(&tmp, &json)?;
+    // Clear any stale/planted tmp (remove_file unlinks a symlink itself, not its target), then
+    // create_new (O_EXCL) so the write never follows a symlink or truncates an attacker-controlled
+    // target — the sidecar is public metadata, but the write path should still not be redirectable.
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    f.write_all(&json)?;
     std::fs::rename(&tmp, meta_path)?;
     Ok(())
 }

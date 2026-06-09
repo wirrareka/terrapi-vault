@@ -215,7 +215,13 @@ fn write_container(path: &Path, meta_json: &[u8], db_bytes: &[u8]) -> Result<()>
 
     let tmp = path.with_extension("memento-note.tmp");
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        // Clear any stale/planted tmp (remove_file unlinks a symlink itself, not its target), then
+        // create_new (O_EXCL) so we never follow a symlink or truncate an attacker-controlled file.
+        let _ = std::fs::remove_file(&tmp);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         f.write_all(&buf)?;
         f.flush()?;
     }

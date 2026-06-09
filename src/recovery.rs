@@ -64,7 +64,9 @@ impl RecoveryCode {
     /// from the heap when dropped.
     #[must_use]
     pub fn format(&self) -> Zeroizing<String> {
-        let payload = base32_encode(&self.0); // 32 chars
+        // `payload` is the secret rendered in base32 — keep it in a zeroizing buffer so it does
+        // not linger on the heap after this returns (the `check` is a CRC, not secret).
+        let payload = Zeroizing::new(base32_encode(&self.0)); // 32 chars
         let check = base32_encode(&crc16(&self.0).to_be_bytes()); // 4 chars
         let mut out = String::with_capacity(44);
         for (i, ch) in payload.chars().enumerate() {
@@ -86,8 +88,9 @@ impl RecoveryCode {
     /// [`Error::RecoveryCodeInvalid`] if the code has the wrong length, an
     /// illegal character, or a failing checksum.
     pub fn parse(input: &str) -> Result<Self> {
-        // Normalize: drop separators, uppercase, fold ambiguous glyphs.
-        let mut norm = String::with_capacity(40);
+        // Normalize: drop separators, uppercase, fold ambiguous glyphs. Zeroizing — `norm` holds
+        // the secret's characters until parsed.
+        let mut norm = Zeroizing::new(String::with_capacity(40));
         for ch in input.chars() {
             if ch == '-' || ch.is_whitespace() {
                 continue;
@@ -107,7 +110,9 @@ impl RecoveryCode {
             )));
         }
         let (payload_s, check_s) = norm.split_at(32);
+        // The decoded payload is the raw secret — keep it zeroizing so it is scrubbed on drop.
         let payload = base32_decode(payload_s)
+            .map(Zeroizing::new)
             .ok_or_else(|| Error::RecoveryCodeInvalid("illegal character".into()))?;
         let check = base32_decode(check_s)
             .ok_or_else(|| Error::RecoveryCodeInvalid("illegal character".into()))?;

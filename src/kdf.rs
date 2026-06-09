@@ -55,7 +55,27 @@ pub const MAX_M_COST_KIB: u32 = 4 * 1024 * 1024;
 pub const MAX_T_COST: u32 = 16;
 pub const MAX_P_COST: u32 = 16;
 
+/// RFC 9106 second-recommended **floor**: 19 MiB memory, 2 passes. The sidecar's `kdf_params`
+/// are plaintext + unauthenticated, so when the library creates a *new* key slot from params that
+/// may have come from an untrusted source (notably the v1→v2 migration, which preserves the v1
+/// cost), it raises them to at least this floor — a tampered/legacy low-cost sidecar can no longer
+/// silently weaken a freshly-wrapped credential. `validate` still bounds the *upper* end.
+pub const MIN_M_COST_KIB: u32 = 19 * 1024;
+pub const MIN_T_COST: u32 = 2;
+
 impl KdfParams {
+    /// Return these params with `m_cost_kib` / `t_cost` raised to at least the RFC 9106 floor
+    /// ([`MIN_M_COST_KIB`] / [`MIN_T_COST`]); `p_cost` is left unchanged. Applied when wrapping a
+    /// new slot from params of untrusted provenance.
+    #[must_use]
+    pub fn floored(self) -> Self {
+        Self {
+            m_cost_kib: self.m_cost_kib.max(MIN_M_COST_KIB),
+            t_cost: self.t_cost.max(MIN_T_COST),
+            p_cost: self.p_cost,
+        }
+    }
+
     /// Reject parameters outside the sane upper bounds — a DoS guard for params read from an
     /// untrusted sidecar or import container.
     ///
@@ -241,6 +261,23 @@ mod tests {
     use super::*;
     use secrecy::ExposeSecret;
     use std::time::Instant;
+
+    #[test]
+    fn floored_raises_weak_params_only() {
+        // Below the floor → raised to it (t and m), p_cost preserved.
+        let weak = KdfParams {
+            m_cost_kib: 8 * 1024,
+            t_cost: 1,
+            p_cost: 3,
+        }
+        .floored();
+        assert_eq!(weak.m_cost_kib, MIN_M_COST_KIB);
+        assert_eq!(weak.t_cost, MIN_T_COST);
+        assert_eq!(weak.p_cost, 3);
+        // At/above the floor → unchanged.
+        let strong = KdfParams::default().floored();
+        assert_eq!(strong, KdfParams::default());
+    }
 
     #[test]
     fn deterministic_with_same_salt() {
