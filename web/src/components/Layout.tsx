@@ -18,7 +18,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useBrokers } from "@/hooks/use-observe";
-import { logoutUrl, useMe } from "@/hooks/use-auth";
+import { logout, useMe } from "@/hooks/use-auth";
 import { useFilters } from "@/stores/filters";
 import { useTheme } from "@/stores/theme";
 import { Badge } from "@/components/ui";
@@ -131,13 +131,15 @@ export function AppLayout() {
               >
                 {theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
               </button>
-              <a
-                href={logoutUrl()}
+              <button
+                type="button"
+                onClick={() => void logout()}
                 className="flex items-center rounded px-1.5 py-1 hover:bg-accent hover:text-foreground"
                 title="Sign out"
+                aria-label="Sign out"
               >
                 <LogOut className="h-3.5 w-3.5" />
-              </a>
+              </button>
             </div>
           </div>
         </div>
