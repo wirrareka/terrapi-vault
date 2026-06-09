@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -96,10 +96,32 @@ impl AuditEvent {
     }
 }
 
+/// Why a durable audit append failed — the record did NOT reach the chain.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AuditError {
+    #[error("audit event could not be serialized")]
+    Serialize,
+    #[error("audit append failed (chain not advanced)")]
+    Append,
+}
+
 /// A sink the broker emits audit events to.
 pub trait AuditSink: Send + Sync {
-    /// Best-effort: a failure here must never break the user-visible action.
+    /// Best-effort: a failure here must never break the user-visible action. Use for events that
+    /// describe state the issuance already committed elsewhere (session open/end, revoke).
     fn emit(&self, event: &AuditEvent);
+
+    /// Like [`AuditSink::emit`] but reports whether the record reached the durable store.
+    /// **Issuance** ops (mint a cert / backend user) call this and fail closed on `Err`, so no
+    /// credential is ever handed out without a durable audit record. Default: best-effort emit
+    /// that always reports success — for sinks with no durability guarantee to make.
+    ///
+    /// # Errors
+    /// [`AuditError`] when the record could not be durably recorded.
+    fn try_emit(&self, event: &AuditEvent) -> Result<(), AuditError> {
+        self.emit(event);
+        Ok(())
+    }
 }
 
 /// Durable local sink: append one JSON line per event. The source of truth; the broker's
@@ -155,6 +177,10 @@ struct ChainState {
     /// Held append writer (opened once, not per event). `None` if it can't be opened; `emit`
     /// then retries the open. Keeping it open avoids an `open()` syscall per audit event.
     file: Option<std::fs::File>,
+    /// Set when the tip could not be cleanly recovered at open (a mid-chain read error → the true
+    /// tail is unknown). The chain then **refuses all appends** (fail-closed) rather than resume
+    /// from a stale seq and fork the chain; issuance `try_emit` therefore 503s until fixed.
+    corrupt: bool,
 }
 
 #[derive(Serialize)]
@@ -222,11 +248,24 @@ impl HashChainSink {
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
-        let (seq, prev) = recover_tip(&path);
+        let (seq, prev, clean) = recover_tip(&path);
+        if !clean {
+            eprintln!(
+                "vault audit: chain at {} could not be cleanly read (mid-file read error); \
+                 refusing to append (fail-closed) to avoid forking the chain — investigate/repair \
+                 the audit file. Issuance will 503 until resolved.",
+                path.display()
+            );
+        }
         let file = open_append(&path);
         Self {
             path,
-            state: Mutex::new(ChainState { seq, prev, file }),
+            state: Mutex::new(ChainState {
+                seq,
+                prev,
+                file,
+                corrupt: !clean,
+            }),
         }
     }
 }
@@ -239,21 +278,35 @@ fn open_append(path: &Path) -> Option<std::fs::File> {
         .ok()
 }
 
-/// Recover `(next_seq, last_hash)` from the file; `(0, GENESIS)` if absent/empty. Uses the
-/// last parseable record (a partial trailing line from a crash is ignored).
-fn recover_tip(path: &Path) -> (u64, [u8; 32]) {
-    let Ok(data) = std::fs::read_to_string(path) else {
-        return (0, GENESIS);
+/// Recover `(next_seq, last_hash, clean)` from the file. `clean` is `false` if a line could not be
+/// read (mid-chain I/O error) — the true tail is then unknown, so the caller fail-closes rather
+/// than resume from a stale tip and fork the chain. An absent/empty file is a clean `(0, GENESIS)`
+/// start. Uses the last parseable record (a partial trailing line from a crash is ignored).
+fn recover_tip(path: &Path) -> (u64, [u8; 32], bool) {
+    let Ok(file) = std::fs::File::open(path) else {
+        return (0, GENESIS, true); // absent/unopenable → clean empty start (append will create it)
     };
+    // Stream line-by-line — the append-only chain grows unbounded, so never load it whole.
     let mut tip = None;
-    for line in data.lines().filter(|l| !l.trim().is_empty()) {
+    let mut clean = true;
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            // A read error before EOF: we cannot know the real tail. Do NOT silently truncate.
+            clean = false;
+            break;
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
         if let Ok(r) = serde_json::from_str::<RecordIn>(line) {
             if let Some(h) = from_hex32(&r.hash) {
                 tip = Some((r.seq, h));
             }
         }
     }
-    tip.map_or((0, GENESIS), |(seq, h)| (seq + 1, h))
+    let (seq, prev) = tip.map_or((0, GENESIS), |(seq, h)| (seq + 1, h));
+    (seq, prev, clean)
 }
 
 /// One audit record for the read-only observe API: its sequence + the canonical B3 event.
@@ -268,11 +321,16 @@ pub struct AuditTail {
 /// read-only operator view, not the integrity check. Already-redacted B3 events.
 #[must_use]
 pub fn read_tail(path: &Path, since: u64, limit: usize) -> Vec<AuditTail> {
-    let Ok(data) = std::fs::read_to_string(path) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
+    // Stream line-by-line and stop at `limit` — never load the whole append-only chain into memory.
     let mut out = Vec::new();
-    for line in data.lines().filter(|l| !l.trim().is_empty()) {
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
         let Ok(r) = serde_json::from_str::<RecordIn>(line) else {
             continue;
         };
@@ -289,12 +347,17 @@ pub fn read_tail(path: &Path, since: u64, limit: usize) -> Vec<AuditTail> {
     out
 }
 
-impl AuditSink for HashChainSink {
-    fn emit(&self, event: &AuditEvent) {
-        let Ok(event_bytes) = serde_json::to_vec(event) else {
-            return;
-        };
+impl HashChainSink {
+    /// Append one record, advancing the chain iff it reaches the file. Returns whether the record
+    /// was durably written so `try_emit` can fail issuance closed.
+    fn append(&self, event: &AuditEvent) -> Result<(), AuditError> {
+        let event_bytes = serde_json::to_vec(event).map_err(|_| AuditError::Serialize)?;
         let mut st = self.state.lock().expect("audit chain lock");
+        // Fail-closed: if the tip couldn't be cleanly recovered, never append (would fork the
+        // chain at an unknown seq). Issuance try_emit() then 503s; best-effort emit() drops.
+        if st.corrupt {
+            return Err(AuditError::Append);
+        }
         let hash = record_hash(&st.prev, st.seq, &event_bytes);
         let rec = RecordOut {
             seq: st.seq,
@@ -302,9 +365,7 @@ impl AuditSink for HashChainSink {
             hash: &to_hex(&hash),
             event,
         };
-        let Ok(mut line) = serde_json::to_vec(&rec) else {
-            return;
-        };
+        let mut line = serde_json::to_vec(&rec).map_err(|_| AuditError::Serialize)?;
         line.push(b'\n');
         // Reopen if we lost the handle (first open failed, or a prior write errored).
         if st.file.is_none() {
@@ -317,23 +378,35 @@ impl AuditSink for HashChainSink {
         // the file (integrity holds), only durability degrades — we must NOT re-use this seq, so
         // advance is gated on the write, not the fsync.
         let wrote = {
-            let Some(file) = st.file.as_mut() else {
-                return;
-            };
-            match file.write_all(&line) {
-                Ok(()) => {
-                    let _ = file.sync_all();
-                    true
-                }
-                Err(_) => false,
+            match st.file.as_mut() {
+                Some(file) => match file.write_all(&line) {
+                    Ok(()) => {
+                        let _ = file.sync_all();
+                        true
+                    }
+                    Err(_) => false,
+                },
+                None => false,
             }
         };
         if wrote {
             st.seq += 1;
             st.prev = hash;
+            Ok(())
         } else {
             st.file = None; // drop a wedged handle; next emit reopens
+            Err(AuditError::Append)
         }
+    }
+}
+
+impl AuditSink for HashChainSink {
+    fn emit(&self, event: &AuditEvent) {
+        let _ = self.append(event);
+    }
+
+    fn try_emit(&self, event: &AuditEvent) -> Result<(), AuditError> {
+        self.append(event)
     }
 }
 
@@ -343,10 +416,16 @@ impl AuditSink for HashChainSink {
 /// # Errors
 /// See [`VerifyError`].
 pub fn verify(path: impl AsRef<Path>) -> Result<u64, VerifyError> {
-    let data = std::fs::read_to_string(path).map_err(|e| VerifyError::Io(e.to_string()))?;
+    let file = std::fs::File::open(path).map_err(|e| VerifyError::Io(e.to_string()))?;
+    // Stream line-by-line so verification memory stays flat regardless of chain length.
     let mut prev = GENESIS;
     let mut expected: u64 = 0;
-    for line in data.lines().filter(|l| !l.trim().is_empty()) {
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.map_err(|e| VerifyError::Io(e.to_string()))?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
         let r: RecordIn =
             serde_json::from_str(line).map_err(|_| VerifyError::Malformed(expected))?;
         if r.seq != expected {
@@ -440,6 +519,18 @@ mod tests {
         sink.emit(&sample());
         sink.emit(&sample());
         assert_eq!(verify(&path), Ok(3));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn try_emit_reports_durable_success_and_advances_chain() {
+        let path = chain_path("tryemit");
+        let _ = std::fs::remove_file(&path);
+        let sink = HashChainSink::new(&path);
+        // try_emit returns Ok when the record is durably appended (the issuance fail-closed path).
+        assert_eq!(sink.try_emit(&sample()), Ok(()));
+        assert_eq!(sink.try_emit(&sample()), Ok(()));
+        assert_eq!(verify(&path), Ok(2));
         let _ = std::fs::remove_file(&path);
     }
 
