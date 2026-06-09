@@ -2,13 +2,57 @@
 # Run: `cargo deny check advisories` (or `cargo audit`). See docs/review/round4/dependencies.md.
 
 [advisories]
-# `cargo deny` analyses the BUILD graph, so it never sees `rsa` (RUSTSEC-2023-0071): that crate is
-# an optional dependency of `ssh-key` this workspace doesn't enable (SSH-CA is ed25519-only) and is
-# never compiled — `cargo tree -i rsa` is empty. It only appears to `cargo audit`, which scans the
-# raw Cargo.lock; that lock-only false positive is ignored in `audit.toml`, not here.
+# `cargo deny` analyses the BUILD graph INCLUDING dev-dependencies, so it does see `rsa`
+# (RUSTSEC-2023-0071) — `cargo tree -i rsa` resolves to a single edge:
+#   rsa v0.9.10 [dev-dependencies] └── vault-console
+# It is a TEST-ONLY dependency of vault-console: the OIDC unit tests generate a throwaway RSA-2048
+# keypair to exercise the RS256 `private_key_jwt` client-assertion path (oidc.rs test module), so no
+# private key is committed to this secrets-boundary repo. `cargo tree -i rsa --edges no-dev` is
+# empty — `rsa` is NEVER in a shipped binary. The Marvin Attack is a timing side-channel in RSA
+# PKCS#1 v1.5 *decryption*; the tests only generate a key and PKCS#8-encode it (jsonwebtoken does the
+# signing), never decrypt, so the side-channel is unreachable even in the test process. Dev-only +
+# unreachable → ignored. Revisit if `rsa` ever enters the non-dev graph.
 ignore = [
+  "RUSTSEC-2023-0071",
   # RUSTSEC-2025-0134 — rustls-pemfile is unmaintained (a maintenance warning, not a vulnerability).
   # Used only to parse the broker's server cert/key PEM once at boot (tls.rs load_certs/load_key).
   # Functional and widely used. Tracked for migration to rustls-pki-types' PEM API; accepted meanwhile.
   "RUSTSEC-2025-0134",
 ]
+
+# License policy: allow the permissive set the dependency tree actually uses (the workspace itself
+# is MIT OR Apache-2.0). A dependency under a license not listed here fails the gate — surfacing a
+# copyleft/unknown license before it ships rather than after.
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "CC0-1.0",
+  "MPL-2.0",
+  # webpki-roots ships the Mozilla CA set under the Community Data License Agreement (permissive).
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+# Dependency hygiene: flag duplicate versions of the same crate (bloat / drift) as a warning, and
+# refuse wildcard version requirements in first-party manifests.
+[bans]
+multiple-versions = "warn"
+# The internal service crates are wired as version-less path deps within this workspace and are
+# never published to crates.io, so cargo-deny's wildcard check is advisory here, not a gate.
+wildcards = "warn"
+allow-wildcard-paths = true
+
+# Source policy: only crates.io. An unknown registry or a git dependency fails the gate (supply
+# chain — no pulling code from an unpinned/unexpected source).
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

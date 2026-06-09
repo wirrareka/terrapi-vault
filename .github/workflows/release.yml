@@ -37,7 +37,7 @@ jobs:
       contents: write
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ inputs.tag || github.ref }}
       - name: Release notes
@@ -52,7 +52,7 @@ jobs:
           fi
           [ -s release-notes.md ] || echo "Release ${VERSION}" > release-notes.md
       - name: Create or update the Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           name: ${{ inputs.tag || github.ref_name }}
@@ -73,7 +73,7 @@ jobs:
       group: freebsd-release-vm
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -141,7 +141,7 @@ jobs:
           [ "$sz" -gt 2000000 ] || { echo "::error::synced FreeBSD tarball too small (${sz}B)"; exit 1; }
 
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
@@ -159,11 +159,13 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ inputs.tag || github.ref }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: services
           shared-key: release-linux
@@ -182,7 +184,7 @@ jobs:
           tar -czf "${STAGING}.tar.gz" "$STAGING"
           sha256sum "${STAGING}.tar.gz" > "${STAGING}.tar.gz.sha256"
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
@@ -205,10 +207,10 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ inputs.tag || github.ref }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
       - name: Build the SPA (web/dist)
@@ -220,8 +222,10 @@ jobs:
           pnpm --dir web install
           pnpm --dir web build
           test -f web/dist/index.html || { echo "::error::web/dist not built"; exit 1; }
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: services
           shared-key: release-linux-console
@@ -240,7 +244,7 @@ jobs:
           tar -czf "${STAGING}.tar.gz" "$STAGING"
           sha256sum "${STAGING}.tar.gz" > "${STAGING}.tar.gz.sha256"
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
@@ -261,10 +265,10 @@ jobs:
       group: freebsd-release-vm
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ inputs.tag || github.ref }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
       - name: Build the SPA (web/dist) on the Linux side (the fbsd VM has no node)
@@ -333,7 +337,7 @@ jobs:
           echo "host tarball size: ${sz} bytes"
           [ "$sz" -gt 2000000 ] || { echo "::error::synced FreeBSD console tarball too small (${sz}B)"; exit 1; }
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |

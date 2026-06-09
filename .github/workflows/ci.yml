@@ -12,10 +12,13 @@ jobs:
   lib-msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Install Rust 1.83 (the lib MSRV floor)
-        uses: dtolnay/rust-toolchain@1.83.0
+        # SHA-pinned (supply-chain): dtolnay/rust-toolchain selects the toolchain from the ref
+        # name, so a pinned SHA must declare `toolchain:` explicitly.
+        uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
         with:
+          toolchain: "1.83.0"
           components: rustfmt, clippy
       - run: cargo +1.83.0 fmt --check
       - run: cargo +1.83.0 clippy --all-targets -- -D warnings
@@ -28,8 +31,10 @@ jobs:
   lib-neutrality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.83.0
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
+        with:
+          toolchain: "1.83.0"
       - name: Assert no platform/networking deps in the lib tree
         run: |
           tree="$(cargo +1.83.0 tree -e normal --prefix none | sort -u)"
@@ -49,10 +54,11 @@ jobs:
       run:
         working-directory: services
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Install Rust 1.91.1 (services build toolchain)
-        uses: dtolnay/rust-toolchain@1.91.1
+        uses: dtolnay/rust-toolchain@ba6e37b9b9af502effa9a8e8d218bc68ac8ea564 # 1.91.1
         with:
+          toolchain: "1.91.1"
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings

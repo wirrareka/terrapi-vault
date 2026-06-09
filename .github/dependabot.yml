@@ -1,0 +1,36 @@
+version: 2
+# Keep SHA-pinned GitHub Actions fresh (the release pipeline has `contents: write`, so a
+# hijacked action tag would be high-impact — actions are pinned to commit SHAs and Dependabot
+# bumps the SHA + the `# vN` comment on each new release). Also tracks the two Cargo workspaces
+# and the web SPA toolchain for security updates.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+
+  # Root at-rest library (MSRV 1.83, dependency-neutral — review bumps carefully).
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps(lib)"
+
+  # Services workspace (broker / console / sync / transport).
+  - package-ecosystem: cargo
+    directory: /services
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps(services)"
+
+  # vault-console SPA (pnpm).
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps(web)"
