@@ -58,11 +58,25 @@ struct ShipConfig {
 impl ShipConfig {
     fn from_env() -> Option<Self> {
         let base_url = std::env::var("VAULT_AUDIT_OS_URL").ok()?;
+        let insecure = std::env::var("VAULT_AUDIT_OS_INSECURE_TLS").as_deref() == Ok("1");
+        // Disabling audit-stream TLS verification exposes the OpenSearch credential (and the
+        // audit feed) to a MITM, so — exactly like `VAULT_OS_INSECURE_TLS` in opensearch.rs — it
+        // is honoured only in insecure-dev. In production it is refused: shipping stays DISABLED
+        // (events remain durable in the local hash chain and replay once a CA-trusted endpoint is
+        // configured) rather than silently trusting any cert. Fail-closed.
+        if insecure && std::env::var("VAULT_ALLOW_INSECURE_DEV").as_deref() != Ok("1") {
+            eprintln!(
+                "vault-broker: audit shipper DISABLED — VAULT_AUDIT_OS_INSECURE_TLS=1 disables \
+                 TLS verification and is refused outside VAULT_ALLOW_INSECURE_DEV=1; point \
+                 VAULT_AUDIT_OS_URL at a CA-trusted endpoint (or set VAULT_AUDIT_OS_CA)."
+            );
+            return None;
+        }
         Some(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             user: std::env::var("VAULT_AUDIT_OS_USER").unwrap_or_else(|_| "admin".into()),
             password: std::env::var("VAULT_AUDIT_OS_PASSWORD").unwrap_or_default(),
-            insecure: std::env::var("VAULT_AUDIT_OS_INSECURE_TLS").as_deref() == Ok("1"),
+            insecure,
             ca_path: std::env::var("VAULT_AUDIT_OS_CA")
                 .ok()
                 .filter(|s| !s.is_empty()),

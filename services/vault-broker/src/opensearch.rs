@@ -20,14 +20,18 @@ pub struct OpenSearchEngine {
     admin_password: String,
     security_role: String,
     max_ttl_secs: u64,
+    /// This broker's node id — stamped on every issued user (`attributes.node`) so boot
+    /// reconciliation only sweeps *this* node's orphans, never a peer broker's live users.
+    node: String,
 }
 
 impl OpenSearchEngine {
-    /// Build from `VAULT_OS_*` env, or `None` if `VAULT_OS_URL` is unset.
+    /// Build from `VAULT_OS_*` env, or `None` if `VAULT_OS_URL` is unset. `node` is this
+    /// broker's node id (for orphan-reconciliation scoping).
     ///
     /// # Errors
     /// `String` if required vars are missing or the HTTP client cannot be built.
-    pub fn from_env() -> Result<Option<Self>, String> {
+    pub fn from_env(node: &str) -> Result<Option<Self>, String> {
         let Ok(base_url) = std::env::var("VAULT_OS_URL") else {
             return Ok(None);
         };
@@ -64,6 +68,7 @@ impl OpenSearchEngine {
             admin_password,
             security_role,
             max_ttl_secs,
+            node: node.to_owned(),
         }))
     }
 
@@ -94,7 +99,12 @@ pub(crate) fn build_os_client(
     ca_pem_path: Option<String>,
     label: &str,
 ) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(insecure);
+    // Always bound the HTTP calls: an OpenSearch that is slow or black-holed must never hang an
+    // issuance request, the audit shipper, or (critically) the boot-time orphan reconcile.
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
+        .danger_accept_invalid_certs(insecure);
     if let Some(path) = ca_pem_path {
         let pem = std::fs::read(&path).map_err(|e| format!("{label} {path}: {e}"))?;
         builder = builder.tls_built_in_root_certs(false);
@@ -117,7 +127,7 @@ impl CredEngine for OpenSearchEngine {
         let body = serde_json::json!({
             "password": password,
             "opendistro_security_roles": [self.security_role],
-            "attributes": { "broker": "vault", "tenant": tenant }
+            "attributes": { "broker": "vault", "node": self.node, "tenant": tenant }
         });
         let resp = self
             .client
@@ -155,6 +165,59 @@ impl CredEngine for OpenSearchEngine {
             let detail = resp.text().await.unwrap_or_default();
             Err(CredError::Backend(format!("delete user {code}: {detail}")))
         }
+    }
+
+    /// Boot reconciliation: delete every internal user this broker node previously created
+    /// (`attributes.broker == "vault"` AND `attributes.node == self.node`) — the in-memory lease
+    /// ledger is empty after a restart, so any such surviving user is an orphan with no owning
+    /// lease, defeating the short-TTL guarantee. Scoped by node so a peer broker's live users are
+    /// never touched. Best-effort: per-user delete failures are logged, not fatal.
+    async fn reconcile_orphans(&self) -> Result<usize, CredError> {
+        let url = format!("{}/_plugins/_security/api/internalusers", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .basic_auth(&self.admin_user, Some(&self.admin_password))
+            .send()
+            .await
+            .map_err(|e| CredError::Backend(format!("list users request: {e}")))?;
+        if !resp.status().is_success() {
+            let code = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(CredError::Backend(format!("list users {code}: {detail}")));
+        }
+        let users: serde_json::Map<String, serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| CredError::Backend(format!("parse users: {e}")))?;
+        let mine: Vec<String> = users
+            .iter()
+            .filter(|(_, def)| {
+                let attrs = def.get("attributes");
+                let broker = attrs
+                    .and_then(|a| a.get("broker"))
+                    .and_then(serde_json::Value::as_str);
+                if broker != Some("vault") {
+                    return false;
+                }
+                // Match this node's users, AND legacy users created before node-tagging (no `node`
+                // attribute at all) — those would otherwise be orphaned forever. A `node` set to a
+                // *different* broker's id is left alone (don't delete a peer's live users).
+                match attrs.and_then(|a| a.get("node")) {
+                    Some(n) => n.as_str() == Some(self.node.as_str()),
+                    None => true,
+                }
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut deleted = 0;
+        for name in mine {
+            match self.revoke(&name).await {
+                Ok(()) => deleted += 1,
+                Err(e) => eprintln!("vault-broker: orphan reconcile: delete {name} failed: {e}"),
+            }
+        }
+        Ok(deleted)
     }
 }
 
@@ -225,6 +288,7 @@ mod tests {
             admin_password: pass.clone(),
             security_role: role,
             max_ttl_secs: 3600,
+            node: "test-node".into(),
         };
 
         let issued = engine

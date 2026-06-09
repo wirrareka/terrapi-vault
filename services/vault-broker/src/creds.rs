@@ -52,6 +52,17 @@ pub trait CredEngine: Send + Sync {
     /// # Errors
     /// `Backend` if the target system errors on delete.
     async fn revoke(&self, username: &str) -> Result<(), CredError>;
+
+    /// Boot reconciliation: delete any users this engine created that are now orphaned (the
+    /// in-memory lease ledger is empty after a restart, so a surviving broker-created user has no
+    /// owning lease). Returns how many were removed. Default: no-op — engines with no out-of-band
+    /// state (the mock) have nothing to reconcile.
+    ///
+    /// # Errors
+    /// `Backend` if the target system errors while listing/deleting.
+    async fn reconcile_orphans(&self) -> Result<usize, CredError> {
+        Ok(0)
+    }
 }
 
 /// role → engine. Built at boot from config (prod) or with a mock (dev).
@@ -73,6 +84,28 @@ impl CredEngines {
     #[must_use]
     pub fn get(&self, role: &str) -> Option<&dyn CredEngine> {
         self.map.get(role).map(AsRef::as_ref)
+    }
+
+    /// Run boot reconciliation across every registered engine; returns the total orphaned users
+    /// removed. Best-effort: a per-engine failure is logged and the others still run.
+    pub async fn reconcile_all(&self) -> usize {
+        let mut total = 0;
+        for (role, engine) in &self.map {
+            match engine.reconcile_orphans().await {
+                Ok(n) => {
+                    if n > 0 {
+                        eprintln!(
+                            "vault-broker: boot reconcile removed {n} orphaned '{role}' user(s)"
+                        );
+                    }
+                    total += n;
+                }
+                Err(e) => {
+                    eprintln!("vault-broker: boot reconcile for '{role}' failed ({e}); continuing");
+                }
+            }
+        }
+        total
     }
 }
 

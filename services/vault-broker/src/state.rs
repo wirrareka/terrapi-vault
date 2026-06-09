@@ -163,7 +163,7 @@ pub fn random_id() -> String {
 /// registry is empty and an issuance for any role returns `404` (unconfigured role).
 fn build_engines(cfg: &BrokerConfig) -> CredEngines {
     let mut engines = CredEngines::new();
-    match crate::opensearch::OpenSearchEngine::from_env() {
+    match crate::opensearch::OpenSearchEngine::from_env(&cfg.node) {
         Ok(Some(os)) => {
             let role = os.role().to_owned();
             eprintln!("vault-broker: OpenSearch cred engine registered for role '{role}'");
@@ -263,6 +263,18 @@ impl AppState {
             .cloned()
     }
 
+    /// Whether `principal_san` owns `session_id` — i.e. it is that principal's currently-bound
+    /// active session. Ownership gate for session-end / lease renew+revoke: one principal must
+    /// not be able to end another's session or renew/revoke another's lease by guessing its id.
+    #[must_use]
+    pub fn owns_session(&self, principal_san: &str, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .get(principal_san)
+            .is_some_and(|sid| sid == session_id)
+    }
+
     /// Snapshot of the principal→session bindings (SAN, session_id), for the read-only observe
     /// API. The console joins this onto the lease engine's session list to label sessions by SAN.
     #[must_use]
@@ -334,5 +346,16 @@ impl AppState {
     pub fn emit(&self, event: &AuditEvent) {
         self.metrics.incr(&event.action);
         self.audit.emit(event);
+    }
+
+    /// Fail-closed emit for **issuance** ops: returns `Err` if the event could not be durably
+    /// recorded, so the caller can tear down the just-issued credential and refuse — no cred is
+    /// ever handed out without an audit record.
+    ///
+    /// # Errors
+    /// [`vault_transport::audit::AuditError`] when the durable append failed.
+    pub fn try_emit(&self, event: &AuditEvent) -> Result<(), vault_transport::audit::AuditError> {
+        self.metrics.incr(&event.action);
+        self.audit.try_emit(event)
     }
 }

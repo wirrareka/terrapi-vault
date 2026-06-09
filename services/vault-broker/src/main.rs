@@ -324,21 +324,22 @@ fn load_ca(store: Vault, group: &str) -> Option<Unsealed> {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // rustls 0.23 can't auto-pick a crypto provider when both aws-lc-rs and ring are
-    // pulled in transitively (rustls server + reqwest) — it panics on first TLS use.
-    // Install aws-lc-rs explicitly, before any TLS (mTLS server, reqwest clients).
-    if rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .is_err()
-    {
-        eprintln!("vault-broker: a rustls CryptoProvider was already installed (continuing)");
-    }
-
-    let cfg = BrokerConfig::from_env();
-
+/// Fail-closed boot checks for the two insecure footguns: serving insecure-dev where it could be
+/// reachable / downgrade production, and silently defaulting the at-rest store + audit chain into
+/// a shared temp dir. Returns an error (refusing to start) rather than booting unsafely.
+fn check_boot_safety(cfg: &BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
     if cfg.allow_insecure_dev {
+        // Refuse the insecure-dev flag when mTLS material is configured: that pairing is a
+        // one-env-var production downgrade (plain HTTP + header-only identity served despite a
+        // real server cert + fleet CA being present). Pick one — dev (no TLS) or production
+        // (mTLS) — never both.
+        if cfg.tls.is_some() {
+            return Err("VAULT_ALLOW_INSECURE_DEV=1 together with VAULT_TLS_* material is refused: \
+                        it would serve plain HTTP with header-only identity while mTLS material is \
+                        configured (a production downgrade). Unset VAULT_ALLOW_INSECURE_DEV for \
+                        production, or remove VAULT_TLS_* for local dev."
+                .into());
+        }
         // Insecure dev (plain HTTP, header-only identity, all-caps `dev` principal) must never
         // be reachable off the local host. Refuse to start if it would bind a routable address.
         if !cfg.bind.ip().is_loopback() {
@@ -355,7 +356,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              auth on {}. NEVER use this outside local development; production is mTLS-over-WG.",
             cfg.bind
         );
+    } else {
+        // Production: refuse to silently place the at-rest store / audit chain in a shared,
+        // world-readable temp dir (the `from_env` dev defaults). They must be set explicitly,
+        // pointing at an encrypted dataset (see docs/broker-bootstrap.md). Fail-closed at boot.
+        for (var, what) in [
+            ("VAULT_STORE_PATH", "the at-rest secrets store (SQLCipher DB)"),
+            ("VAULT_AUDIT_PATH", "the tamper-evident audit chain"),
+        ] {
+            if std::env::var_os(var).is_none() {
+                return Err(format!(
+                    "production requires {var} to be set explicitly ({what}); refusing to default \
+                     to a shared temp dir. Point it at a path on an encrypted dataset, or set \
+                     VAULT_ALLOW_INSECURE_DEV=1 for local runs."
+                )
+                .into());
+            }
+        }
     }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // rustls 0.23 can't auto-pick a crypto provider when both aws-lc-rs and ring are
+    // pulled in transitively (rustls server + reqwest) — it panics on first TLS use.
+    // Install aws-lc-rs explicitly, before any TLS (mTLS server, reqwest clients).
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_err()
+    {
+        eprintln!("vault-broker: a rustls CryptoProvider was already installed (continuing)");
+    }
+
+    let cfg = BrokerConfig::from_env();
+
+    check_boot_safety(&cfg)?;
     eprintln!(
         "vault-broker {} starting: bind={} residency_group={} node={} audit={}",
         env!("CARGO_PKG_VERSION"),
@@ -375,6 +411,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState::new(cfg, seal, audit);
     if let Some(task) = ship_task {
         tokio::spawn(audit_ship::run(task));
+    }
+
+    // Boot reconciliation: the lease ledger is in-memory, so after a crash/restart any backend
+    // user a prior incarnation of THIS node created is an orphan (no owning lease) — which would
+    // otherwise outlive its short TTL forever. Run it in the BACKGROUND (the HTTP calls are
+    // timeout-bounded) so a slow/unreachable OpenSearch can't delay the broker from binding +
+    // serving; best-effort, retried on the next restart.
+    {
+        let recon_state = state.clone();
+        tokio::spawn(async move {
+            let n = recon_state.engines.reconcile_all().await;
+            eprintln!(
+                "vault-broker: boot reconcile complete ({n} orphaned backend user(s) removed)"
+            );
+        });
     }
 
     // Arm (a): if boot re-sealed the master under a rotated root, signal it now that the audit

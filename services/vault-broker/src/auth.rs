@@ -97,12 +97,25 @@ impl Capability {
     }
 }
 
+/// Privileged SSH principals an ssh-sign role may NEVER mint unless its `ssh_principals` allowlist
+/// names them explicitly — so a role left without an allowlist still cannot be coaxed into signing
+/// a superuser cert. Lowercase exact match (SSH principals are case-sensitive; these are the
+/// conventional privileged accounts).
+const DANGEROUS_SSH_PRINCIPALS: &[&str] = &["root", "admin", "administrator", "sudo", "wheel"];
+
 /// A registered principal: the role name a SAN maps to + its granted capabilities. Loaded
 /// from the roles config (`VAULT_ROLES_CONFIG`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct RolePrincipal {
     pub role: String,
     pub caps: HashSet<Capability>,
+    /// Optional SSH principal allowlist — the cert subject principals (usernames / hostnames)
+    /// this role may request in `POST /v1/{group}/ssh/sign`. When `Some`, every requested
+    /// principal must be an exact member, so an `ssh-sign` role cannot mint a cert for an
+    /// arbitrary user/host (e.g. `root`). When absent, no constraint (legacy) — production roles
+    /// SHOULD set it (see coordination/conventions/secrets-broker.md).
+    #[serde(default)]
+    pub ssh_principals: Option<Vec<String>>,
 }
 
 /// The verified client-cert SAN, injected as a request extension by the TLS accept loop
@@ -117,6 +130,9 @@ pub struct Principal {
     pub san: String,
     pub role: String,
     pub caps: HashSet<Capability>,
+    /// SSH principal allowlist for this role (see [`RolePrincipal::ssh_principals`]); `None` =
+    /// unconstrained (legacy / dev).
+    pub ssh_principals: Option<Vec<String>>,
 }
 
 impl Principal {
@@ -124,6 +140,21 @@ impl Principal {
     #[must_use]
     pub fn allows(&self, cap: Capability) -> bool {
         self.caps.contains(&cap)
+    }
+
+    /// Whether this role may request `requested` SSH principals. With an allowlist, every requested
+    /// principal must be an exact member. WITHOUT an allowlist (legacy / unconfigured) the role is
+    /// otherwise unconstrained EXCEPT it can never mint a [`DANGEROUS_SSH_PRINCIPALS`] one (e.g.
+    /// `root`) — so a role left unconfigured can't be tricked into signing a privileged cert. To
+    /// legitimately issue such a principal the role must list it explicitly in `ssh_principals`.
+    #[must_use]
+    pub fn allows_ssh_principals(&self, requested: &[String]) -> bool {
+        match &self.ssh_principals {
+            Some(allow) => requested.iter().all(|p| allow.contains(p)),
+            None => requested
+                .iter()
+                .all(|p| !DANGEROUS_SSH_PRINCIPALS.contains(&p.as_str())),
+        }
     }
 }
 
@@ -150,6 +181,7 @@ impl FromRequestParts<AppState> for Principal {
                 san,
                 role: rp.role,
                 caps: rp.caps,
+                ssh_principals: rp.ssh_principals,
             });
         }
 
@@ -179,12 +211,14 @@ impl FromRequestParts<AppState> for Principal {
                 san,
                 role: rp.role,
                 caps: rp.caps,
+                ssh_principals: rp.ssh_principals,
             });
         }
         Ok(Principal {
             san,
             role: "dev".to_owned(),
             caps: Capability::all(),
+            ssh_principals: None,
         })
     }
 }
@@ -213,10 +247,37 @@ mod tests {
             caps: [Capability::SshSign, Capability::Session, Capability::Leases]
                 .into_iter()
                 .collect(),
+            ssh_principals: Some(vec!["ops".into(), "deploy".into()]),
         };
         assert!(p.allows(Capability::SshSign));
         assert!(!p.allows(Capability::Creds));
         assert!(!p.allows(Capability::SshCa));
+        // SSH principal allowlist: members allowed, non-members (e.g. root) refused.
+        assert!(p.allows_ssh_principals(&["ops".into()]));
+        assert!(p.allows_ssh_principals(&["ops".into(), "deploy".into()]));
+        assert!(!p.allows_ssh_principals(&["root".into()]));
+        assert!(!p.allows_ssh_principals(&["ops".into(), "root".into()]));
+    }
+
+    #[test]
+    fn no_allowlist_still_refuses_dangerous_principals() {
+        let p = Principal {
+            san: "demon.eu.proximi.internal".into(),
+            role: "dev".into(),
+            caps: Capability::all(),
+            ssh_principals: None, // unconfigured / legacy
+        };
+        // Unconstrained for ordinary principals…
+        assert!(p.allows_ssh_principals(&["ops".into(), "svc-x".into()]));
+        // …but root/admin/etc. are refused unless explicitly allowlisted.
+        assert!(!p.allows_ssh_principals(&["root".into()]));
+        assert!(!p.allows_ssh_principals(&["ops".into(), "wheel".into()]));
+        // An explicit allowlist naming root would permit it (deliberate opt-in).
+        let q = Principal {
+            ssh_principals: Some(vec!["root".into()]),
+            ..p
+        };
+        assert!(q.allows_ssh_principals(&["root".into()]));
     }
 
     #[test]

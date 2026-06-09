@@ -250,6 +250,23 @@ fn require_unsealed(state: &AppState) -> Result<(), (StatusCode, Json<ErrorBody>
     }
 }
 
+/// Emit an issuance/sensitive-op audit event **fail-closed**: `503 audit_unavailable` if the
+/// record can't be durably written, so the op's result (a wrapped/unwrapped KEK, a presigned URL,
+/// an opened session) is never returned without a durable trace. For ops with **no** artifact to
+/// tear down on failure; `ssh_sign`/`creds` use their own teardown-aware variants.
+fn require_audit(
+    state: &AppState,
+    event: &AuditEvent,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    state.try_emit(event).map_err(|_| {
+        err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit_unavailable",
+            "operation refused: the audit record could not be durably written",
+        )
+    })
+}
+
 async fn ssh_ca(
     State(state): State<AppState>,
     principal: Principal,
@@ -329,6 +346,17 @@ async fn ssh_sign(
         }
     }
 
+    // Per-role SSH principal allowlist: a role may only mint certs for the cert subject
+    // principals it is configured for, so an `ssh-sign` role cannot request `root` or an
+    // arbitrary user/host. No-op when the role has no allowlist (legacy / dev).
+    if !principal.allows_ssh_principals(&req.principals) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "principal_not_allowed",
+            "a requested SSH principal is not in this role's allowlist",
+        ));
+    }
+
     // Every issued cred is a child of the caller's active session.
     let Some(session_id) = state.active_session(&principal.san) else {
         return Err(err(
@@ -391,19 +419,36 @@ async fn ssh_sign(
     // revocation list.
     state.record_ssh_serial(&lease_id, signed.serial);
 
-    state.emit(&AuditEvent::vault(
-        AppState::now_ts(),
-        state.cfg.node.clone(),
-        Some(state.cfg.residency_group.as_str().to_owned()),
-        system_actor(&principal),
-        "ssh.sign",
-        Target {
-            kind: "ssh-cert".into(),
-            id: Some(format!("serial={}", signed.serial)),
-        },
-        Outcome::Success,
-        None,
-    ));
+    // Fail closed: if the issuance can't be durably audited, do NOT hand the cert to the client —
+    // revoke its lease and put the serial on the KRL so the (already-minted) cert is short-lived
+    // and revoked. No credential leaves the broker without an audit record.
+    if state
+        .try_emit(&AuditEvent::vault(
+            AppState::now_ts(),
+            state.cfg.node.clone(),
+            Some(state.cfg.residency_group.as_str().to_owned()),
+            system_actor(&principal),
+            "ssh.sign",
+            Target {
+                kind: "ssh-cert".into(),
+                id: Some(format!("serial={}", signed.serial)),
+            },
+            Outcome::Success,
+            None,
+        ))
+        .is_err()
+    {
+        {
+            let mut eng = state.leases.lock().expect("lease lock");
+            let _ = eng.revoke(&lease_id);
+        }
+        record_revoked_ssh(&state, std::slice::from_ref(&lease_id));
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit_unavailable",
+            "issuance refused: the audit record could not be durably written",
+        ));
+    }
 
     Ok(Json(crate::dto::SshSignResponse {
         signed_certificate: signed.openssh,
@@ -583,19 +628,9 @@ async fn creds(
         ));
     };
 
-    state.emit(&AuditEvent::vault(
-        AppState::now_ts(),
-        state.cfg.node.clone(),
-        Some(state.cfg.residency_group.as_str().to_owned()),
-        system_actor(&principal),
-        "creds.issue",
-        Target {
-            kind: "creds".into(),
-            id: Some(format!("role={role};tenant={tenant_id};lease={lease_id}")),
-        },
-        Outcome::Success,
-        None,
-    ));
+    // Fail closed: if the issuance can't be durably audited, revoke the lease + delete the
+    // just-created backend user — no credential is returned without an audit record.
+    audit_creds_issue_or_teardown(&state, &principal, &role, &tenant_id, &lease_id).await?;
 
     Ok(Json(crate::dto::CredsResponse {
         username: issued.username,
@@ -605,6 +640,45 @@ async fn creds(
         renewable: true,
         max_ttl_secs: issued.max_ttl_secs,
     }))
+}
+
+/// Emit the `creds.issue` event fail-closed. On a durable-audit failure, revoke the lease and
+/// delete the just-created backend user, then return `503` — no credential is handed out without
+/// an audit record. `Ok(())` once the issuance is durably recorded.
+async fn audit_creds_issue_or_teardown(
+    state: &AppState,
+    principal: &Principal,
+    role: &str,
+    tenant_id: &str,
+    lease_id: &str,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let audited = state.try_emit(&AuditEvent::vault(
+        AppState::now_ts(),
+        state.cfg.node.clone(),
+        Some(state.cfg.residency_group.as_str().to_owned()),
+        system_actor(principal),
+        "creds.issue",
+        Target {
+            kind: "creds".into(),
+            id: Some(format!("role={role};tenant={tenant_id};lease={lease_id}")),
+        },
+        Outcome::Success,
+        None,
+    ));
+    if audited.is_ok() {
+        return Ok(());
+    }
+    let lid = lease_id.to_owned();
+    {
+        let mut eng = state.leases.lock().expect("lease lock");
+        let _ = eng.revoke(&lid);
+    }
+    tear_down_creds(state, principal, std::slice::from_ref(&lid)).await;
+    Err(err(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "audit_unavailable",
+        "issuance refused: the audit record could not be durably written",
+    ))
 }
 
 /// Sign a short-TTL presigned **PUT** URL for a tile archive or its manifest pointer (the publish
@@ -701,23 +775,27 @@ fn do_presign(
     let ttl = signer.clamp_ttl(req.ttl_secs);
     let (url, expires) = signer.presign(method, &key, now_unix(), ttl);
 
-    // Audit the issuance — the object key + tenant + expiry only. NEVER the URL or signature.
-    state.emit(&AuditEvent::vault(
-        AppState::now_ts(),
-        state.cfg.node.clone(),
-        Some(state.cfg.residency_group.as_str().to_owned()),
-        system_actor(principal),
-        action,
-        Target {
-            kind: "object-store".into(),
-            id: Some(format!(
-                "key={key};tenant={};expires={expires}",
-                req.tenant_id
-            )),
-        },
-        Outcome::Success,
-        None,
-    ));
+    // Audit the issuance fail-closed — the object key + tenant + expiry only. NEVER the URL or
+    // signature. A signed URL is not returned unless its issuance is durably recorded.
+    require_audit(
+        state,
+        &AuditEvent::vault(
+            AppState::now_ts(),
+            state.cfg.node.clone(),
+            Some(state.cfg.residency_group.as_str().to_owned()),
+            system_actor(principal),
+            action,
+            Target {
+                kind: "object-store".into(),
+                id: Some(format!(
+                    "key={key};tenant={};expires={expires}",
+                    req.tenant_id
+                )),
+            },
+            Outcome::Success,
+            None,
+        ),
+    )?;
 
     Ok(Json(crate::dto::PresignResponse {
         url,
@@ -979,8 +1057,13 @@ async fn kms_authorize(
     headers: &HeaderMap,
     tenant_id: &str,
 ) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    // The mTLS principal must ALWAYS hold the `kms` cap. When the kms-JWT verifier is configured
+    // (Option J) the identity-minted bearer is an ADDITIONAL per-call, per-tenant proof — not a
+    // replacement for the channel's role grant. Without this, any registered SAN holding a stolen
+    // tenant JWT could wrap/unwrap; the cap requirement keeps it to SANs explicitly granted kms.
+    require_cap(principal, Capability::Kms)?;
     let Some(verifier) = state.kms_jwt.as_ref() else {
-        return require_cap(principal, Capability::Kms);
+        return Ok(());
     };
     let token = bearer(headers).ok_or_else(|| map_jwt_err(crate::jwt::JwtError::Missing))?;
     let grant = verifier.verify(token).await.map_err(map_jwt_err)?;
@@ -1069,19 +1152,22 @@ async fn kms_wrap(
     }
     .map_err(map_kms_err)?;
 
-    state.emit(&AuditEvent::vault(
-        AppState::now_ts(),
-        state.cfg.node.clone(),
-        Some(state.cfg.residency_group.as_str().to_owned()),
-        system_actor(&principal),
-        "kms.wrap",
-        Target {
-            kind: "kms-kek".into(),
-            id: Some(format!("{group}/{tenant_id}/{key_id}")),
-        },
-        Outcome::Success,
-        None,
-    ));
+    require_audit(
+        &state,
+        &AuditEvent::vault(
+            AppState::now_ts(),
+            state.cfg.node.clone(),
+            Some(state.cfg.residency_group.as_str().to_owned()),
+            system_actor(&principal),
+            "kms.wrap",
+            Target {
+                kind: "kms-kek".into(),
+                id: Some(format!("{group}/{tenant_id}/{key_id}")),
+            },
+            Outcome::Success,
+            None,
+        ),
+    )?;
     Ok(Json(KmsWrapResponse {
         wrapped: base64::engine::general_purpose::STANDARD.encode(wrapped),
         kek_id: format!("{group}/{tenant_id}/{key_id}"),
@@ -1112,19 +1198,22 @@ async fn kms_unwrap(
     }
     .map_err(map_kms_err)?;
 
-    state.emit(&AuditEvent::vault(
-        AppState::now_ts(),
-        state.cfg.node.clone(),
-        Some(state.cfg.residency_group.as_str().to_owned()),
-        system_actor(&principal),
-        "kms.unwrap",
-        Target {
-            kind: "kms-kek".into(),
-            id: Some(format!("{group}/{tenant_id}/{key_id}")),
-        },
-        Outcome::Success,
-        None,
-    ));
+    require_audit(
+        &state,
+        &AuditEvent::vault(
+            AppState::now_ts(),
+            state.cfg.node.clone(),
+            Some(state.cfg.residency_group.as_str().to_owned()),
+            system_actor(&principal),
+            "kms.unwrap",
+            Target {
+                kind: "kms-kek".into(),
+                id: Some(format!("{group}/{tenant_id}/{key_id}")),
+            },
+            Outcome::Success,
+            None,
+        ),
+    )?;
     Ok(Json(KmsUnwrapResponse {
         dek: base64::engine::general_purpose::STANDARD.encode(dek),
     }))
@@ -1144,19 +1233,22 @@ async fn kms_rotate(
     }
     .map_err(map_kms_err)?;
 
-    state.emit(&AuditEvent::vault(
-        AppState::now_ts(),
-        state.cfg.node.clone(),
-        Some(state.cfg.residency_group.as_str().to_owned()),
-        system_actor(&principal),
-        "kms.rotate",
-        Target {
-            kind: "kms-kek".into(),
-            id: Some(format!("{group}/{tenant_id}/{key_id}")),
-        },
-        Outcome::Success,
-        None,
-    ));
+    require_audit(
+        &state,
+        &AuditEvent::vault(
+            AppState::now_ts(),
+            state.cfg.node.clone(),
+            Some(state.cfg.residency_group.as_str().to_owned()),
+            system_actor(&principal),
+            "kms.rotate",
+            Target {
+                kind: "kms-kek".into(),
+                id: Some(format!("{group}/{tenant_id}/{key_id}")),
+            },
+            Outcome::Success,
+            None,
+        ),
+    )?;
     Ok(Json(KmsRotateResponse {
         kek_id: format!("{group}/{tenant_id}/{key_id}"),
         version,
@@ -1191,19 +1283,22 @@ async fn kms_rewrap(
     }
     .map_err(map_kms_err)?;
 
-    state.emit(&AuditEvent::vault(
-        AppState::now_ts(),
-        state.cfg.node.clone(),
-        Some(state.cfg.residency_group.as_str().to_owned()),
-        system_actor(&principal),
-        "kms.rewrap",
-        Target {
-            kind: "kms-kek".into(),
-            id: Some(format!("{group}/{tenant_id}/{key_id}")),
-        },
-        Outcome::Success,
-        None,
-    ));
+    require_audit(
+        &state,
+        &AuditEvent::vault(
+            AppState::now_ts(),
+            state.cfg.node.clone(),
+            Some(state.cfg.residency_group.as_str().to_owned()),
+            system_actor(&principal),
+            "kms.rewrap",
+            Target {
+                kind: "kms-kek".into(),
+                id: Some(format!("{group}/{tenant_id}/{key_id}")),
+            },
+            Outcome::Success,
+            None,
+        ),
+    )?;
     Ok(Json(KmsWrapResponse {
         wrapped: base64::engine::general_purpose::STANDARD.encode(wrapped_out),
         kek_id: format!("{group}/{tenant_id}/{key_id}"),
@@ -1276,24 +1371,68 @@ async fn session_open(
         .idle_timeout_secs
         .unwrap_or(DEFAULT_SESSION_IDLE_SECS)
         .clamp(1, ttl);
+    // One active session per principal: if this SAN already has one, end it (cascade-revoke its
+    // child leases + tear down their backend users) before opening the replacement. Otherwise the
+    // superseded session and its creds would linger live until TTL/idle expiry.
+    if let Some(prev) = state.active_session(&principal.san) {
+        let revoked = {
+            let mut eng = state.leases.lock().expect("lease lock");
+            eng.end_session(&prev).unwrap_or_default()
+        };
+        state.unbind_session(&prev);
+        tear_down_creds(&state, &principal, &revoked).await;
+        record_revoked_ssh(&state, &revoked);
+        state.emit(&AuditEvent::vault(
+            AppState::now_ts(),
+            state.cfg.node.clone(),
+            Some(state.cfg.residency_group.as_str().to_owned()),
+            system_actor(&principal),
+            "session.end",
+            Target {
+                kind: "session".into(),
+                id: Some(prev),
+            },
+            Outcome::Success,
+            None,
+        ));
+    }
     let id = {
         let mut eng = state.leases.lock().expect("lease lock");
         eng.open_session(now_unix(), ttl, idle)
     };
     state.bind_session(&principal.san, &id);
-    state.emit(&AuditEvent::vault(
-        AppState::now_ts(),
-        state.cfg.node.clone(),
-        Some(state.cfg.residency_group.as_str().to_owned()),
-        system_actor(&principal),
-        "session.open",
-        Target {
-            kind: "session".into(),
-            id: Some(id.clone()),
-        },
-        Outcome::Success,
-        None,
-    ));
+    // Fail closed: a session is the parent of every issued credential, so one that can't be
+    // durably recorded must not enable issuance. End + unbind the just-opened (child-less) session
+    // and refuse. (The rebind teardown above is a revocation — fail-safe — so it stays best-effort.)
+    if require_audit(
+        &state,
+        &AuditEvent::vault(
+            AppState::now_ts(),
+            state.cfg.node.clone(),
+            Some(state.cfg.residency_group.as_str().to_owned()),
+            system_actor(&principal),
+            "session.open",
+            Target {
+                kind: "session".into(),
+                id: Some(id.clone()),
+            },
+            Outcome::Success,
+            None,
+        ),
+    )
+    .is_err()
+    {
+        {
+            let mut eng = state.leases.lock().expect("lease lock");
+            let _ = eng.end_session(&id);
+        }
+        state.unbind_session(&id);
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit_unavailable",
+            "session refused: the audit record could not be durably written",
+        ));
+    }
     Ok(Json(SessionOpenResponse {
         session_id: id,
         ttl_secs: ttl,
@@ -1308,6 +1447,15 @@ async fn session_end(
 ) -> ApiResult<SessionEndResponse> {
     require_cap(&principal, Capability::Session)?;
     require_unsealed(&state)?;
+    // Ownership: a principal may only end its OWN active session. Reject anything else as
+    // not-found (don't reveal whether another principal's session id exists).
+    if !state.owns_session(&principal.san, &id) {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "no_such_session",
+            "no such session for this principal",
+        ));
+    }
     let revoked = {
         let mut eng = state.leases.lock().expect("lease lock");
         eng.end_session(&id)
@@ -1337,6 +1485,29 @@ async fn session_end(
     }))
 }
 
+/// Ownership gate for a lease op: the lease must be a child of the caller's own active session.
+/// `404 no_such_lease` if the lease is unknown OR belongs to another principal — the two are
+/// deliberately indistinguishable so a `leases`-capped principal can't probe for others' lease ids.
+fn require_lease_owner(
+    state: &AppState,
+    principal: &Principal,
+    lease_id: &str,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let parent = {
+        let id = lease_id.to_owned(); // LeaseEngine::lease takes &LeaseId (&String)
+        let eng = state.leases.lock().expect("lease lock");
+        eng.lease(&id).map(|l| l.parent_session.clone())
+    };
+    match parent {
+        Some(p) if state.owns_session(&principal.san, &p) => Ok(()),
+        _ => Err(err(
+            StatusCode::NOT_FOUND,
+            "no_such_lease",
+            "no such lease for this principal",
+        )),
+    }
+}
+
 async fn lease_renew(
     State(state): State<AppState>,
     principal: Principal,
@@ -1344,6 +1515,7 @@ async fn lease_renew(
 ) -> ApiResult<LeaseRenewResponse> {
     require_cap(&principal, Capability::Leases)?;
     require_unsealed(&state)?;
+    require_lease_owner(&state, &principal, &req.lease_id)?;
     let ttl = {
         let mut eng = state.leases.lock().expect("lease lock");
         eng.renew(now_unix(), &req.lease_id, req.increment_secs)
@@ -1362,6 +1534,7 @@ async fn lease_revoke(
 ) -> ApiResult<Ack> {
     require_cap(&principal, Capability::Leases)?;
     require_unsealed(&state)?;
+    require_lease_owner(&state, &principal, &req.lease_id)?;
     let lease_id = req.lease_id;
     {
         let mut eng = state.leases.lock().expect("lease lock");
@@ -1407,6 +1580,39 @@ mod tests {
         assert!(!is_uuid_v4_lower("11111111-1111-4111-c111-111111111111")); // bad variant
         assert!(!is_uuid_v4_lower("11111111-1111-4111-8111-11111111111A")); // uppercase
         assert!(!is_uuid_v4_lower("short"));
+    }
+
+    #[test]
+    fn session_and_lease_ownership_is_enforced() {
+        let state = dev_state(crate::config::Hardening::default());
+        // Principal A opens a session (bound to its SAN) and issues a lease under it.
+        let sid = {
+            let mut e = state.leases.lock().unwrap();
+            e.open_session(now_unix(), 3600, 1800)
+        };
+        state.bind_session("san-a", &sid);
+        let lease = {
+            let mut e = state.leases.lock().unwrap();
+            e.issue_lease(now_unix(), &sid, 900, 900, true).unwrap()
+        };
+        // owns_session: A yes, B no.
+        assert!(state.owns_session("san-a", &sid));
+        assert!(!state.owns_session("san-b", &sid));
+
+        let principal = |san: &str| Principal {
+            san: san.into(),
+            role: "dev".into(),
+            caps: Capability::all(),
+            ssh_principals: None,
+        };
+        // A may renew/revoke its lease; B is rejected as not-found (no existence leak).
+        assert!(require_lease_owner(&state, &principal("san-a"), &lease).is_ok());
+        let e = require_lease_owner(&state, &principal("san-b"), &lease).unwrap_err();
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
+        assert_eq!(e.1 .0.error, "no_such_lease");
+        // An unknown lease id is likewise not-found.
+        let e = require_lease_owner(&state, &principal("san-a"), "no-such").unwrap_err();
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
     }
 
     struct NullSink;
@@ -1471,6 +1677,7 @@ mod tests {
             RolePrincipal {
                 role: "demon-system".into(),
                 caps: [Capability::SshSign].into_iter().collect(),
+                ssh_principals: None,
             },
         );
         let state = prod_state(roles);

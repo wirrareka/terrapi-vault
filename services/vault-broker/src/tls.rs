@@ -22,9 +22,19 @@ use rustls::{RootCertStore, ServerConfig};
 use std::io::{self, BufReader};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
+
+/// Bound a TLS handshake: a peer that connects but stalls the handshake must not pin a task
+/// forever. Generous for a WG RTT; a real client completes in well under this.
+const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+/// Ceiling on concurrently-served connections. Bounds task/FD growth from a flood of slow or
+/// looping handshakes (defence in depth on top of the WG-only exposure). New connections over
+/// the cap are dropped at accept rather than spawned.
+const MAX_CONCURRENT_CONNS: usize = 512;
 
 /// Serve `app` over mTLS until a shutdown signal. Each accepted connection must present a
 /// client cert signed by the Root CA in `tls.client_ca`; its SAN is injected as a
@@ -37,6 +47,7 @@ pub async fn serve(listener: TcpListener, app: Router, tls: &TlsPaths) -> io::Re
     let acceptor = TlsAcceptor::from(Arc::new(config));
     eprintln!("vault-broker: mTLS termination active (client-cert required vs Root CA)");
 
+    let conn_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNS));
     let mut shutdown = Box::pin(tokio::signal::ctrl_c());
     loop {
         tokio::select! {
@@ -46,9 +57,18 @@ pub async fn serve(listener: TcpListener, app: Router, tls: &TlsPaths) -> io::Re
             }
             accepted = listener.accept() => {
                 let (tcp, _peer) = accepted?;
+                // At the connection cap → drop the new TCP conn rather than spawn unboundedly.
+                let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
+                    eprintln!("vault-broker: connection cap ({MAX_CONCURRENT_CONNS}) reached; dropping new connection");
+                    drop(tcp);
+                    continue;
+                };
                 let acceptor = acceptor.clone();
                 let app = app.clone();
-                tokio::spawn(async move { serve_conn(acceptor, app, tcp).await });
+                tokio::spawn(async move {
+                    let _permit = permit; // released when the connection ends
+                    serve_conn(acceptor, app, tcp).await;
+                });
             }
         }
     }
@@ -56,8 +76,14 @@ pub async fn serve(listener: TcpListener, app: Router, tls: &TlsPaths) -> io::Re
 
 /// Handle one connection: complete the handshake, lift the verified SAN, serve requests.
 async fn serve_conn(acceptor: TlsAcceptor, app: Router, tcp: tokio::net::TcpStream) {
-    let Ok(stream) = acceptor.accept(tcp).await else {
-        return; // handshake failed (no/invalid client cert) — drop the connection
+    // Bound the handshake so a peer that stalls mid-handshake can't pin this task forever.
+    let accept = tokio::time::timeout(
+        Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+        acceptor.accept(tcp),
+    )
+    .await;
+    let Ok(Ok(stream)) = accept else {
+        return; // handshake failed (no/invalid client cert) or timed out — drop the connection
     };
     // Extract the verified peer SAN before the stream is moved into the hyper IO.
     let san = {
@@ -120,15 +146,27 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
         .ok_or_else(|| format!("no private key in {}", path.display()))
 }
 
-/// First DNS SAN of a DER-encoded X.509 cert (the daemon identity → role key).
+/// The single DNS SAN of a DER-encoded X.509 cert (the daemon identity → role key). Fleet client
+/// certs MUST carry exactly one `dNSName` SAN: with several, which one is "the identity" is
+/// ambiguous and the role mapping becomes unpredictable, so this fails closed (returns `None` →
+/// no `ClientSan` extension → the principal extractor 401s) rather than silently picking one.
 fn san_from_cert(der: &[u8]) -> Option<String> {
     use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
     let (_, cert) = X509Certificate::from_der(der).ok()?;
     let san = cert.subject_alternative_name().ok()??;
-    san.value.general_names.iter().find_map(|gn| match gn {
+    let mut dns = san.value.general_names.iter().filter_map(|gn| match gn {
         GeneralName::DNSName(d) => Some((*d).to_owned()),
         _ => None,
-    })
+    });
+    let first = dns.next()?;
+    if dns.next().is_some() {
+        eprintln!(
+            "vault-broker: client cert presents multiple dNSName SANs — refusing (fleet certs \
+             must carry exactly one SAN so the role mapping is unambiguous)"
+        );
+        return None;
+    }
+    Some(first)
 }
 
 #[cfg(test)]
@@ -141,6 +179,17 @@ mod tests {
             .unwrap();
         let san = san_from_cert(ck.cert.der());
         assert_eq!(san.as_deref(), Some("demon.eu.proximi.internal"));
+    }
+
+    #[test]
+    fn multi_san_cert_is_refused() {
+        // A cert with two dNSName SANs is ambiguous for role mapping → no SAN derived.
+        let ck = rcgen::generate_simple_self_signed(vec![
+            "demon.eu.proximi.internal".to_string(),
+            "other.eu.proximi.internal".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(san_from_cert(ck.cert.der()), None);
     }
 
     #[test]
