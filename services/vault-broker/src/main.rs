@@ -334,11 +334,13 @@ fn check_boot_safety(cfg: &BrokerConfig) -> Result<(), Box<dyn std::error::Error
         // real server cert + fleet CA being present). Pick one — dev (no TLS) or production
         // (mTLS) — never both.
         if cfg.tls.is_some() {
-            return Err("VAULT_ALLOW_INSECURE_DEV=1 together with VAULT_TLS_* material is refused: \
+            return Err(
+                "VAULT_ALLOW_INSECURE_DEV=1 together with VAULT_TLS_* material is refused: \
                         it would serve plain HTTP with header-only identity while mTLS material is \
                         configured (a production downgrade). Unset VAULT_ALLOW_INSECURE_DEV for \
                         production, or remove VAULT_TLS_* for local dev."
-                .into());
+                    .into(),
+            );
         }
         // Insecure dev (plain HTTP, header-only identity, all-caps `dev` principal) must never
         // be reachable off the local host. Refuse to start if it would bind a routable address.
@@ -361,7 +363,10 @@ fn check_boot_safety(cfg: &BrokerConfig) -> Result<(), Box<dyn std::error::Error
         // world-readable temp dir (the `from_env` dev defaults). They must be set explicitly,
         // pointing at an encrypted dataset (see docs/broker-bootstrap.md). Fail-closed at boot.
         for (var, what) in [
-            ("VAULT_STORE_PATH", "the at-rest secrets store (SQLCipher DB)"),
+            (
+                "VAULT_STORE_PATH",
+                "the at-rest secrets store (SQLCipher DB)",
+            ),
             ("VAULT_AUDIT_PATH", "the tamper-evident audit chain"),
         ] {
             if std::env::var_os(var).is_none() {

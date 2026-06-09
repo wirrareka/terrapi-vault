@@ -184,7 +184,10 @@ async fn auth_callback(
         eprintln!("vault-console: OIDC callback state not bound to this browser (login-CSRF?)");
         return (
             AppendHeaders([(header::SET_COOKIE, cleared_auth_binding_cookie())]),
-            (StatusCode::BAD_REQUEST, "auth state not bound to this browser"),
+            (
+                StatusCode::BAD_REQUEST,
+                "auth state not bound to this browser",
+            ),
         )
             .into_response();
     }

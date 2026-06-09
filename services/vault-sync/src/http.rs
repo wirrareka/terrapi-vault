@@ -146,7 +146,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sync/{vault_id}/pull", get(pull))
         .route("/v1/sync/{vault_id}/status", get(status))
         .route("/v1/sync/{vault_id}/devices", get(list_devices))
-        .route("/v1/sync/{vault_id}/devices/{device_id}", delete(revoke_device))
+        .route(
+            "/v1/sync/{vault_id}/devices/{device_id}",
+            delete(revoke_device),
+        )
         .route("/v1/sync/{vault_id}/tail", get(tail))
         // Per-route so metrics run after routing and see the `MatchedPath` template (id-free).
         .route_layer(axum::middleware::from_fn_with_state(
@@ -729,8 +732,7 @@ async fn revoke_device(
             "device_id is empty or exceeds the length limit",
         ));
     }
-    let caller =
-        auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"").await?;
+    let caller = auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"").await?;
     // Refuse to revoke the LAST remaining device — that would lock the vault out of all signing
     // (a new device could only return via the passphrase enrol path). A compromised device can
     // still revoke its siblings (any device is the single user in this model), but never strand
