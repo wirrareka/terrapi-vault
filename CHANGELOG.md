@@ -3,7 +3,7 @@
 terrapi-vault — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
-## Unreleased — security hardening (2026-06-09)
+## 0.1.11 (2026-06-09) — security hardening
 
 Multi-agent security analysis (`docs/security/security-analysis-2026-06-09.md`) → a phased
 remediation across the lib + all services. No data-model or wire-breaking changes; the broker
