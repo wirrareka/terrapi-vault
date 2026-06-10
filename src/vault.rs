@@ -221,6 +221,46 @@ impl Vault {
         })
     }
 
+    /// Open a SECOND, **read-only** handle to an already-open vault, for running
+    /// heavy read queries (full-vault export, search, history) off the UI thread
+    /// without contending with the primary connection. Pass a clone of the live
+    /// DEK from [`Self::derived_key`].
+    ///
+    /// The connection is opened with `PRAGMA query_only = ON`, so any write is
+    /// rejected at the SQL layer (`Error::Db`) instead of mutating the vault — a
+    /// `Repository` built over this handle runs its read paths safely while a
+    /// stray write fails closed rather than applying. No migrations run and the
+    /// meta sidecar is not rewritten: the vault is assumed already opened +
+    /// migrated by the primary handle. WAL is joined automatically (the primary
+    /// connection set it), so committed writes from the primary are visible.
+    ///
+    /// The returned `Vault`'s `Connection` is **not `Send`** — open it ON the
+    /// thread that will use it (e.g. inside a background task), not on the owner
+    /// thread and then moved.
+    ///
+    /// # Errors
+    /// [`Error::EncryptionUnavailable`] if SQLCipher is absent,
+    /// [`Error::MetaMissing`]/[`Error::MetaInvalid`] for sidecar problems,
+    /// [`Error::WrongPassphrase`] if the DEK does not match, otherwise
+    /// [`Error::Db`]/[`Error::Io`].
+    pub fn open_read_only<P: AsRef<Path>>(
+        path: P,
+        key: SecretBox<DerivedKey>,
+    ) -> Result<Self> {
+        let vault_path = path.as_ref().to_path_buf();
+        let meta_path = meta_path_for(&vault_path);
+        // Same early sidecar validation as `open_with_key`.
+        let _meta = StoredMeta::read(&meta_path)?;
+        let conn = open_keyed_read_only(&vault_path, &key)?;
+        verify_key(&conn)?;
+        Ok(Self {
+            conn,
+            key,
+            vault_path,
+            meta_path,
+        })
+    }
+
     /// A clone of the current data-encryption key (DEK), in a zeroizing handle.
     ///
     /// In the v2 format this is the random DEK — the actual SQLCipher key —
@@ -649,6 +689,36 @@ fn open_keyed(path: &Path, key: &SecretBox<DerivedKey>) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Like [`open_keyed`] but for a **read-only** secondary connection: applies the
+/// SQLCipher key + the same memory-safety pragmas, a decrypted-page cache for
+/// fast scans, then `query_only = ON`. It deliberately does NOT set
+/// `journal_mode`/`synchronous` (those are writes; the primary connection
+/// already put the file in WAL, which a reader joins automatically).
+fn open_keyed_read_only(path: &Path, key: &SecretBox<DerivedKey>) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    let cipher = conn.query_row("PRAGMA cipher_version", [], |r| r.get::<_, String>(0));
+    if !matches!(&cipher, Ok(v) if !v.trim().is_empty()) {
+        return Err(Error::EncryptionUnavailable);
+    }
+    let literal = key.expose_secret().pragma_literal();
+    conn.pragma_update(None, "key", literal.as_str())
+        .map_err(map_cipher_err)?;
+    conn.pragma_update(None, "cipher_memory_security", "ON")
+        .map_err(map_cipher_err)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")
+        .map_err(map_cipher_err)?;
+    // ~16 MiB decrypted page cache (negative = KiB), matching the primary
+    // connection's tuning so a big-vault export scan stays in memory.
+    conn.pragma_update(None, "cache_size", -16000_i64)
+        .map_err(map_cipher_err)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // Belt-and-braces: forbid any data-changing statement on this handle. WAL
+    // /-shm read housekeeping is still permitted (it is not a DB change).
+    conn.pragma_update(None, "query_only", "ON")
+        .map_err(map_cipher_err)?;
+    Ok(conn)
+}
+
 /// Where a `rotate_key` stages the new sidecar before committing it: `<meta>.rekeying`.
 fn rekey_staging_path(meta_path: &Path) -> PathBuf {
     let mut s = meta_path.as_os_str().to_owned();
@@ -944,6 +1014,48 @@ mod tests {
             .unwrap();
         assert_eq!(x, 42);
         assert_eq!(v.schema_version().unwrap(), 1);
+    }
+
+    #[test]
+    fn read_only_handle_reads_committed_data_and_rejects_writes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        let mut primary = Vault::create(&path, "pw", p()).unwrap();
+        primary
+            .with_connection(|c| c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (7);"))
+            .unwrap();
+
+        // A second, read-only handle opened with a clone of the live DEK sees
+        // the committed row...
+        let ro = Vault::open_read_only(&path, primary.derived_key()).unwrap();
+        let x: i64 = ro
+            .with_connection(|c| c.query_row("SELECT x FROM t", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(x, 7);
+
+        // ...but any write fails closed (query_only), never mutating the vault.
+        let write = ro.with_connection(|c| c.execute("INSERT INTO t VALUES (8)", []));
+        assert!(write.is_err(), "query_only must reject the write");
+
+        // A write the primary makes AFTER the read handle opened is still
+        // visible to it (WAL: committed writes reach new reads).
+        primary
+            .with_connection(|c| c.execute("INSERT INTO t VALUES (9)", []))
+            .unwrap();
+        let max: i64 = ro
+            .with_connection(|c| c.query_row("SELECT MAX(x) FROM t", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(max, 9);
+    }
+
+    #[test]
+    fn read_only_handle_rejects_a_wrong_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        Vault::create(&path, "pw", p()).unwrap().lock();
+        let bogus = SecretBox::new(Box::new(DerivedKey::from_bytes([0u8; crate::KEY_LEN])));
+        let err = Vault::open_read_only(&path, bogus).unwrap_err();
+        assert!(matches!(err, Error::WrongPassphrase), "got {err:?}");
     }
 
     #[test]
