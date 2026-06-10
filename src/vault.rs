@@ -633,6 +633,12 @@ fn open_keyed(path: &Path, key: &SecretBox<DerivedKey>) -> Result<Connection> {
     // our raw-key path but documented in the format spec).
     conn.pragma_update(None, "cipher_memory_security", "ON")
         .map_err(map_cipher_err)?;
+    // Keep transient sort/group/VACUUM spill material in memory, never in a
+    // plaintext `etilqs_*` temp file on disk (Sec-L2). The bundled SQLCipher is
+    // usually compiled with SQLITE_TEMP_STORE=2 already; this makes it explicit
+    // and belt-and-braces against a build that isn't.
+    conn.pragma_update(None, "temp_store", "MEMORY")
+        .map_err(map_cipher_err)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(map_cipher_err)?;
