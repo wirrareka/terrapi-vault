@@ -12,7 +12,7 @@ jobs:
   lib-msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Install Rust 1.83 (the lib MSRV floor)
         # SHA-pinned (supply-chain). The exact toolchain comes from rust-toolchain.toml (root pins
         # 1.83), which dtolnay/rust-toolchain reads when invoked by SHA — no `toolchain:` input.
@@ -30,7 +30,7 @@ jobs:
   lib-neutrality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
       - name: Assert no platform/networking deps in the lib tree
         run: |
@@ -51,7 +51,7 @@ jobs:
       run:
         working-directory: services
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Install Rust 1.91.1 (services build toolchain)
         # SHA-pinned; the toolchain comes from services/rust-toolchain.toml (1.91.1).
         uses: dtolnay/rust-toolchain@ba6e37b9b9af502effa9a8e8d218bc68ac8ea564 # 1.91.1
