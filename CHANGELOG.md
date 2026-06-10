@@ -3,6 +3,18 @@
 terrapi-vault — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
+## 0.1.12 (2026-06-10)
+
+Follow-ups landed after the v0.1.11 cut:
+
+- **security (lib, Sec-L2):** keyed SQLCipher connections set `PRAGMA temp_store = MEMORY`, so
+  temp B-trees / spill data from queries on the encrypted store stay in memory and are never
+  written to a plaintext temp file on disk.
+- **ci:** `actions/setup-node` bumped v4 → v5 (Node 24 runtime; clears the Node 20 deprecation
+  warning in the console SPA-build jobs); dropped the redundant `dtolnay/rust-toolchain`
+  `toolchain:` input (the SHA-pinned action reads `rust-toolchain.toml`); rustfmt the v0.1.11
+  hardening changes.
+
 ## 0.1.11 (2026-06-09) — security hardening
 
 Multi-agent security analysis (`docs/security/security-analysis-2026-06-09.md`) → a phased
