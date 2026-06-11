@@ -3,10 +3,14 @@
 terrapi-vault — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
-## 0.1.12 (2026-06-10)
+## 0.1.12 (2026-06-11)
 
 Follow-ups landed after the v0.1.11 cut:
 
+- **feat (lib, D1):** `Vault::open_read_only(path, dek)` — a second SQLCipher handle keyed with a
+  clone of the live DEK and opened `PRAGMA query_only = ON`, for running heavy read queries
+  (full-vault export, search, history) off the UI thread without contending with the primary
+  connection. WAL-joined so committed writes from the primary stay visible; writes fail closed.
 - **security (lib, Sec-L2):** keyed SQLCipher connections set `PRAGMA temp_store = MEMORY`, so
   temp B-trees / spill data from queries on the encrypted store stay in memory and are never
   written to a plaintext temp file on disk.
