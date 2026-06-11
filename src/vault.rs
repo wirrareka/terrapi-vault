@@ -243,10 +243,7 @@ impl Vault {
     /// [`Error::MetaMissing`]/[`Error::MetaInvalid`] for sidecar problems,
     /// [`Error::WrongPassphrase`] if the DEK does not match, otherwise
     /// [`Error::Db`]/[`Error::Io`].
-    pub fn open_read_only<P: AsRef<Path>>(
-        path: P,
-        key: SecretBox<DerivedKey>,
-    ) -> Result<Self> {
+    pub fn open_read_only<P: AsRef<Path>>(path: P, key: SecretBox<DerivedKey>) -> Result<Self> {
         let vault_path = path.as_ref().to_path_buf();
         let meta_path = meta_path_for(&vault_path);
         // Same early sidecar validation as `open_with_key`.
