@@ -1017,7 +1017,7 @@ mod tests {
     fn read_only_handle_reads_committed_data_and_rejects_writes() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
-        let mut primary = Vault::create(&path, "pw", p()).unwrap();
+        let primary = Vault::create(&path, "pw", p()).unwrap();
         primary
             .with_connection(|c| c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (7);"))
             .unwrap();
