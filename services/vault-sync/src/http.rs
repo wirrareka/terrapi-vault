@@ -343,7 +343,7 @@ async fn enroll_challenge(
     // This is the only fully-unauthenticated endpoint and it hands back enrolment salt+params,
     // so rate-limit it to blunt offline-dictionary harvesting and account-existence probing.
     // (A TLS-terminating proxy does per-IP limiting in front; this is the in-process backstop.)
-    if !state.challenge_rl.allow() {
+    if !state.challenge_rl.allow(&vault_id) {
         return Err(err(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
@@ -377,7 +377,7 @@ async fn create_account(
     // Unauthenticated surface (only a self-signed proof): rate-limit so an attacker can't cheaply
     // mass-create accounts (disk-fill) or flood the replay-nonce guard. Shared with the challenge
     // bucket; a TLS proxy does per-IP limiting in front, this is the in-process backstop.
-    if !state.enroll_rl.allow() {
+    if !state.enroll_rl.allow(&vault_id) {
         return Err(err(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
@@ -463,7 +463,7 @@ async fn enroll(
 ) -> Result<(StatusCode, Json<Ack>), ErrResp> {
     // Unauthenticated surface (proof + self-signed key only): rate-limit like /account so device
     // enrolment can't be used to flood the account/nonce state.
-    if !state.enroll_rl.allow() {
+    if !state.enroll_rl.allow(&vault_id) {
         return Err(err(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
