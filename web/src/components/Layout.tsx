@@ -59,7 +59,7 @@ export function AppLayout() {
         <div className="flex items-center gap-2 border-b px-5 py-4">
           <Lock className="h-5 w-5" />
           <div className="flex-1 leading-tight">
-            <div className="text-sm font-semibold tracking-tight">vault-console</div>
+            <div className="text-sm font-semibold tracking-tight">vesta-console</div>
             <div className="text-xs text-muted-foreground">
               {group ? `${group} group` : "operator view"}
             </div>

@@ -1,5 +1,5 @@
 [package]
-name = "terrapi-vault"
+name = "terrapi-vesta"
 version = "0.1.0"
 edition = "2021"
 # The deliberate MSRV floor (matches rust-toolchain.toml + the services workspace); the lib is
@@ -7,9 +7,9 @@ edition = "2021"
 rust-version = "1.83"
 description = "Terrapi shared encrypted-at-rest SQLCipher vault: Argon2id KDF, key rotation, documented on-disk format. Adopted by memento (notes) and probe (API client); vault files are binary-compatible across apps."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/terrapi/terrapi-vault"
-homepage = "https://github.com/terrapi/terrapi-vault"
-documentation = "https://docs.rs/terrapi-vault"
+repository = "https://github.com/terrapi/terrapi-vesta"
+homepage = "https://github.com/terrapi/terrapi-vesta"
+documentation = "https://docs.rs/terrapi-vesta"
 readme = "README.md"
 keywords = ["sqlcipher", "encryption", "argon2", "vault", "sqlite"]
 categories = ["cryptography", "database"]

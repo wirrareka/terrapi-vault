@@ -1,4 +1,4 @@
-# pf snippet — terrapi-vault broker ingress is WG-only. Apply on the HOST.
+# pf snippet — terrapi-vesta broker ingress is WG-only. Apply on the HOST.
 #
 # The broker binds its WG /32 INSIDE the jail:
 #   :8200  broker API   — mTLS-over-WireGuard vs the fleet Root CA (daemon auth)
@@ -13,7 +13,7 @@
 # --- macros (set per host) ---
 wg_if      = "wg0"            # the residency-group WG interface
 ext_if     = "vtnet0"        # public NIC — the broker gets NO inbound here
-jail_ip    = "10.200.0.101"  # vault-broker jail address on the WG mesh (eu example)
+jail_ip    = "10.200.0.101"  # vesta-broker jail address on the WG mesh (eu example)
 api_port   = "8200"
 metrics_port = "8201"
 prom_ip    = "10.200.0.10"   # the on-box Prometheus jail (scrapes :8201)

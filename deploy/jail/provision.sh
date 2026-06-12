@@ -1,5 +1,5 @@
 #!/bin/sh
-# provision.sh — host-side helper to stand up a terrapi-vault broker jail.
+# provision.sh — host-side helper to stand up a terrapi-vesta broker jail.
 # Wraps the Bastillefile with the per-group arg + the dataset delegation that
 # bastille templates can't express. Run as root on the bastille host.
 #
@@ -32,8 +32,8 @@ bastille zfs "${JAIL}" jail "${DATASET}" 2>/dev/null || \
     echo "    (delegate manually if your bastille lacks 'zfs ... jail')"
 
 echo "==> copying binary into jail (build per deploy/build.sh first)"
-[ -f "${HERE}/jail/usr/local/sbin/vault-broker" ] || \
-    echo "    WARN: place the built binary at deploy/jail/usr/local/sbin/vault-broker before templating"
+[ -f "${HERE}/jail/usr/local/sbin/vesta-broker" ] || \
+    echo "    WARN: place the built binary at deploy/jail/usr/local/sbin/vesta-broker before templating"
 
 echo "==> applying Bastillefile template"
 bastille template "${JAIL}" "${HERE}/jail" --arg GROUP="${GROUP}"
@@ -41,4 +41,4 @@ bastille template "${JAIL}" "${HERE}/jail" --arg GROUP="${GROUP}"
 echo "==> NEXT (inside jail): run deploy/install.sh ${GROUP} to lay config + enable + start"
 echo "    bastille console ${JAIL}"
 echo "==> firewall: apply deploy/security/pf.conf.snippet on the HOST (WG-only to :8200/:8201)"
-echo "==> verify: bastille cmd ${JAIL} /usr/local/etc/terrapi-vault-deploy/check-encryption.sh ${DATASET} /var/db/terrapi-vault"
+echo "==> verify: bastille cmd ${JAIL} /usr/local/etc/terrapi-vesta-deploy/check-encryption.sh ${DATASET} /var/db/terrapi-vesta"

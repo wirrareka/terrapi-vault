@@ -43,7 +43,7 @@ jobs:
           fi
           echo "lib dependency tree is neutral ✓"
 
-  # The services workspace (vault-broker / vault-sync / vault-transport): its own
+  # The services workspace (vesta-broker / vesta-sync / vesta-transport): its own
   # toolchain (1.91.1), separate from the lib. Lives under services/.
   services:
     runs-on: ubuntu-latest

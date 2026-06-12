@@ -18,8 +18,8 @@ export const MOCK = import.meta.env.VITE_MOCK === "1";
 
 // Fixed clock so relative-expiry rendering is stable in tests.
 const NOW = 1_780_000_000;
-const B1 = "vault-eu-1";
-const B2 = "vault-eu-2";
+const B1 = "vesta-eu-1";
+const B2 = "vesta-eu-2";
 const T1 = "11111111-1111-4111-8111-111111111111";
 const T2 = "22222222-2222-4222-8222-222222222222";
 

@@ -481,7 +481,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "terrapi-vault"
+name = "terrapi-vesta"
 version = "0.1.0"
 dependencies = [
  "argon2",

@@ -1984,7 +1984,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "terrapi-vault"
+name = "terrapi-vesta"
 version = "0.1.0"
 dependencies = [
  "argon2",
@@ -2297,7 +2297,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
-name = "vault-broker"
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "version_check"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vesta-broker"
 version = "0.1.12"
 dependencies = [
  "async-trait",
@@ -2318,18 +2330,18 @@ dependencies = [
  "serde_json",
  "sha2",
  "ssh-key",
- "terrapi-vault",
+ "terrapi-vesta",
  "thiserror 1.0.69",
  "time",
  "tokio",
  "tokio-rustls",
  "tower",
- "vault-transport",
+ "vesta-transport",
  "x509-parser",
 ]
 
 [[package]]
-name = "vault-console"
+name = "vesta-console"
 version = "0.1.12"
 dependencies = [
  "axum",
@@ -2345,10 +2357,11 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "tokio",
+ "vesta-transport",
 ]
 
 [[package]]
-name = "vault-sync"
+name = "vesta-sync"
 version = "0.1.12"
 dependencies = [
  "axum",
@@ -2359,17 +2372,17 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "terrapi-vault",
+ "terrapi-vesta",
  "thiserror 1.0.69",
  "time",
  "tokio",
  "tokio-tungstenite",
  "tower",
- "vault-transport",
+ "vesta-transport",
 ]
 
 [[package]]
-name = "vault-transport"
+name = "vesta-transport"
 version = "0.1.12"
 dependencies = [
  "serde",
@@ -2377,18 +2390,6 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
 ]
-
-[[package]]
-name = "vcpkg"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
-
-[[package]]
-name = "version_check"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "walkdir"

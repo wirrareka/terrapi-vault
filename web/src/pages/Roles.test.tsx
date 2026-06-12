@@ -9,7 +9,7 @@ vi.mock("@/hooks/use-observe", () => ({
     data: {
       roles: [
         {
-          broker: "vault-eu-1",
+          broker: "vesta-eu-1",
           san: "demon-operator.eu.proximi.internal",
           role: "demon-operator",
           caps: ["ssh-sign", "session"],

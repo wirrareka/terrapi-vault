@@ -1,0 +1,51 @@
+# terrapi-vesta broker — email-first alert rules. HAND TO INFRA (monitoring-infra).
+#
+# Matches the fleet's email-first model (observability-email-first.md). Per-group
+# instances (vault-eu / vault-uae) — label every series with residency_group so
+# routing + dashboards stay group-local (no cross-residency).
+#
+# Severity: critical => page-by-email immediately; warning => digest.
+# Metric names are the contract the broker exposes on its metrics listener
+# (VESTA_METRICS_BIND, e.g. 10.200.0.101:8201, WG-only). Confirm against /metrics.
+# Today the broker exports: `vault_sealed` (gauge) and
+# `vault_audit_events_total{action=...}` (counter). The encryption gauge is fed
+# by deploy/zfs/check-encryption.sh via a node_exporter textfile collector.
+
+groups:
+  - name: vesta-broker
+    rules:
+      # --- broker SEALED (can't issue — every mutating op 503s) ---
+      - alert: VaultBrokerSealed
+        expr: vault_sealed == 1
+        for: 5m
+        labels: { severity: critical, service: vesta-broker, channel: email }
+        annotations:
+          summary: "vesta-broker SEALED on {{ $labels.residency_group }}"
+          description: "Broker has no master key — SSH-CA / creds / KMS all 503. Check the encrypted dataset is unlocked + the unseal passphrase. Unblocks demon + identity + aether."
+
+      # --- broker scrape down (process/jail/WG down) ---
+      - alert: VaultBrokerDown
+        expr: up{job="vesta-broker"} == 0
+        for: 5m
+        labels: { severity: critical, service: vesta-broker, channel: email }
+        annotations:
+          summary: "vesta-broker unreachable on {{ $labels.residency_group }}"
+          description: "Metrics scrape failing — broker process/jail/WG down. The fleet's secrets boundary is offline."
+
+      # --- encryption-at-rest OFF (CRITICAL) — fed by check-encryption.sh textfile ---
+      - alert: VaultBrokerEncryptionOff
+        expr: vault_dataset_encrypted == 0
+        for: 0m
+        labels: { severity: critical, service: vesta-broker, channel: email }
+        annotations:
+          summary: "Encryption-at-rest OFF on vesta-broker-{{ $labels.residency_group }}"
+          description: "Crown-jewel dataset NOT encrypted/unlocked correctly. SSH-CA key + KMS KEKs at risk. Page now."
+
+      # --- issuance dried up (possible upstream/auth breakage) — tune per traffic ---
+      - alert: VaultBrokerNoIssuance
+        expr: sum by (residency_group) (increase(vault_audit_events_total{action=~"ssh.sign|creds.issue|kms.wrap"}[30m])) == 0
+        for: 30m
+        labels: { severity: warning, service: vesta-broker, channel: email }
+        annotations:
+          summary: "No brokered issuance for 30m on vesta-broker-{{ $labels.residency_group }}"
+          description: "No ssh.sign/creds.issue/kms.wrap in 30m. Expected during quiet hours; investigate if consumers are active (403 storm? sealed? cert mismatch?)."

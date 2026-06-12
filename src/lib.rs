@@ -21,9 +21,9 @@
 //! ## Quick start
 //!
 //! ```no_run
-//! use terrapi_vault::{Vault, KdfParams};
+//! use terrapi_vesta::{Vault, KdfParams};
 //!
-//! # fn main() -> terrapi_vault::Result<()> {
+//! # fn main() -> terrapi_vesta::Result<()> {
 //! // First run: create the vault.
 //! let vault = Vault::create("notes.terrapi", "correct horse battery staple",
 //!                           KdfParams::default())?;

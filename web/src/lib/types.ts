@@ -1,6 +1,6 @@
 // Console API types — mirror the broker observe DTOs (spec/broker-openapi.yaml 1.4.0) with a
 // per-broker `broker` tag added by the console's fan-out aggregator. The console backend
-// (services/vault-console — not yet built; pending infra port + identity OIDC) implements
+// (services/vesta-console — not yet built; pending infra port + identity OIDC) implements
 // /api/v1/* by calling each broker's /v1/.../observe/* over mTLS and tagging results by broker.
 // Raw broker types can be regenerated with `pnpm gen:api` (→ broker-openapi.d.ts).
 

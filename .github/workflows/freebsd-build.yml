@@ -1,6 +1,6 @@
 name: FreeBSD build smoke
 
-# Build the vault-broker on the medina FreeBSD builder (the same `runner-fbsd`
+# Build the vesta-broker on the medina FreeBSD builder (the same `runner-fbsd`
 # mechanism kalista uses), NOT vmactions/freebsd-vm. The broker lives in the
 # `services/` workspace and path-deps the root `terrapi-vault` lib crate.
 
@@ -42,14 +42,14 @@ jobs:
       - name: Sync source into the FreeBSD VM
         run: |
           set -euo pipefail
-          ssh runner-fbsd 'mkdir -p build/terrapi-vault'
+          ssh runner-fbsd 'mkdir -p build/terrapi-vesta'
           # target/ + services/target/ live in the VM (cargo cache persists).
           rsync -az --delete \
             --exclude '/target' \
             --exclude '/services/target' \
             --exclude '/.git' \
             -e ssh \
-            ./ runner-fbsd:build/terrapi-vault/
+            ./ runner-fbsd:build/terrapi-vesta/
 
       - name: cargo build --release on the FreeBSD VM
         run: |
@@ -60,8 +60,8 @@ jobs:
             # /usr/local/bin (pkg cmake/pkgconf/cc) is not on PATH by default —
             # cargo build scripts (aws-lc-rs, bundled SQLCipher) need it.
             export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:"$HOME/.cargo/bin"
-            cd "$HOME/build/terrapi-vault/services"
-            cargo build --release -p vault-broker
-            ls -l target/release/vault-broker
-            file target/release/vault-broker || true
+            cd "$HOME/build/terrapi-vesta/services"
+            cargo build --release -p vesta-broker
+            ls -l target/release/vesta-broker
+            file target/release/vesta-broker || true
           '

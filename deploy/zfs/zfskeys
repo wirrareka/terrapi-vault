@@ -5,8 +5,8 @@
 # BEFORE:  vault_broker
 # KEYWORD: shutdown
 #
-# Load the ZFS-native-encryption key for the terrapi-vault crown-jewel dataset
-# and mount it BEFORE vault-broker starts. The dataset holds (all mode-0600):
+# Load the ZFS-native-encryption key for the terrapi-vesta crown-jewel dataset
+# and mount it BEFORE vesta-broker starts. The dataset holds (all mode-0600):
 #   - the at-rest store       store.sqlcipher  (SSH-CA signing key + KMS KEKs)
 #   - the unseal passphrase   unseal.pass
 #   - backend secrets         secrets/os-admin.pass
@@ -25,7 +25,7 @@
 # Enable (inside the jail's /etc/rc.conf):
 #   zfskeys_enable="YES"
 #   zfskeys_dataset="zroot/terrapi/vault"
-#   zfskeys_keylocation="file:///root/.zfskeys/terrapi-vault.key"  # off-pool
+#   zfskeys_keylocation="file:///root/.zfskeys/terrapi-vesta.key"  # off-pool
 
 . /etc/rc.subr
 
@@ -36,7 +36,7 @@ load_rc_config $name
 : ${zfskeys_enable:="NO"}
 # ASSUMPTION (confirm with operator): dataset path + jail-visible mountpoint.
 : ${zfskeys_dataset:="zroot/terrapi/vault"}
-: ${zfskeys_mountpoint:="/var/db/terrapi-vault"}
+: ${zfskeys_mountpoint:="/var/db/terrapi-vesta"}
 # Keysource MUST be off this pool. Operator overrides per host.
 : ${zfskeys_keylocation:="prompt"}
 
@@ -66,7 +66,7 @@ zfskeys_start() {
 
 zfskeys_stop() {
     # Unmount + unload on shutdown so the key isn't resident in a powered-down
-    # box (disk theft / RMA threat model). vault-broker is stopped first (BEFORE).
+    # box (disk theft / RMA threat model). vesta-broker is stopped first (BEFORE).
     zfs unmount "${zfskeys_dataset}" 2>/dev/null
     zfs unload-key "${zfskeys_dataset}" 2>/dev/null
     echo "zfskeys: ${zfskeys_dataset} unmounted + key unloaded."

@@ -26,9 +26,9 @@ const RECOVERY_SLOT: &str = "recovery";
 /// # Example
 ///
 /// ```no_run
-/// use terrapi_vault::{Vault, KdfParams};
+/// use terrapi_vesta::{Vault, KdfParams};
 ///
-/// # fn main() -> terrapi_vault::Result<()> {
+/// # fn main() -> terrapi_vesta::Result<()> {
 /// let v = Vault::create("notes.terrapi", "correct horse", KdfParams::default())?;
 /// v.with_connection(|c| {
 ///     c.execute_batch("CREATE TABLE note(id INTEGER PRIMARY KEY, body TEXT);")

@@ -1,12 +1,12 @@
 #!/bin/sh
-# install.sh — terrapi-vault broker operator runbook + idempotent installer (run
+# install.sh — terrapi-vesta broker operator runbook + idempotent installer (run
 # INSIDE the jail, as root). Canonical install ORDER — read top to bottom.
 #
 #   ./install.sh eu
 #   ./install.sh uae
 #
 # Pre-req: the jail exists (deploy/jail/provision.sh), the binary is built
-# (deploy/build.sh) and present at /usr/local/sbin/vault-broker, and infra has
+# (deploy/build.sh) and present at /usr/local/sbin/vesta-broker, and infra has
 # delivered: the server mTLS cert/key, the fleet Root CA bundle, and the
 # audit-writer/OpenSearch-admin secret.
 #
@@ -14,7 +14,7 @@
 #   1) least-privilege user/dirs (also done by Bastillefile; idempotent)
 #   2) zfs key   -> unlock the encrypted dataset BEFORE the broker
 #   3) secrets   -> unseal.pass + os-admin.pass onto the dataset (mode 600)
-#   4) config    -> vault-broker.env (0600) + roles.json (0600) + tls/
+#   4) config    -> vesta-broker.env (0600) + roles.json (0600) + tls/
 #   5) rc enable -> zfskeys + vault_broker = YES
 #   6) start     -> service zfskeys start ; service vault_broker start
 set -eu
@@ -22,16 +22,16 @@ set -eu
 GROUP="${1:?usage: install.sh <eu|uae>}"
 HERE="$(cd "$(dirname "$0")" && pwd)"          # deploy/
 DATASET="${DATASET:-zroot/terrapi/vault}"
-DATA="/var/db/terrapi-vault"
-ETC="/usr/local/etc/terrapi-vault"
+DATA="/var/db/terrapi-vesta"
+ETC="/usr/local/etc/terrapi-vesta"
 
-echo "=== terrapi-vault broker install — group=${GROUP} ==="
+echo "=== terrapi-vesta broker install — group=${GROUP} ==="
 
 # --- step 1: least-privilege + user/dirs + rc.d exec wrapper ----------------
 sh "${HERE}/security/least-privilege.sh"
 # Install the rc.d exec wrapper (sources the env drop-in, execs the broker).
 install -d -m 755 /usr/local/libexec
-install -m 755 "${HERE}/libexec/vault-broker-run" /usr/local/libexec/vault-broker-run
+install -m 755 "${HERE}/libexec/vesta-broker-run" /usr/local/libexec/vesta-broker-run
 
 # --- step 2: unlock the encrypted dataset and verify (NEVER run sealed in prod) ---
 echo "--> unlocking encrypted dataset ${DATASET}"
@@ -61,9 +61,9 @@ chown vault:vault "${DATA}/unseal.pass"; chmod 600 "${DATA}/unseal.pass"
 # --- step 4: config + roles + tls -------------------------------------------
 install -d -m 755 "${ETC}" "${ETC}/tls"
 # env + roles are 0640 root:vault — the broker reads them as the vault user.
-if [ ! -s "${ETC}/vault-broker.env" ]; then
-    install -m 640 -o root -g vault "${HERE}/vault-broker.env.sample" "${ETC}/vault-broker.env"
-    echo "--> wrote ${ETC}/vault-broker.env from sample — EDIT it (group, WG IP, OS URL)."
+if [ ! -s "${ETC}/vesta-broker.env" ]; then
+    install -m 640 -o root -g vault "${HERE}/vesta-broker.env.sample" "${ETC}/vesta-broker.env"
+    echo "--> wrote ${ETC}/vesta-broker.env from sample — EDIT it (group, WG IP, OS URL)."
 fi
 if [ ! -s "${ETC}/roles.json" ]; then
     install -m 640 -o root -g vault "${HERE}/roles.json.sample" "${ETC}/roles.json"
@@ -72,7 +72,7 @@ fi
 echo "    REQUIRED: ${ETC}/tls/{server.pem,server.key,fleet-root-ca.pem} from infra."
 [ -f "${ETC}/tls/server.pem" ] && [ -f "${ETC}/tls/fleet-root-ca.pem" ] || \
     echo "    WARN: TLS material missing — the broker refuses to start in prod without it."
-# The broker reads VAULT_TLS_KEY as the `vault` user → the key MUST be vault-readable.
+# The broker reads VESTA_TLS_KEY as the `vault` user → the key MUST be vault-readable.
 # root-owned + group-readable (0640 root:vault): vault reads, cannot overwrite.
 if [ -f "${ETC}/tls/server.key" ]; then
     chown root:vault "${ETC}/tls/server.key"; chmod 0640 "${ETC}/tls/server.key"
@@ -87,12 +87,12 @@ sysrc vault_broker_enable=YES
 service vault_broker start
 sleep 1
 service vault_broker status || true
-echo "--> readiness: curl -s http://\$VAULT_METRICS_BIND/metrics | grep vault_sealed  (expect 0)"
+echo "--> readiness: curl -s http://\$VESTA_METRICS_BIND/metrics | grep vault_sealed  (expect 0)"
 
 cat <<'RUNBOOK'
 
 === RUNBOOK ===
-* UNSEAL (boot): the broker reads VAULT_UNSEAL_PASSPHRASE_FILE at start. If it
+* UNSEAL (boot): the broker reads VESTA_UNSEAL_PASSPHRASE_FILE at start. If it
   boots SEALED, every mutating op 503s — check the dataset is unlocked and the
   passphrase file is correct. `GET /v1/sys/seal-status` shows {sealed:false} when ready.
 

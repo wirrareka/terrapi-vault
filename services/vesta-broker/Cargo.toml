@@ -1,0 +1,43 @@
+[package]
+name = "vesta-broker"
+description = "Svet A: proximi.io network secrets broker (Path A) — mTLS-over-WG daemon-auth, SSH signed-cert CA, leased OpenSearch/RethinkDB creds, session-bound leases, B3 audit (source:vault). Per residency group."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "vesta-broker"
+path = "src/main.rs"
+
+[dependencies]
+terrapi-vesta.workspace = true
+vesta-transport.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+secrecy.workspace = true
+tokio.workspace = true
+axum.workspace = true
+time.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+x509-parser.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tower.workspace = true
+ssh-key.workspace = true
+rand.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+jsonwebtoken.workspace = true
+chacha20poly1305.workspace = true
+base64.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+rcgen.workspace = true
+
+[lints]
+workspace = true

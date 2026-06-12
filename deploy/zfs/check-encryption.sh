@@ -1,16 +1,16 @@
 #!/bin/sh
-# check-encryption.sh — contract check: the terrapi-vault crown-jewel dataset is
+# check-encryption.sh — contract check: the terrapi-vesta crown-jewel dataset is
 # ZFS-native-encrypted, unlocked, and mounted at the expected mountpoint, and the
 # unseal passphrase is present + mode-600.
 #
 # Run on the host (or inside the jail with zfs visibility). Exit 0 = pass. Wire
 # into the boot self-check AND the "encryption-at-rest=off" alert
-# (deploy/alerts/vault-broker-alerts.yml). A FAIL here is a CRITICAL page: the
+# (deploy/alerts/vesta-broker-alerts.yml). A FAIL here is a CRITICAL page: the
 # SSH-CA signing key + KMS KEKs would be sitting in cleartext.
 set -eu
 
 DATASET="${1:-zroot/terrapi/vault}"
-EXPECT_MOUNT="${2:-/var/db/terrapi-vault}"
+EXPECT_MOUNT="${2:-/var/db/terrapi-vesta}"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 

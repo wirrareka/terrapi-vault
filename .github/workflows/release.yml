@@ -1,12 +1,12 @@
 name: Release
 
-# Build the vault-broker release artifact(s) and publish to GitHub Releases on a
+# Build the vesta-broker release artifact(s) and publish to GitHub Releases on a
 # tag. FreeBSD (the medina production target) is built on the `runner-fbsd`
 # builder (NOT vmactions); Linux is built natively on medina.
 #
 # Artifacts (per target):
-#   vault-broker-<version>-<target>.tar.gz        — binary + deploy/ + LICENSE-*
-#   vault-broker-<version>-<target>.tar.gz.sha256
+#   vesta-broker-<version>-<target>.tar.gz        — binary + deploy/ + LICENSE-*
+#   vesta-broker-<version>-<target>.tar.gz.sha256
 #
 # Release assets do NOT count against the Actions artifact quota (we never use
 # upload-artifact), so this mirrors kalista's quota-bypass pattern.
@@ -80,13 +80,13 @@ jobs:
       - name: Sync source into the FreeBSD VM
         run: |
           set -euo pipefail
-          ssh runner-fbsd 'mkdir -p build/terrapi-vault'
+          ssh runner-fbsd 'mkdir -p build/terrapi-vesta'
           rsync -az --delete \
             --exclude '/target' \
             --exclude '/services/target' \
             --exclude '/.git' \
             -e ssh \
-            ./ runner-fbsd:build/terrapi-vault/
+            ./ runner-fbsd:build/terrapi-vesta/
 
       - name: Build + package on the FreeBSD VM
         env:
@@ -99,17 +99,17 @@ jobs:
             set -eu
             : "${VERSION:?VERSION not set on VM session}"
             export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:"$HOME/.cargo/bin"
-            cd "$HOME/build/terrapi-vault/services"
-            cargo build --release -p vault-broker
-            ls -l target/release/vault-broker
-            file target/release/vault-broker || true
-            cd "$HOME/build/terrapi-vault"
+            cd "$HOME/build/terrapi-vesta/services"
+            cargo build --release -p vesta-broker
+            ls -l target/release/vesta-broker
+            file target/release/vesta-broker || true
+            cd "$HOME/build/terrapi-vesta"
             TARGET="x86_64-unknown-freebsd"
-            STAGING="vault-broker-${VERSION}-${TARGET}"
+            STAGING="vesta-broker-${VERSION}-${TARGET}"
             rm -rf "$STAGING" "${STAGING}.tar.gz" "${STAGING}.tar.gz.sha256"
             mkdir -p "$STAGING"
-            cp -v services/target/release/vault-broker "$STAGING/vault-broker"
-            [ -s "$STAGING/vault-broker" ] || { echo "::error::staged binary missing/empty"; exit 1; }
+            cp -v services/target/release/vesta-broker "$STAGING/vesta-broker"
+            [ -s "$STAGING/vesta-broker" ] || { echo "::error::staged binary missing/empty"; exit 1; }
             cp LICENSE-APACHE LICENSE-MIT README.md "$STAGING/" || true
             # Ship the whole deploy/ module alongside the binary (rc.d, install.sh,
             # zfs, security, env/roles samples) so the host has everything.
@@ -127,16 +127,16 @@ jobs:
           VERSION: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          STAGING="vault-broker-${VERSION}-x86_64-unknown-freebsd"
+          STAGING="vesta-broker-${VERSION}-x86_64-unknown-freebsd"
           rsync -az -e ssh \
-            "runner-fbsd:build/terrapi-vault/${STAGING}.tar.gz" \
-            "runner-fbsd:build/terrapi-vault/${STAGING}.tar.gz.sha256" \
+            "runner-fbsd:build/terrapi-vesta/${STAGING}.tar.gz" \
+            "runner-fbsd:build/terrapi-vesta/${STAGING}.tar.gz.sha256" \
             ./
 
       - name: Verify packaged tarball on host
         run: |
-          ls -l vault-broker-*-x86_64-unknown-freebsd.tar.gz
-          sz=$(stat -c%s vault-broker-*-x86_64-unknown-freebsd.tar.gz)
+          ls -l vesta-broker-*-x86_64-unknown-freebsd.tar.gz
+          sz=$(stat -c%s vesta-broker-*-x86_64-unknown-freebsd.tar.gz)
           echo "host tarball size: ${sz} bytes"
           [ "$sz" -gt 2000000 ] || { echo "::error::synced FreeBSD tarball too small (${sz}B)"; exit 1; }
 
@@ -145,8 +145,8 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
-            vault-broker-*-x86_64-unknown-freebsd.tar.gz
-            vault-broker-*-x86_64-unknown-freebsd.tar.gz.sha256
+            vesta-broker-*-x86_64-unknown-freebsd.tar.gz
+            vesta-broker-*-x86_64-unknown-freebsd.tar.gz.sha256
           fail_on_unmatched_files: true
 
   linux:
@@ -169,15 +169,15 @@ jobs:
           workspaces: services
           shared-key: release-linux
       - name: Build
-        run: cargo build --release -p vault-broker
+        run: cargo build --release -p vesta-broker
         working-directory: services
       - name: Package
         run: |
           VERSION="${{ inputs.tag || github.ref_name }}"
           TARGET="x86_64-unknown-linux-gnu"
-          STAGING="vault-broker-${VERSION}-${TARGET}"
+          STAGING="vesta-broker-${VERSION}-${TARGET}"
           mkdir -p "$STAGING"
-          cp services/target/release/vault-broker "$STAGING/"
+          cp services/target/release/vesta-broker "$STAGING/"
           cp LICENSE-APACHE LICENSE-MIT README.md "$STAGING/" || true
           cp -R deploy "$STAGING/deploy"
           tar -czf "${STAGING}.tar.gz" "$STAGING"
@@ -187,11 +187,11 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
-            vault-broker-*-x86_64-unknown-linux-gnu.tar.gz
-            vault-broker-*-x86_64-unknown-linux-gnu.tar.gz.sha256
+            vesta-broker-*-x86_64-unknown-linux-gnu.tar.gz
+            vesta-broker-*-x86_64-unknown-linux-gnu.tar.gz.sha256
           fail_on_unmatched_files: true
 
-  # --- vault-console (single binary with the SPA embedded) ---------------------------------
+  # --- vesta-console (single binary with the SPA embedded) ---------------------------------
   # The SPA is built first (Node 24, infra-confirmed in the runner tool-cache) → `web/dist`,
   # then embedded via `cargo build --features embed-ui`. The FreeBSD VM has no node, so its
   # `web/dist` is built here on the Linux side and carried into the rsync.
@@ -228,15 +228,15 @@ jobs:
           workspaces: services
           shared-key: release-linux-console
       - name: Build (SPA embedded)
-        run: cargo build --release -p vault-console --features embed-ui
+        run: cargo build --release -p vesta-console --features embed-ui
         working-directory: services
       - name: Package
         run: |
           VERSION="${{ inputs.tag || github.ref_name }}"
           TARGET="x86_64-unknown-linux-gnu"
-          STAGING="vault-console-${VERSION}-${TARGET}"
+          STAGING="vesta-console-${VERSION}-${TARGET}"
           mkdir -p "$STAGING"
-          cp services/target/release/vault-console "$STAGING/"
+          cp services/target/release/vesta-console "$STAGING/"
           cp LICENSE-APACHE LICENSE-MIT "$STAGING/" || true
           cp -R deploy/console "$STAGING/deploy-console"
           tar -czf "${STAGING}.tar.gz" "$STAGING"
@@ -246,8 +246,8 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
-            vault-console-*-x86_64-unknown-linux-gnu.tar.gz
-            vault-console-*-x86_64-unknown-linux-gnu.tar.gz.sha256
+            vesta-console-*-x86_64-unknown-linux-gnu.tar.gz
+            vesta-console-*-x86_64-unknown-linux-gnu.tar.gz.sha256
           fail_on_unmatched_files: true
 
   console-freebsd:
@@ -281,14 +281,14 @@ jobs:
       - name: Sync source (incl. web/dist) into the FreeBSD VM
         run: |
           set -euo pipefail
-          ssh runner-fbsd 'mkdir -p build/terrapi-vault'
+          ssh runner-fbsd 'mkdir -p build/terrapi-vesta'
           rsync -az --delete \
             --exclude '/target' \
             --exclude '/services/target' \
             --exclude '/.git' \
             --exclude '/web/node_modules' \
             -e ssh \
-            ./ runner-fbsd:build/terrapi-vault/
+            ./ runner-fbsd:build/terrapi-vesta/
       - name: Build + package on the FreeBSD VM
         env:
           VERSION: ${{ inputs.tag || github.ref_name }}
@@ -298,18 +298,18 @@ jobs:
             set -eu
             : "${VERSION:?VERSION not set on VM session}"
             export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:"$HOME/.cargo/bin"
-            cd "$HOME/build/terrapi-vault"
+            cd "$HOME/build/terrapi-vesta"
             # rust-embed needs a pre-built web/dist (the VM has no node — it was built + rsynced).
             test -f web/dist/index.html || { echo "::error::web/dist missing on VM"; exit 1; }
             cd services
-            cargo build --release -p vault-console --features embed-ui
-            cd "$HOME/build/terrapi-vault"
+            cargo build --release -p vesta-console --features embed-ui
+            cd "$HOME/build/terrapi-vesta"
             TARGET="x86_64-unknown-freebsd"
-            STAGING="vault-console-${VERSION}-${TARGET}"
+            STAGING="vesta-console-${VERSION}-${TARGET}"
             rm -rf "$STAGING" "${STAGING}.tar.gz" "${STAGING}.tar.gz.sha256"
             mkdir -p "$STAGING"
-            cp -v services/target/release/vault-console "$STAGING/vault-console"
-            [ -s "$STAGING/vault-console" ] || { echo "::error::staged binary missing/empty"; exit 1; }
+            cp -v services/target/release/vesta-console "$STAGING/vesta-console"
+            [ -s "$STAGING/vesta-console" ] || { echo "::error::staged binary missing/empty"; exit 1; }
             cp LICENSE-APACHE LICENSE-MIT "$STAGING/" || true
             cp -R deploy/console "$STAGING/deploy-console"
             tar -czf "${STAGING}.tar.gz" "$STAGING"
@@ -323,15 +323,15 @@ jobs:
           VERSION: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          STAGING="vault-console-${VERSION}-x86_64-unknown-freebsd"
+          STAGING="vesta-console-${VERSION}-x86_64-unknown-freebsd"
           rsync -az -e ssh \
-            "runner-fbsd:build/terrapi-vault/${STAGING}.tar.gz" \
-            "runner-fbsd:build/terrapi-vault/${STAGING}.tar.gz.sha256" \
+            "runner-fbsd:build/terrapi-vesta/${STAGING}.tar.gz" \
+            "runner-fbsd:build/terrapi-vesta/${STAGING}.tar.gz.sha256" \
             ./
       - name: Verify packaged tarball on host
         run: |
-          ls -l vault-console-*-x86_64-unknown-freebsd.tar.gz
-          sz=$(stat -c%s vault-console-*-x86_64-unknown-freebsd.tar.gz)
+          ls -l vesta-console-*-x86_64-unknown-freebsd.tar.gz
+          sz=$(stat -c%s vesta-console-*-x86_64-unknown-freebsd.tar.gz)
           echo "host tarball size: ${sz} bytes"
           [ "$sz" -gt 2000000 ] || { echo "::error::synced FreeBSD console tarball too small (${sz}B)"; exit 1; }
       - name: Upload to GitHub Release
@@ -339,6 +339,6 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
-            vault-console-*-x86_64-unknown-freebsd.tar.gz
-            vault-console-*-x86_64-unknown-freebsd.tar.gz.sha256
+            vesta-console-*-x86_64-unknown-freebsd.tar.gz
+            vesta-console-*-x86_64-unknown-freebsd.tar.gz.sha256
           fail_on_unmatched_files: true
