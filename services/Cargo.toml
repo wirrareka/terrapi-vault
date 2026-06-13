@@ -54,7 +54,7 @@ tower = { version = "0.5", features = ["util"] }
 rcgen = { version = "0.13", features = ["x509-parser"] }
 # SSH signed-certificate CA (Phase 2): ed25519 CA key + OpenSSH certificate signing.
 ssh-key = { version = "0.6", features = ["ed25519", "std"] }
-rand = "0.8"
+rand = "0.9"
 # vesta-sync device auth (Svet B): raw ed25519 verification of per-request device signatures.
 ed25519-dalek = "2"
 # Dynamic-cred engines (Phase 3): async trait for backend adapters + the OpenSearch
