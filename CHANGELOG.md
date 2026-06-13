@@ -3,6 +3,26 @@
 terrapi-vesta — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
+## 0.1.13 (2026-06-13) — vault → Vesta rename + Stage-3 cutover prep
+
+The project is renamed **vault → Vesta**. This is the first deployable Stage-3 build; the live
+contract values keep `vault` (with back-compat) until the coordinated cutover completes (Stage 4).
+
+- **Rename (Stage 1/1b):** crates `terrapi-vault`→`terrapi-vesta`, `vault-{broker,console,sync,
+  transport}`→`vesta-*`; env `VAULT_*`→`VESTA_*` with a boot compat shim (legacy `VAULT_*` still
+  read); the lib type `Vault`→`Vesta` + `VaultMeta`→`VestaMeta`; web SPA, CI artifacts
+  (`vesta-broker/console-*.tar.gz`), deploy units, and docs.
+- **Data migrations (transparent, on open):** the lib `vault_schema` table → `vesta_schema`; the
+  sync DB column `vault_id` → `vesta_id` (accounts/devices/ops). Existing vaults/sync DBs migrate on
+  first open via `ALTER TABLE RENAME`, no data loss. The sync URL/wire is unchanged (only the route
+  template name + the `bad_vault_id`→`bad_vesta_id` error code).
+- **Stage-3 cutover prep (live contracts, non-breaking):**
+  - KMS JWT verifier dual-accepts `aud ∈ {vesta(primary), vault(legacy)}`.
+  - Audit B3 `source` flipped `"vault"`→`"vesta"` (consumers confirmed dual-accept / no-op).
+  - Prometheus metrics dual-emit `vault_*`+`vesta_*` (and `vault_sync_*`+`vesta_sync_*`) so dashboards
+    migrate gap-free.
+  - `roles.json.sample` dual-maps `vault-console` + `vesta-console` SANs for the cert re-mint.
+
 ## 0.1.12 (2026-06-11)
 
 Follow-ups landed after the v0.1.11 cut:
