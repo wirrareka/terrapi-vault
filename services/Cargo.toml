@@ -22,7 +22,7 @@ serde = { version = "1.0.215", features = ["derive"] }
 serde_json = { version = "1.0.133", features = ["raw_value"] }
 thiserror = "1.0.69"
 # Tamper-evident audit hash chain (SHA-256 over prev-hash ++ seq ++ event bytes).
-sha2 = "0.10"
+sha2 = "0.11"
 # HMAC-SHA256 for AWS SigV4 presigned-URL signing (object-store presign op). RustCrypto,
 # pairs with sha2 0.10.
 hmac = "0.12"
