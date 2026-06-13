@@ -6,7 +6,7 @@ were given the round-1 baseline and asked for **new** findings only. Reports:
 [`architecture.md`](architecture.md) · [`api-dx.md`](api-dx.md).
 
 **Honest framing:** round 1 was thorough, so round 2 is narrower — but it surfaced **2 real HIGH
-security issues** (verified against the code) that defeat vault's central short-TTL model, plus a
+security issues** (verified against the code) that defeat vesta's central short-TTL model, plus a
 durability gap on the audit path and a worthwhile dedup. No Critical, no round-1 regressions.
 
 ## Convergent findings (flagged by ≥2 agents)
@@ -64,7 +64,7 @@ _Verified: full tree green — root lib 32 tests, services 83 (broker 39, sync 2
   benefit (the modules are cohesive; agents rated it "tidy-up, not rescue"). Revisit if a file grows
   materially or a sub-area gains reuse value.
 - **R2-12. ✅ Lows**: KMS AEAD now binds the target tuple as AAD; key-file perms warned (both); nonce
-  length cap (`bad_nonce`); stale KMS doc comments fixed. _(Replay per-vault cap + `CredError`
+  length cap (`bad_nonce`); stale KMS doc comments fixed. _(Replay per-vesta cap + `CredError`
   pre-shaping left as low-value/speculative; single-person scope and no real adapter yet.)_
 
 ## Suggested order

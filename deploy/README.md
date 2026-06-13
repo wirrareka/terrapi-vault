@@ -8,7 +8,7 @@ per-group WireGuard mesh. Mirrors `quanto/identity/deploy/` conventions.
 - `build.sh` — build the `vesta-broker` release binary (`cargo build --release -p vesta-broker`).
 - `jail/Bastillefile` + `jail/provision.sh` — stand up the vnet jail + delegate the
   encrypted dataset.
-- `rc.d/vesta-broker` — service (unprivileged `vault` user; `REQUIRE zfskeys`).
+- `rc.d/vesta-broker` — service (unprivileged `vesta` user; `REQUIRE zfskeys`).
 - `zfs/zfskeys` — unlock the ZFS-encrypted crown-jewel dataset before the broker.
 - `zfs/check-encryption.sh` — boot/monitoring self-check (encrypted + unlocked + unseal.pass).
 - `vesta-broker.env.sample` — the env drop-in (`VESTA_*`, mode 0600, secrets from the dataset).
@@ -33,7 +33,7 @@ per-group WireGuard mesh. Mirrors `quanto/identity/deploy/` conventions.
   the client certs (`demon-operator`/`demon-system`, later `aether-backup`) already issued;
   the OpenSearch `audit-writer` secret; pf/FIM/auditd applied; `:8201` scrape.
 
-## Crown jewels (encrypted ZFS dataset `zroot/terrapi/vault` → `/var/db/terrapi-vesta`)
+## Crown jewels (encrypted ZFS dataset `zroot/terrapi/vesta` → `/var/db/terrapi-vesta`)
 - `store.sqlcipher` — the SSH-CA signing key + per-target KMS KEKs (encrypted at rest).
 - `unseal.pass` — the master-key passphrase (mode 600). Back up to the offline encrypted-USB
   store, kept **separate** from any store snapshot (a combined backup defeats at-rest crypto).

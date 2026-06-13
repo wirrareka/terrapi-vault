@@ -21,11 +21,11 @@
 //! ## Quick start
 //!
 //! ```no_run
-//! use terrapi_vesta::{Vault, KdfParams};
+//! use terrapi_vesta::{Vesta, KdfParams};
 //!
 //! # fn main() -> terrapi_vesta::Result<()> {
 //! // First run: create the vault.
-//! let vault = Vault::create("notes.terrapi", "correct horse battery staple",
+//! let vault = Vesta::create("notes.terrapi", "correct horse battery staple",
 //!                           KdfParams::default())?;
 //! vault.with_connection(|conn| {
 //!     conn.execute_batch("CREATE TABLE note(id INTEGER PRIMARY KEY, body TEXT)")
@@ -33,7 +33,7 @@
 //! vault.lock();
 //!
 //! // Later run: unlock.
-//! let vault = Vault::open("notes.terrapi", "correct horse battery staple")?;
+//! let vault = Vesta::open("notes.terrapi", "correct horse battery staple")?;
 //! # Ok(())
 //! # }
 //! ```
@@ -41,8 +41,8 @@
 //! ## Running migrations downstream
 //!
 //! Downstream crates (e.g. `memento-core`, `probe-core`) run their own
-//! migrations through [`Vault::with_connection`] /
-//! [`Vault::with_connection_mut`]; the encrypted [`rusqlite::Connection`]
+//! migrations through [`Vesta::with_connection`] /
+//! [`Vesta::with_connection_mut`]; the encrypted [`rusqlite::Connection`]
 //! is never exposed unguarded.
 //!
 //! ## Licensing
@@ -64,7 +64,7 @@ mod meta;
 #[cfg(feature = "note-export")]
 mod note_export;
 mod recovery;
-mod vault;
+mod vesta;
 
 pub use error::{Error, Result};
 pub use kdf::{
@@ -73,16 +73,16 @@ pub use kdf::{
 };
 pub use keyslot::WrappedKey;
 pub use meta::{
-    meta_path_for, KeySlot, KeySlots, MetaV2, StoredMeta, VaultMeta, CURRENT_FORMAT_VERSION,
+    meta_path_for, KeySlot, KeySlots, MetaV2, StoredMeta, VestaMeta, CURRENT_FORMAT_VERSION,
     FORMAT_VERSION, META_SUFFIX,
 };
 #[cfg(feature = "note-export")]
 pub use note_export::{export_note, import_note, ExportedNote, CONTAINER_VERSION, NOTE_MAGIC};
 pub use recovery::{RecoveryCode, RECOVERY_ENTROPY_BYTES};
-pub use vault::{RotationInputs, RotationPlan, Vault};
+pub use vesta::{RotationInputs, RotationPlan, Vesta};
 
 /// Re-export of the `rusqlite` version this crate links, so downstream
 /// crates can depend on the exact same SQLCipher/rusqlite without a
 /// version-mismatch hazard when passing the connection through
-/// [`Vault::with_connection`].
+/// [`Vesta::with_connection`].
 pub use rusqlite;

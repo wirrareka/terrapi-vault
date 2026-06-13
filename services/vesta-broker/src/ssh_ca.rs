@@ -1,7 +1,7 @@
 //! SSH signed-certificate CA (Phase 2).
 //!
 //! An ed25519 SSH CA whose private key lives in the broker's at-rest encrypted store
-//! (`terrapi_vesta::Vault`, SQLCipher) and **never leaves the broker**. On first use the
+//! (`terrapi_vesta::Vesta`, SQLCipher) and **never leaves the broker**. On first use the
 //! CA key is generated and persisted; thereafter it is loaded. The CA signs short-TTL
 //! OpenSSH certificates for daemon/operator keys (`POST /v1/{group}/ssh/sign`); its
 //! public key is the trust anchor served by `GET /v1/{group}/ssh/ca`.
@@ -12,7 +12,7 @@
 use rand::rngs::OsRng;
 use ssh_key::certificate::{Builder, CertType};
 use ssh_key::{Algorithm, LineEnding, PrivateKey, PublicKey};
-use terrapi_vesta::{rusqlite, Vault};
+use terrapi_vesta::{rusqlite, Vesta};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CaError {
@@ -54,7 +54,7 @@ impl SshCa {
     ///
     /// # Errors
     /// `Store` on a DB error; `Ssh` if a stored key cannot be parsed.
-    pub fn load_or_generate(vault: &Vault, group: &str) -> Result<Self, CaError> {
+    pub fn load_or_generate(vault: &Vesta, group: &str) -> Result<Self, CaError> {
         vault
             .with_connection(|c| {
                 c.execute_batch(
@@ -178,7 +178,7 @@ impl SshCa {
 ///
 /// # Errors
 /// `Store` on a DB error.
-pub fn record_revoked(vault: &Vault, serials: &[u64], now_ts: &str) -> Result<(), CaError> {
+pub fn record_revoked(vault: &Vesta, serials: &[u64], now_ts: &str) -> Result<(), CaError> {
     vault
         .with_connection(|c| {
             c.execute_batch(
@@ -205,7 +205,7 @@ pub fn record_revoked(vault: &Vault, serials: &[u64], now_ts: &str) -> Result<()
 ///
 /// # Errors
 /// `Store` on a DB error.
-pub fn list_revoked(vault: &Vault) -> Result<Vec<u64>, CaError> {
+pub fn list_revoked(vault: &Vesta) -> Result<Vec<u64>, CaError> {
     vault
         .with_connection(|c| {
             c.execute_batch(

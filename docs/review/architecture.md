@@ -76,7 +76,7 @@ Each finding: **Impact** · location · issue · concrete refactor.
 - `vault-sync/src/store.rs:99-100` — `create_account` does
   `b64().decode(...).unwrap_or_default()` for `enroll_salt` and `enroll_hash`. A client
   that sends a malformed `salt_b64`/`hash_b64` gets an **empty `Vec`** stored silently,
-  permanently bricking enrolment for that vault (the verifier hash becomes `[]`, so no
+  permanently bricking enrolment for that vesta (the verifier hash becomes `[]`, so no
   future device can ever pass `verify_enroll_proof`).
 - `store.rs:101/128` — `serde_json` of `KdfParams` `unwrap_or_default()` likewise hides
   serialization failure.
@@ -96,7 +96,7 @@ Each finding: **Impact** · location · issue · concrete refactor.
 
 ### 2.5 — `Op`/`StoredOp`/`seq` model is clear · GOOD (minor)
 - `vault-sync/src/dto.rs` — `Op` (client→server, no seq) vs `StoredOp { seq, #[flatten] op }`
-  (server→client) is a clean, well-documented split; `seq` is unambiguously the per-vault
+  (server→client) is a clean, well-documented split; `seq` is unambiguously the per-vesta
   pull cursor. The `i64`↔`u64` boundary conversions in `store.rs` (SQLite is i64-native)
   are defensive but verbose; a small `fn seq_to_db/db_to_seq` helper would DRY the four
   `try_from(...).unwrap_or(...)` sites and document the clamp policy once.
@@ -130,7 +130,7 @@ Each finding: **Impact** · location · issue · concrete refactor.
 
 ### 3.3 — state shape diverges appropriately · GOOD
 - `vault-broker` `AppState` carries `LeaseEngine`, `CredEngines`, `Metrics`, seal
-  `AtomicBool`; `vault-sync` `AppState` carries `Store`, `ReplayGuard`, per-vault
+  `AtomicBool`; `vault-sync` `AppState` carries `Store`, `ReplayGuard`, per-vesta
   broadcast `tails`. Both correctly wrap the `!Sync` rusqlite connection in `Arc<Mutex>`.
   Divergence here is intrinsic to the two domains — do not unify.
 
@@ -156,7 +156,7 @@ Each finding: **Impact** · location · issue · concrete refactor.
   client harness), and currently the riskiest untested path (broadcast lag → resync).
 
 ### 4.2 — Store logic is well-isolated and well-tested · GOOD
-- `vault-sync/src/store.rs` tests cover monotonic seq, dedupe, per-vault isolation,
+- `vault-sync/src/store.rs` tests cover monotonic seq, dedupe, per-vesta isolation,
   idempotent account create, malformed-payload rejection. `open_memory()` makes the store
   trivially testable. `lease.rs` is pure + clock-injected → fully unit-testable. This is
   the maintainability high-water mark of the repo; mirror it.
@@ -199,7 +199,7 @@ Each finding: **Impact** · location · issue · concrete refactor.
 1. **Stop leaking internal error strings to clients** (§2.1) — `vault-broker/src/http.rs:520,629`
    + `db_err`, `vault-sync/src/http.rs:37`. Log full, return opaque `detail`. *High.*
 2. **Fix silent base64-default in `create_account`** (§2.3) — `vault-sync/src/store.rs:99-101`.
-   Malformed input permanently bricks a vault's enrolment. Validate + `400` like the push
+   Malformed input permanently bricks a vesta's enrolment. Validate + `400` like the push
    path. *High.*
 3. **Give vault-sync request hardening** (§3.1) — extract timeout/concurrency/body
    middleware from `vault-broker/src/hardening.rs` into `vault-transport`; apply in both.

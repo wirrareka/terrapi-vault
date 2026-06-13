@@ -2,17 +2,17 @@
 //!
 //! The broker boots **sealed**: it holds no open at-rest store and every mutating op
 //! returns `503` (see `http::require_unsealed`). Unsealing = opening the broker's at-rest
-//! encrypted store (`terrapi_vesta::Vault`, SQLCipher) with the operator passphrase. The
+//! encrypted store (`terrapi_vesta::Vesta`, SQLCipher) with the operator passphrase. The
 //! store holds the SSH CA key (and, later, the lease ledger / dynamic-cred state); its
 //! SQLCipher key is derived from the passphrase with the lib's Argon2id (never
-//! re-implemented). A wrong passphrase surfaces as `Vault`'s `WrongPassphrase`.
+//! re-implemented). A wrong passphrase surfaces as `Vesta`'s `WrongPassphrase`.
 //!
 //! Unseal is operator-local at boot (passphrase via env / out of band), NOT a network
 //! endpoint — there is deliberately no `/v1/sys/unseal` route. Readiness is reported by
 //! `GET /v1/sys/seal-status`.
 
 use std::path::Path;
-use terrapi_vesta::{Error as VaultError, KdfParams, Vault};
+use terrapi_vesta::{Error as VestaError, KdfParams, Vesta};
 
 #[derive(Debug, thiserror::Error)]
 pub enum UnsealError {
@@ -31,15 +31,15 @@ pub fn unseal(
     store_path: &Path,
     passphrase: &str,
     params: KdfParams,
-) -> Result<Vault, UnsealError> {
+) -> Result<Vesta, UnsealError> {
     if store_path.exists() {
-        match Vault::open(store_path, passphrase) {
+        match Vesta::open(store_path, passphrase) {
             Ok(v) => Ok(v),
-            Err(VaultError::WrongPassphrase) => Err(UnsealError::BadPassphrase),
+            Err(VestaError::WrongPassphrase) => Err(UnsealError::BadPassphrase),
             Err(e) => Err(UnsealError::Store(e.to_string())),
         }
     } else {
-        Vault::create(store_path, passphrase, params).map_err(|e| UnsealError::Store(e.to_string()))
+        Vesta::create(store_path, passphrase, params).map_err(|e| UnsealError::Store(e.to_string()))
     }
 }
 
@@ -48,7 +48,7 @@ pub fn unseal(
 ///
 /// # Errors
 /// `Store` if the temp store cannot be created.
-pub fn unseal_dev() -> Result<Vault, UnsealError> {
+pub fn unseal_dev() -> Result<Vesta, UnsealError> {
     let path = std::env::temp_dir().join(format!(
         "vesta-broker-dev-store-{}.sqlcipher",
         std::process::id()
@@ -56,7 +56,7 @@ pub fn unseal_dev() -> Result<Vault, UnsealError> {
     // A leftover dev store from a previous run would make `create` fail.
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(terrapi_vesta::meta_path_for(&path));
-    Vault::create(&path, "dev-ephemeral", dev_params())
+    Vesta::create(&path, "dev-ephemeral", dev_params())
         .map_err(|e| UnsealError::Store(e.to_string()))
 }
 

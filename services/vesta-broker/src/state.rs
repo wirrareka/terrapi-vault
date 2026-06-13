@@ -6,7 +6,7 @@ use crate::ssh_ca::SshCa;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use terrapi_vesta::Vault;
+use terrapi_vesta::Vesta;
 use vesta_transport::audit::{AuditEvent, AuditSink};
 use vesta_transport::http::HttpMetrics;
 use vesta_transport::lease::LeaseEngine;
@@ -15,9 +15,9 @@ use vesta_transport::lease::LeaseEngine;
 pub const CREDS_DEFAULT_TTL_SECS: u64 = 900;
 
 /// The result of a successful boot-time unseal: the opened at-rest store and the SSH CA
-/// loaded from it. `Vault` owns a rusqlite connection (`!Sync`), hence the `Mutex`.
+/// loaded from it. `Vesta` owns a rusqlite connection (`!Sync`), hence the `Mutex`.
 pub struct Unsealed {
-    pub store: Vault,
+    pub store: Vesta,
     pub ssh_ca: SshCa,
 }
 
@@ -103,7 +103,7 @@ pub struct AppState {
     pub sealed: Arc<AtomicBool>,
     /// The unsealed at-rest store (SQLCipher). `None` while sealed. Holds the SSH CA key
     /// and the per-target KMS KEKs.
-    pub store: Option<Arc<Mutex<Vault>>>,
+    pub store: Option<Arc<Mutex<Vesta>>>,
     /// The SSH CA loaded for this instance's group. `None` while sealed.
     pub ssh_ca: Option<Arc<SshCa>>,
     /// Active operator session per authenticated principal (SAN → session id). Issued

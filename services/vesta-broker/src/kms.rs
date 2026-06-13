@@ -18,7 +18,7 @@
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use terrapi_vesta::{random_salt, rusqlite, Vault};
+use terrapi_vesta::{random_salt, rusqlite, Vesta};
 
 const NONCE_LEN: usize = 24; // XChaCha20-Poly1305 extended nonce
 const VER_LEN: usize = 4; // u32 LE KEK-version prefix on the wrapped blob
@@ -51,7 +51,7 @@ pub enum KmsError {
     Crypto,
 }
 
-fn ensure_table(vault: &Vault) -> Result<(), KmsError> {
+fn ensure_table(vault: &Vesta) -> Result<(), KmsError> {
     vault
         .with_connection(|c| {
             c.execute_batch(
@@ -74,7 +74,7 @@ fn ensure_table(vault: &Vault) -> Result<(), KmsError> {
 ///
 /// # Errors
 /// `Store` on a DB error.
-pub fn list_keys(vault: &Vault, group: &str) -> Result<Vec<(String, String, u32)>, KmsError> {
+pub fn list_keys(vault: &Vesta, group: &str) -> Result<Vec<(String, String, u32)>, KmsError> {
     ensure_table(vault)?;
     vault
         .with_connection(|c| {
@@ -103,7 +103,7 @@ fn gen_kek() -> [u8; 32] {
 }
 
 fn insert_kek(
-    vault: &Vault,
+    vault: &Vesta,
     g: &str,
     t: &str,
     k: &str,
@@ -125,7 +125,7 @@ fn insert_kek(
 
 /// The current (highest) KEK version for a target, creating version 1 on first use.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-fn current_kek(vault: &Vault, g: &str, t: &str, k: &str) -> Result<(u32, [u8; 32]), KmsError> {
+fn current_kek(vault: &Vesta, g: &str, t: &str, k: &str) -> Result<(u32, [u8; 32]), KmsError> {
     ensure_table(vault)?;
     let found: Option<(u32, Vec<u8>)> = vault
         .with_connection(|c| {
@@ -156,7 +156,7 @@ fn current_kek(vault: &Vault, g: &str, t: &str, k: &str) -> Result<(u32, [u8; 32
 
 /// Load a specific KEK version (for unwrapping an older blob).
 fn kek_at(
-    vault: &Vault,
+    vault: &Vesta,
     g: &str,
     t: &str,
     k: &str,
@@ -192,7 +192,7 @@ fn kek_at(
 ///
 /// # Errors
 /// `Store` on a DB error.
-pub fn rotate(vault: &Vault, group: &str, tenant_id: &str, key_id: &str) -> Result<u32, KmsError> {
+pub fn rotate(vault: &Vesta, group: &str, tenant_id: &str, key_id: &str) -> Result<u32, KmsError> {
     ensure_table(vault)?;
     let max: i64 = vault
         .with_connection(|c| {
@@ -221,7 +221,7 @@ pub fn rotate(vault: &Vault, group: &str, tenant_id: &str, key_id: &str) -> Resu
 /// `BadInput`/`Crypto` if `wrapped` doesn't authenticate under this target (see [`unwrap`]);
 /// `Store` on a DB error.
 pub fn rewrap(
-    vault: &Vault,
+    vault: &Vesta,
     group: &str,
     tenant_id: &str,
     key_id: &str,
@@ -237,7 +237,7 @@ pub fn rewrap(
 /// # Errors
 /// `Store` on a DB error; `Crypto` on an AEAD failure.
 pub fn wrap(
-    vault: &Vault,
+    vault: &Vesta,
     group: &str,
     tenant_id: &str,
     key_id: &str,
@@ -270,7 +270,7 @@ pub fn wrap(
 /// `BadInput` if too short; `Store` on a DB error; `Crypto` if the version is unknown or
 /// the KEK/nonce/tag/AAD don't authenticate (wrong target or tampered blob).
 pub fn unwrap(
-    vault: &Vault,
+    vault: &Vesta,
     group: &str,
     tenant_id: &str,
     key_id: &str,
@@ -302,7 +302,7 @@ mod tests {
     use super::*;
     use terrapi_vesta::KdfParams;
 
-    fn dev_vault(name: &str) -> (Vault, std::path::PathBuf) {
+    fn dev_vault(name: &str) -> (Vesta, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!(
             "vault-kms-test-{name}-{}.sqlcipher",
             std::process::id()
@@ -314,7 +314,7 @@ mod tests {
             t_cost: 1,
             p_cost: 1,
         };
-        let v = Vault::create(&path, "test", params).unwrap();
+        let v = Vesta::create(&path, "test", params).unwrap();
         (v, path)
     }
 

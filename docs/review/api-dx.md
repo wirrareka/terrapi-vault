@@ -109,13 +109,13 @@ The summary says "Idempotent on op_id" and the response carries `accepted`+`dupl
 is good. But the response fields are untyped beyond `integer` and there is no statement of the
 **guarantee**: that re-sending the same `op_id` is safe (same final state, counted in
 `duplicates`), that a partial batch can have both accepted and duplicate ops, and what
-`latest_seq` means relative to *this* device's view (it is the vault high-water after the
+`latest_seq` means relative to *this* device's view (it is the vesta high-water after the
 push). Clients building at-least-once push need that contract spelled out, plus a `403`
 example for the `device_mismatch` case (`http.rs:371`, currently prose at `:141`).
 
 **Improvement:** add a `PushResponse` schema with field descriptions and an idempotency note
 in the operation description: "Re-submitting an op with an `op_id` already stored is a no-op,
-returned in `duplicates`; you may safely retry a whole batch. `latest_seq` is the vault's
+returned in `duplicates`; you may safely retry a whole batch. `latest_seq` is the vesta's
 server cursor after this call — use it to advance your local pull cursor."
 
 ### M2 — No request-id / correlation id on either service
@@ -163,7 +163,7 @@ adding a code becomes a visible contract change.
 Both are `{error, detail}` (`broker dto.rs:6`, `sync dto.rs ErrorBody`) — good, but it is
 coincidental, not contractual. A client lib that talks to both would benefit from one
 documented shape. **Improvement:** state in both specs "error envelope is identical across
-vault services: `{error, detail[, request_id]}`" so a shared client error type is sanctioned.
+vesta services: `{error, detail[, request_id]}`" so a shared client error type is sanctioned.
 
 ### L2 — Wire naming is consistently snake_case — keep it, and say so
 All wire fields are snake_case (`op_id`, `latest_seq`, `vault_id`, `lease_id`, `kek_id`);

@@ -28,7 +28,7 @@ remaining item is a soft unmaintained warning.
 ## Duplicate versions (non-security, noted)
 Normal transitive duplication from different majors pinned by different deps — **not** a
 vulnerability, only a small binary-size cost: `rand 0.8/0.9`, `rand_core 0.6/0.9`,
-`rand_chacha 0.3/0.9`, `getrandom 0.2/0.3`, `hashbrown 0.14/0.17`, `thiserror 1.0/2.0`. The vault
+`rand_chacha 0.3/0.9`, `getrandom 0.2/0.3`, `hashbrown 0.14/0.17`, `thiserror 1.0/2.0`. The vesta
 crates pin the 0.8/1.0 lines; the newer copies come from transitive deps (reqwest/aws-lc-rs
 stacks). Not worth forcing unification (would constrain transitive deps for no security gain).
 

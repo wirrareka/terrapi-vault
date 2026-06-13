@@ -1,7 +1,7 @@
 # Separate workspace for the proximi.io platform / personal-sync SERVICES.
 # Deliberately NOT rooted at the repo top: the root `terrapi-vesta` lib crate keeps
 # its 1.83 MSRV floor (`../rust-toolchain.toml`) and stays dependency-neutral so
-# memento/probe are never constrained (see ../docs/planning/01-vault-as-service.md §2.1).
+# memento/probe are never constrained (see ../docs/planning/01-vesta-as-service.md §2.1).
 # Services consume the lib as a plain path dependency, NOT as a workspace member.
 [workspace]
 resolver = "2"

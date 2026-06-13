@@ -1,6 +1,6 @@
-# worklog — KMS root-of-trust chain, vault side (2026-06-02)
+# worklog — KMS root-of-trust chain, vesta side (2026-06-02)
 
-Vault's side of the identity ↔ vault KMS root-of-trust chain (locked with identity per
+Vesta's side of the identity ↔ vesta KMS root-of-trust chain (locked with identity per
 `coordination/conventions/secrets-broker.md §KMS root-of-trust`). Three pieces, shipped +
 tested, all **gated off** until identity/infra enable their side. Broker API `1.0.0 → 1.1.0`.
 Does NOT block v0.5.0; Vulture sec-1.9 (SQLCipher per-tenant DBs) is the downstream consumer.
@@ -56,7 +56,7 @@ app-layer secret. `IdentityKmsConfig` carries no secret.
 
 `spec/broker-openapi.yaml` → `1.1.0`: `kmsBearer` security scheme + per-op security on the kms
 ops, `kmsRewrap` path + `KmsRewrapRequest`. `CHANGELOG.md`, `broker-bootstrap.md`,
-`planning/01-vault-as-service.md` updated.
+`planning/01-vesta-as-service.md` updated.
 
 ## Tests
 
@@ -70,8 +70,8 @@ identity/infra enablement — see the contract.
 
 After a design round with identity (`inbox/identity/vault-kms-root-rotation-sequence.md`) that
 caught a contract conflation — "re-wrap master + ~150 DEKs" mixed (1) identity ROOT rotation
-(vault re-seals its **master key only**; KEKs + consumer DEK blobs are under the master, unchanged)
-with (2) vault's own KEK rotation (`kms.rotate`/`kms.rewrap`, identity-uninvolved) — the rotation
+(vesta re-seals its **master key only**; KEKs + consumer DEK blobs are under the master, unchanged)
+with (2) vesta's own KEK rotation (`kms.rotate`/`kms.rewrap`, identity-uninvolved) — the rotation
 handling shipped:
 - `identity_kms`: unseal response gains `current_kek_id` + `reseal_required` (serde-default →
   back-compat with pre-rotation identity); `store_sealed` is now an atomic temp+rename swap.
@@ -81,12 +81,12 @@ handling shipped:
   {old_kek_id→new_kek_id}` (at-least-once; identity dedups by `{old,new}`); handled at boot AND in
   a `reseal_watch` timer task (`VAULT_KMS_RESEAL_CHECK_SECS`, default 6 h) for a broker running
   across a rotation without restart. Identity's overlap window (current+previous root) is what
-  lets the boot unseal-with-old succeed so vault can re-seal-under-new (7-day auto-retire backstop).
+  lets the boot unseal-with-old succeed so vesta can re-seal-under-new (7-day auto-retire backstop).
 - Renamed from the contract's `kms.rewrap_complete` → **`kms.master_resealed`** (accurate: no DEK
   re-wrap on root rotation). identity fixed the CONTRACTS "~150 DEKs" wording.
 - Tests: +1 (`unseal_signals_reseal_after_root_rotation`) → broker **52**.
 
-## Pending (not vault code)
+## Pending (not vesta code)
 
 Adopt the infra-issued dot-form cert `vault.eu.proximi.internal` (clientAuth) as `VAULT_TLS_*`
 + eu seal→unseal round-trip; identity enables arm (b) mint (`/kms/v1/workload-cred`, principal-

@@ -2,12 +2,12 @@
 
 Owner decision (2026-05-29): vesta-sync v1 is a **row-level oplog**, not whole-file blob
 sync. Server-blind, device-keypair auth, per-row LWW by HLC. CRDT text-merge is Phase 4.
-See planning §5 of `01-vault-as-service.md` and the memory `vesta-sync-oplog-decision`.
+See planning §5 of `01-vesta-as-service.md` and the memory `vesta-sync-oplog-decision`.
 
 ## 0. Reality this must fit
 
 - `memento`/`probe` embed the **at-rest lib** (`terrapi-vesta`) to encrypt a local
-  SQLCipher file (+ plaintext `<vault>.meta.json` KDF sidecar, no secrets).
+  SQLCipher file (+ plaintext `<vesta>.meta.json` KDF sidecar, no secrets).
 - `memento-core` ships a `SyncProvider` trait that is **whole-file blob** today
   (`async push/pull(vault_path)`, `status()`; `LocalOnly` no-op, `GitSync` real,
   `MementoCloud` stub). **The oplog needs a NEW client provider** in memento-core — out of
@@ -19,19 +19,19 @@ See planning §5 of `01-vault-as-service.md` and the memory `vesta-sync-oplog-de
 ## 1. Roles
 
 - **Server (vesta-sync):** a dumb, signed, append-only **op store**, partitioned by
-  `vault_id`, payloads opaque. Assigns a per-vault monotonic `seq`. Never holds the vault
+  `vault_id`, payloads opaque. Assigns a per-vesta monotonic `seq`. Never holds the vesta
   key or plaintext. Runs on a mac mini / small VPS.
 - **Client (memento-core, future):** captures each local DB row change as an op, encrypts
-  the payload with a key derived from the vault key, pushes ops, pulls remote ops, applies
+  the payload with a key derived from the vesta key, pushes ops, pulls remote ops, applies
   them with per-row LWW keyed by HLC. Owns all conflict logic.
 
 ## 2. Identity & auth (server-blind)
 
-- `vault_id`: opaque public UUID for a vault's sync account. **Not** derived from the
+- `vault_id`: opaque public UUID for a vesta's sync account. **Not** derived from the
   passphrase (keeps the server blind); chosen at account creation.
-- **Enrolment secret:** derived client-side from the **vault passphrase** via Argon2id with a
+- **Enrolment secret:** derived client-side from the **vesta passphrase** via Argon2id with a
   domain-separation label distinct from the at-rest key derivation (so a leaked enrolment
-  verifier never helps derive the vault key). The server stores only an Argon2id **verifier**
+  verifier never helps derive the vesta key). The server stores only an Argon2id **verifier**
   (salt + params + hash) — it can check a new device's proof without learning the secret.
   - Tradeoff (documented): an attacker with the server DB can offline-guess a *weak*
     passphrase against the verifier. Acceptable for personal use with a strong passphrase +
@@ -55,7 +55,7 @@ Op {
 }
 ```
 
-- The server adds a per-vault **`seq: u64`** on accept — the transport pull cursor (robust
+- The server adds a per-vesta **`seq: u64`** on accept — the transport pull cursor (robust
   "give me everything after seq N", independent of clock quality). HLC is for *client*
   ordering/LWW; `seq` is for *transport* completeness.
 - **Idempotent:** an `op_id` already stored for this `vault_id` is a no-op (dedupe). Push is
@@ -117,7 +117,7 @@ ed25519 verifier (`ed25519-dalek` or reuse `ssh-key`). **No** reqwest/OpenSearch
 ## 8. Server-blind guarantees (invariants)
 
 - The server stores: `vault_id`, an Argon2 verifier, device pubkeys, opaque ops. It **never**
-  receives the vault passphrase, the vault key, or plaintext note content.
+  receives the vesta passphrase, the vesta key, or plaintext note content.
 - `encrypted_payload` is opaque bytes. `collection_id` is the only low-entropy metadata; the
   client MAY HMAC it under a vault-derived key to blind it further (recommended, documented).
 - No platform deps; no residency; not multi-tenant. If vesta-sync ever serves *tenant* data
@@ -128,8 +128,8 @@ ed25519 verifier (`ed25519-dalek` or reuse `ssh-key`). **No** reqwest/OpenSearch
 **Server — Phases 1–4 DONE.** `services/vesta-sync` is now a real axum server (was a
 print-only skeleton):
 - `store.rs` — SQLite op store via the lib's `rusqlite` (plain sqlite; payloads already E2E).
-  Accounts / devices / ops; per-vault `seq` allocation in the push transaction; idempotent
-  dedupe by `(vault_id, op_id)`; per-vault isolation. Unit-tested.
+  Accounts / devices / ops; per-vesta `seq` allocation in the push transaction; idempotent
+  dedupe by `(vault_id, op_id)`; per-vesta isolation. Unit-tested.
 - `auth.rs` — ed25519 request-signature verify (`verify_strict`), the versioned canonical
   string, the enrolment Argon2-verifier check (constant-time SHA-256), and an in-memory
   `ReplayGuard` (±300 s skew window). Unit-tested.
@@ -145,7 +145,7 @@ print-only skeleton):
 
 **WS live-tail — DONE 2026-05-29.** `GET /v1/sync/{vault_id}/tail` (axum `ws`). The upgrade
 is device-signed exactly like a GET; after it verifies, the socket streams each newly-pushed
-`StoredOp` as a JSON text frame off a per-vault `tokio::broadcast` channel (capacity 256). A
+`StoredOp` as a JSON text frame off a per-vesta `tokio::broadcast` channel (capacity 256). A
 subscriber that lags is sent `{"resync":true}` and should do a full `pull`. `push` fans the
 freshly-stored ops out via `AppState::publish`. Covered by `http::tests::
 push_notifies_tail_subscribers`. Added `axum`+`ws` / `tokio`+`sync` features.
@@ -164,7 +164,7 @@ table, backups. No FreeBSD bastille module (personal, not the broker's platform 
 
 ## Threat model — what the server learns (metadata exposure)
 
-vesta-sync is **content** server-blind: the vault key never reaches the server and
+vesta-sync is **content** server-blind: the vesta key never reaches the server and
 `encrypted_payload` is never decrypted (the server stores it as an opaque blob). But a
 server-blind oplog is **not** metadata-blind. An honest-but-curious or compromised server, or
 anyone who can read its DB, observes:
@@ -176,9 +176,9 @@ anyone who can read its DB, observes:
 | `hlc.wall_ms` | `ops` | client wall-clock at edit time (timezone/skew hints) |
 | op payload **size** | `ops.payload` length | coarse size of each change (no content) |
 | `collection_id` (cleartext) | `ops.collection_id` | which table/collection changed, unless the client HMACs it (a **MAY** today, not enforced) |
-| `vault_id` ↔ device pubkeys | `accounts`/`devices` | links a vault to its device key set |
+| `vault_id` ↔ device pubkeys | `accounts`/`devices` | links a vesta to its device key set |
 
-**Not** observable: note/field plaintext, the vault passphrase or key, the enrolment secret
+**Not** observable: note/field plaintext, the vesta passphrase or key, the enrolment secret
 (only `SHA-256` of it is stored), row contents.
 
 Accepted for the personal/single-user scope (the server is the owner's own host, TLS-fronted,

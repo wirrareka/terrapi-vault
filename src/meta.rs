@@ -35,7 +35,7 @@ pub const META_SUFFIX: &str = ".meta.json";
 /// pass) a sidecar carrying a future field it doesn't understand.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct VaultMeta {
+pub struct VestaMeta {
     /// Sidecar format version. See [`FORMAT_VERSION`].
     pub version: u32,
     /// KDF algorithm identifier. Always `"argon2id"` in v1.
@@ -48,7 +48,7 @@ pub struct VaultMeta {
     pub created_at: String,
 }
 
-impl VaultMeta {
+impl VestaMeta {
     /// Build a fresh sidecar for a newly-created vault.
     #[must_use]
     pub fn new(salt: &[u8; SALT_LEN], params: KdfParams) -> Self {
@@ -102,13 +102,13 @@ impl VaultMeta {
     /// # Errors
     ///
     /// [`Error::MetaMissing`] if absent, [`Error::Json`] if unparseable, or
-    /// the variants from [`VaultMeta::validate`].
+    /// the variants from [`VestaMeta::validate`].
     pub fn read(meta_path: &Path) -> Result<Self> {
         if !meta_path.exists() {
             return Err(Error::MetaMissing(meta_path.to_path_buf()));
         }
         let bytes = std::fs::read(meta_path)?;
-        let meta: VaultMeta = serde_json::from_slice(&bytes)?;
+        let meta: VestaMeta = serde_json::from_slice(&bytes)?;
         meta.validate()?;
         Ok(meta)
     }
@@ -124,7 +124,7 @@ impl VaultMeta {
     }
 }
 
-/// Decode a hex salt into the fixed 16-byte array. Shared by [`VaultMeta`]
+/// Decode a hex salt into the fixed 16-byte array. Shared by [`VestaMeta`]
 /// (v1) and [`KeySlot`] (v2).
 ///
 /// # Errors
@@ -167,8 +167,8 @@ fn atomic_write_json<T: Serialize>(value: &T, meta_path: &Path) -> Result<()> {
 
 /// Compute the sidecar path for a given vault path.
 #[must_use]
-pub fn meta_path_for(vault_path: &Path) -> PathBuf {
-    let mut s = vault_path.as_os_str().to_owned();
+pub fn meta_path_for(vesta_path: &Path) -> PathBuf {
+    let mut s = vesta_path.as_os_str().to_owned();
     s.push(META_SUFFIX);
     PathBuf::from(s)
 }
@@ -338,7 +338,7 @@ struct VersionPeek {
 #[derive(Debug)]
 pub enum StoredMeta {
     /// Legacy salt-derives-key sidecar.
-    V1(VaultMeta),
+    V1(VestaMeta),
     /// Current DEK key-slot sidecar.
     V2(MetaV2),
 }
@@ -368,7 +368,7 @@ impl StoredMeta {
 
         match peek.version {
             FORMAT_VERSION => {
-                let meta: VaultMeta = serde_json::from_slice(&bytes)?;
+                let meta: VestaMeta = serde_json::from_slice(&bytes)?;
                 meta.validate()?;
                 Ok(StoredMeta::V1(meta))
             }
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn roundtrip_hex_salt() {
         let salt = [0xABu8; SALT_LEN];
-        let m = VaultMeta::new(&salt, KdfParams::default());
+        let m = VestaMeta::new(&salt, KdfParams::default());
         assert_eq!(m.salt().unwrap(), salt);
         assert_eq!(m.salt_hex.len(), SALT_LEN * 2);
     }
@@ -440,7 +440,7 @@ mod tests {
     fn validate_rejects_out_of_range_kdf_params() {
         // A tampered sidecar pinning an absurd Argon2 memory cost must be refused before any
         // derive attempts a multi-TiB allocation.
-        let mut m = VaultMeta::new(&[0u8; SALT_LEN], KdfParams::default());
+        let mut m = VestaMeta::new(&[0u8; SALT_LEN], KdfParams::default());
         m.kdf_params.m_cost_kib = u32::MAX;
         assert!(matches!(m.validate(), Err(Error::MetaInvalid(_))));
     }
@@ -449,19 +449,19 @@ mod tests {
     fn deserialize_rejects_unknown_field() {
         // `deny_unknown_fields`: a future/garbage field is a hard error, never silently dropped.
         let json = r#"{"version":1,"kdf":"argon2id","kdf_params":{"m_cost_kib":65536,"t_cost":2,"p_cost":1},"salt_hex":"00112233445566778899aabbccddeeff","created_at":"x","surprise":true}"#;
-        assert!(serde_json::from_str::<VaultMeta>(json).is_err());
+        assert!(serde_json::from_str::<VestaMeta>(json).is_err());
     }
 
     #[test]
     fn rejects_future_version() {
-        let mut m = VaultMeta::new(&[0u8; SALT_LEN], KdfParams::default());
+        let mut m = VestaMeta::new(&[0u8; SALT_LEN], KdfParams::default());
         m.version = FORMAT_VERSION + 1;
         assert!(matches!(m.validate(), Err(Error::UnsupportedFormat { .. })));
     }
 
     #[test]
     fn rejects_unknown_kdf() {
-        let mut m = VaultMeta::new(&[0u8; SALT_LEN], KdfParams::default());
+        let mut m = VestaMeta::new(&[0u8; SALT_LEN], KdfParams::default());
         m.kdf = "scrypt".into();
         assert!(matches!(m.validate(), Err(Error::MetaInvalid(_))));
     }
@@ -512,7 +512,7 @@ mod tests {
 
         // v1 file → StoredMeta::V1
         let p1 = dir.path().join("one.meta.json");
-        VaultMeta::new(&[1u8; SALT_LEN], KdfParams::default())
+        VestaMeta::new(&[1u8; SALT_LEN], KdfParams::default())
             .write(&p1)
             .unwrap();
         assert!(matches!(StoredMeta::read(&p1).unwrap(), StoredMeta::V1(_)));

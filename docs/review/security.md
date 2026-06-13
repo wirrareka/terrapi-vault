@@ -28,7 +28,7 @@ unlimited accounts; the `tails` map and `ReplayGuard.seen` grow with attacker-ch
 
 **S3. Self-signed account/enrol = TOFU with no binding to the human** —
 `http.rs:226-262`, `316-355`. The first device is accepted on a self-signature over a key
-chosen in the same request; only `enroll` (not `account`) is proof-gated, so vault ownership
+chosen in the same request; only `enroll` (not `account`) is proof-gated, so vesta ownership
 is first-come-first-served. **Fix:** gate `create_account` on the enrolment proof too.
 
 **S4. Broker dev-bypass grants ALL caps to any unmapped SAN via a plaintext header** —
@@ -60,7 +60,7 @@ accept (`<=`) windows are equal, so a nonce can be pruned while a same-`ts` repl
 within a 1 s edge. **Fix:** prune with a strictly larger window than accept.
 
 **S9. vault-sync metadata exposure** — `store.rs:264-280`, `dto.rs:19`. Content is genuinely
-server-blind (vault key never reaches the server; `encrypted_payload` never decrypted), but the
+server-blind (vesta key never reaches the server; `encrypted_payload` never decrypted), but the
 server sees op/device counts, cleartext `collection_id` (blinding is only a MAY), HLC
 wall-clock, and op sizes. **Fix:** document in the threat model; consider mandatory HMAC
 `collection_id` + size padding.

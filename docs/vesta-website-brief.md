@@ -1,23 +1,23 @@
-# Vault — website presentation brief (for the web designer)
+# Vesta — website presentation brief (for the web designer)
 
-A brief for building the **Vault** showcase/landing section on the Terrapi website. Everything here
+A brief for building the **Vesta** showcase/landing section on the Terrapi website. Everything here
 is grounded in the actual product/tech (the `terrapi-vesta` at-rest library + the `vesta-broker`
 secrets broker + `vesta-console`). **Do not invent security claims, audits, or compliance
 certifications** — the wording below is what we can stand behind today. Flag anything you'd like
 reworded; marketing owns final copy, this is the accurate substrate.
 
-Note the audience is different from Memento's: Vault speaks to **platform / DevOps / security
+Note the audience is different from Memento's: Vesta speaks to **platform / DevOps / security
 engineers**, not consumers. Tone is technical, calm, infrastructure-grade — trust through
 architecture, not adjectives.
 
 ---
 
-## 1. What Vault is (the one-liner)
+## 1. What Vesta is (the one-liner)
 
-> **Terrapi Vault — the secrets boundary for your fleet. Short-lived credentials, hard data
+> **Terrapi Vesta — the secrets boundary for your fleet. Short-lived credentials, hard data
 > residency, an operator console that never shows a secret.**
 
-Vault is a self-hostable **secrets broker**: services authenticate to it over mutual TLS and ask for
+Vesta is a self-hostable **secrets broker**: services authenticate to it over mutual TLS and ask for
 **short-TTL, revocable credentials** (SSH certificates, database / search-engine logins, signed
 object-store URLs, KMS wrap/unwrap) instead of holding long-lived static secrets. It runs **one
 instance per data-residency region**, so a credential can never resolve another region's data.
@@ -67,7 +67,7 @@ Lead with **least privilege by construction**. Five pillars (pick 3–4 for the 
 
 ## 4. Suggested page structure (sections)
 
-1. **Hero** — the one-liner + a single tight diagram: *service → (mTLS/WireGuard) → Vault → short-TTL
+1. **Hero** — the one-liner + a single tight diagram: *service → (mTLS/WireGuard) → Vesta → short-TTL
    credential*, with a clock/expiry motif. One primary CTA (e.g. "Read the architecture" / "View the
    API contract").
 2. **The problem** — long-lived secrets sprawl (API keys in env files, shared SSH keys, static DB
@@ -103,7 +103,7 @@ Lead with **least privilege by construction**. Five pillars (pick 3–4 for the 
   none are claimed today. You *can* say the design follows least-privilege and data-residency
   principles and that contracts/formats are open.
 - **"Self-hostable / open-source core" yes; "buy it today as a managed product" — only if marketing
-  confirms** the go-to-market. Vault currently ships as part of the Terrapi/proximi.io stack; how it
+  confirms** the go-to-market. Vesta currently ships as part of the Terrapi/proximi.io stack; how it
   is offered externally is a marketing decision. Don't imply a pricing/SLA that doesn't exist.
 - **Enterprise PKI (license-gated short-lived certificate issuance)** is on the roadmap / phased —
   describe as "coming" rather than shipped, unless told otherwise.
@@ -118,11 +118,11 @@ Lead with **least privilege by construction**. Five pillars (pick 3–4 for the 
 
 ## 7. Ready-to-use copy snippets (all grounded)
 
-- Hero sub: *"Services ask Vault for a credential that expires. No static keys to leak, rotate by
+- Hero sub: *"Services ask Vesta for a credential that expires. No static keys to leak, rotate by
   hand, or forget about."*
 - Pillar: *"Identity is the certificate. Clients authenticate with mutual TLS over a private
   network; the cert maps to a role and exactly the capabilities that role is allowed."*
-- Residency: *"Run one Vault per region. EU stays in EU, UAE stays in UAE — a credential issued in
+- Residency: *"Run one Vesta per region. EU stays in EU, UAE stays in UAE — a credential issued in
   one region cannot reach another."*
 - Console: *"The operator console shows you the state of the system — active leases, sessions,
   certificate serials, the audit trail — and never a secret value."*

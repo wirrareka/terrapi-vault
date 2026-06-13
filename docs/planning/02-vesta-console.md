@@ -9,7 +9,7 @@ client + bind JWK) and the closing **live `acr=mfa` round-trip**. Originally APP
 
 ## Purpose
 
-Today vault has **no human view** — only the mTLS broker API (`:8200`) and Prometheus
+Today vesta has **no human view** — only the mTLS broker API (`:8200`) and Prometheus
 metrics (`:8201`). With brokers deployed across many servers we need an operator
 **read-mostly observability console** (web + API; native probe/memento later via the same
 API). Modelled on the **Kalista web/API standard**.
@@ -99,7 +99,7 @@ All read-only, `observe`-capped, residency-checked, rate-limited. The broker's a
   restart is acceptable for an ops console); local break-glass admin from env (hashed). A
   **rusqlite** DB is added only if we want persistent sessions or a console-login audit —
   **(confirm: P1 stateless, no DB)**.
-- **Single binary**, SPA embedded → one artifact, matches vault's FreeBSD single-binary deploy.
+- **Single binary**, SPA embedded → one artifact, matches vesta's FreeBSD single-binary deploy.
 
 ## Read surface (P1)
 

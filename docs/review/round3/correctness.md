@@ -46,7 +46,7 @@ the declared length. Add a unit test with a forged oversized `db_len`.
 
 ## Medium
 
-### M1 — `rotate_key` is not crash-consistent: rekey succeeds, sidecar write fails → bricked vault
+### M1 — `rotate_key` is not crash-consistent: rekey succeeds, sidecar write fails → bricked vesta
 `vault.rs:194-200`.
 
 Order is: `PRAGMA rekey` (mutates the DB key in place), **then**
@@ -54,7 +54,7 @@ Order is: `PRAGMA rekey` (mutates the DB key in place), **then**
 fails, *after* rekey but *before* the new sidecar lands, the on-disk DB is now
 encrypted under `new_key` while the sidecar still holds the **old** salt. Result:
 `open` derives the old key → `WrongPassphrase`; the new passphrase also fails
-because the stored salt no longer matches. The vault is unrecoverable with
+because the stored salt no longer matches. The vesta is unrecoverable with
 either passphrase.
 
 `VaultMeta::write` is itself atomic (temp+rename, meta.rs:117-119), so the
@@ -75,13 +75,13 @@ Fix options, best first:
 This is the same class of bug as create (H/M below) but worse because there is
 existing data to lose.
 
-### M2 — `create` is not crash-consistent: orphan DB after a crash auto-deletes the next vault attempt's data silently
+### M2 — `create` is not crash-consistent: orphan DB after a crash auto-deletes the next vesta attempt's data silently
 `vault.rs:71-74`, `:354-369`.
 
 `create` writes the DB (`open_keyed` + `init_schema`) then the sidecar. A crash
 between them leaves an orphan DB with no sidecar. `prepare_paths_for_create`
 "recovers" by **silently `remove_file`** the orphan on the next `create`
-(vault.rs:359-366). For `create` of a brand-new vault that is correct, but the
+(vault.rs:359-366). For `create` of a brand-new vesta that is correct, but the
 recovery branch cannot distinguish "leftover from a half-finished create" from
 "a real DB whose sidecar the user accidentally deleted/lost" — in the latter
 case it deletes recoverable-by-backup ciphertext without warning. Acceptable for
@@ -98,7 +98,7 @@ a footgun; consider `symlink_metadata`.
 
 - `prepare_paths_for_create` only checks/removes `vault_path` and `meta_path`,
   never `vault_path-wal` / `-shm` (vault.rs:354). A stale `-wal` from a previous
-  vault that shared the path can be replayed into the freshly-created DB.
+  vesta that shared the path can be replayed into the freshly-created DB.
 - `export_note` reads only `db_path` after `vault.lock()` (note_export.rs:144-147).
   `lock()` calls `conn.close()` which checkpoints the WAL back into the main
   file, so in the happy path the WAL is empty — but `lock()` **ignores the close
@@ -116,13 +116,13 @@ minimum stop discarding the `lock()` close error on the export path.
 
 `lock(self)` returns `()` and discards the close result. A failed WAL checkpoint
 on close means un-checkpointed committed data sits only in the `-wal` file; for a
-normal vault that is fine (next open replays it), but combined with M3 it is a
+normal vesta that is fine (next open replays it), but combined with M3 it is a
 silent data-loss path for export. Consider a `try_lock(self) -> Result<()>` (or
 have `lock` log) so callers that need durability (export, pre-backup) can detect
 a failed flush.
 
 ### M5 — `import_note` cannot surface meta-version / corruption distinctly
-`note_export.rs:177` → `Vault::open` → `VaultMeta::read`.
+`note_export.rs:177` → `Vesta::open` → `VaultMeta::read`.
 
 A `.memento-note` carrying a future `version` in its embedded sidecar surfaces as
 `UnsupportedFormat` (good), but a *corrupt* embedded sidecar (valid framing,
@@ -145,7 +145,7 @@ field only; harmless, but note it.
 
 ### L2 — `meta_path_for` is purely string-suffix based
 meta.rs:126-130. `vault.memento` → `vault.memento.meta.json`. Correct, but a
-vault path ending in a trailing separator or with unusual OsString bytes yields a
+vesta path ending in a trailing separator or with unusual OsString bytes yields a
 surprising sidecar path. Fine for the documented usage; document that callers
 pass a normal file path.
 
@@ -189,7 +189,7 @@ variant (the enum is `#[non_exhaustive]`, so adding one is non-breaking).
   from real `Db` errors (vault.rs:315-323).
 - `#[non_exhaustive]` on `Error`; `#[from]` impls (Io/Json/Db) are correct and
   every `?` maps to the right variant.
-- Use-after-lock is statically impossible: `lock(self)` consumes the vault, so
+- Use-after-lock is statically impossible: `lock(self)` consumes the vesta, so
   double-lock / use-after-lock won't compile. Key zeroizes via `DerivedKey`'s
   `#[zeroize(drop)]`. No runtime "locked" state to mismanage. Good design.
 - The `u64 as i64` cast in `now_rfc3339` and `db_bytes.len() as u64` in
@@ -203,7 +203,7 @@ variant (the enum is `#[non_exhaustive]`, so adding one is non-breaking).
    allocating in `read_container` (the only malicious-input DoS).
 2. **M1** — make `rotate_key` crash-safe (write new sidecar before rekey + a
    recovery path, or rekey-back on write failure) so a failed rotation can't
-   brick a vault with data.
+   brick a vesta with data.
 3. **M3 / M4** — handle `-wal`/`-shm` in create-recovery, and stop discarding the
    `close()` error on the `export_note` path (silent partial-note export).
 4. **M2** — make `create`'s orphan-deletion explicit (doc + ideally a separate
@@ -216,7 +216,7 @@ variant (the enum is `#[non_exhaustive]`, so adding one is non-breaking).
 1. `import_note` with a **forged oversized `db_len`/`meta_len`** header → must
    return `MetaInvalid`, not OOM (regression test for H1).
 2. `rotate_key` where the **sidecar write fails** (read-only dir / injected
-   error) → assert the vault still opens with the *old* passphrase (no brick).
+   error) → assert the vesta still opens with the *old* passphrase (no brick).
 3. **Crash-between-DB-and-sidecar** simulation for `create` and `rotate_key`
    (write DB, skip/corrupt sidecar) → assert the documented recoverable outcome.
 4. `import_note` with a **corrupt embedded sidecar JSON** and with a **future
@@ -225,7 +225,7 @@ variant (the enum is `#[non_exhaustive]`, so adding one is non-breaking).
    container observed (L3).
 6. `open` on a **truncated / corrupt DB body** (valid sidecar) → assert a clean
    `Db`/`WrongPassphrase`, never a panic.
-7. `create` when a stale **`-wal`** companion is present → fresh vault must not
+7. `create` when a stale **`-wal`** companion is present → fresh vesta must not
    replay the stale WAL (M3).
 8. `schema_version` / meta `version` **mismatch** open path (currently only the
    unit `rejects_future_version` covers validate, not the full `open`).

@@ -101,7 +101,7 @@ _Verification: `cargo build/clippy -D warnings/test/fmt` all clean; 51 tests pas
   host paths are gone from the wire (kept server-side for audit/IR only). `http.rs`, `dto.rs`,
   `spec/broker-openapi.yaml`. Coordinated via `inbox/aether/vault-snapshot-path-opaque-handle.md`.
 - **R18. ✅ Metadata threat-model documented** (S9): new "Threat model — what the server learns"
-  section in `docs/planning/02-vault-sync-oplog.md` — enumerates the metadata an
+  section in `docs/planning/02-vesta-sync-oplog.md` — enumerates the metadata an
   honest-but-curious server sees (op/device counts, timing, sizes, cleartext `collection_id`) vs.
   what stays blind, and the revisit list (mandatory HMAC `collection_id` + size padding) if it
   ever serves others' data.

@@ -1,11 +1,11 @@
-//! The [`Vault`] type: lifecycle over an encrypted SQLCipher database.
+//! The [`Vesta`] type: lifecycle over an encrypted SQLCipher database.
 
 use crate::error::{Error, Result};
 use crate::kdf::{
     derive_key, derive_key_from_bytes, random_key, random_salt, DerivedKey, KdfParams,
 };
 use crate::keyslot;
-use crate::meta::{meta_path_for, KeySlot, MetaV2, StoredMeta, VaultMeta};
+use crate::meta::{meta_path_for, KeySlot, MetaV2, StoredMeta, VestaMeta};
 use crate::recovery::RecoveryCode;
 use rusqlite::Connection;
 use secrecy::{ExposeSecret, SecretBox};
@@ -19,17 +19,17 @@ const RECOVERY_SLOT: &str = "recovery";
 
 /// An open, unlocked encrypted vault.
 ///
-/// A `Vault` owns a single `rusqlite` [`Connection`] keyed with SQLCipher
+/// A `Vesta` owns a single `rusqlite` [`Connection`] keyed with SQLCipher
 /// and the derived key (held in a [`SecretBox`], zeroized on drop). Run SQL
-/// — including migrations and FTS5 setup — through [`Vault::with_connection`].
+/// — including migrations and FTS5 setup — through [`Vesta::with_connection`].
 ///
 /// # Example
 ///
 /// ```no_run
-/// use terrapi_vesta::{Vault, KdfParams};
+/// use terrapi_vesta::{Vesta, KdfParams};
 ///
 /// # fn main() -> terrapi_vesta::Result<()> {
-/// let v = Vault::create("notes.terrapi", "correct horse", KdfParams::default())?;
+/// let v = Vesta::create("notes.terrapi", "correct horse", KdfParams::default())?;
 /// v.with_connection(|c| {
 ///     c.execute_batch("CREATE TABLE note(id INTEGER PRIMARY KEY, body TEXT);")
 /// })?;
@@ -37,7 +37,7 @@ const RECOVERY_SLOT: &str = "recovery";
 /// # Ok(())
 /// # }
 /// ```
-pub struct Vault {
+pub struct Vesta {
     conn: Connection,
     key: SecretBox<DerivedKey>,
     vault_path: PathBuf,
@@ -45,12 +45,12 @@ pub struct Vault {
 }
 
 /// Snapshot of the inputs a passphrase change needs, captured cheaply on the
-/// thread that owns the [`Vault`] ([`Vault::rotation_inputs`]).
+/// thread that owns the [`Vesta`] ([`Vesta::rotation_inputs`]).
 ///
 /// In the v2 (DEK) format a passphrase change **re-wraps the data key under a
 /// new password slot** — it does not re-encrypt the database — so the snapshot
 /// carries the current DEK plus the existing password slot (whose salt/params
-/// let [`Vault::plan_rotation`] verify the old passphrase off-thread). The DEK
+/// let [`Vesta::plan_rotation`] verify the old passphrase off-thread). The DEK
 /// it holds zeroizes on drop; treat its bytes as sensitive.
 pub struct RotationInputs {
     dek: SecretBox<DerivedKey>,
@@ -67,14 +67,14 @@ pub struct SetPassphraseInputs {
 
 /// Inputs for enrolling a recovery code: just the current DEK (zeroized on
 /// drop), captured on the vault thread so the expensive Argon2id derivation in
-/// [`Vault::plan_enroll_recovery`] can run off-thread.
+/// [`Vesta::plan_enroll_recovery`] can run off-thread.
 pub struct RecoveryEnrollInputs {
     dek: SecretBox<DerivedKey>,
 }
 
 /// The result of the expensive half of a passphrase change: a freshly built
 /// password [`KeySlot`] (a new salt + the DEK re-sealed under the new
-/// passphrase's slot key), ready to be committed by [`Vault::apply_rotation`].
+/// passphrase's slot key), ready to be committed by [`Vesta::apply_rotation`].
 ///
 /// Holds **no** bare key material — the DEK inside `new_password_slot` is
 /// authenticated ciphertext — so it is trivially `Send` for the off-thread
@@ -83,22 +83,22 @@ pub struct RotationPlan {
     new_password_slot: KeySlot,
 }
 
-impl std::fmt::Debug for Vault {
+impl std::fmt::Debug for Vesta {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never print the key or connection internals.
-        f.debug_struct("Vault")
+        f.debug_struct("Vesta")
             .field("vault_path", &self.vault_path)
             .field("meta_path", &self.meta_path)
             .finish_non_exhaustive()
     }
 }
 
-impl Vault {
+impl Vesta {
     /// Create a brand-new encrypted vault at `path`.
     ///
     /// Generates a fresh random salt, derives the key with `params`, applies
     /// `PRAGMA key`, writes the `<path>.meta.json` sidecar, and initializes
-    /// the `vault_schema` version table. Recovers automatically from a
+    /// the `vesta_schema` version table. Recovers automatically from a
     /// partial prior state (an orphan DB *or* an orphan sidecar — neither is
     /// recoverable, so the stale file is removed) but refuses if **both**
     /// already exist.
@@ -181,11 +181,11 @@ impl Vault {
 
     /// Open an existing vault at `path` with a raw 32-byte key.
     ///
-    /// Unlike [`Vault::open`], this skips Argon2id derivation and uses
+    /// Unlike [`Vesta::open`], this skips Argon2id derivation and uses
     /// `key` directly as the SQLCipher key. It exists for opt-in
     /// alternative-unlock paths (e.g. a biometric-gated OS keystore that
     /// holds the previously derived key); the sidecar is still read so the
-    /// vault remembers its salt/params for a later [`Vault::rotate_key`].
+    /// vault remembers its salt/params for a later [`Vesta::rotate_key`].
     ///
     /// # Security
     ///
@@ -234,7 +234,7 @@ impl Vault {
     /// migrated by the primary handle. WAL is joined automatically (the primary
     /// connection set it), so committed writes from the primary are visible.
     ///
-    /// The returned `Vault`'s `Connection` is **not `Send`** — open it ON the
+    /// The returned `Vesta`'s `Connection` is **not `Send`** — open it ON the
     /// thread that will use it (e.g. inside a background task), not on the owner
     /// thread and then moved.
     ///
@@ -263,7 +263,7 @@ impl Vault {
     /// In the v2 format this is the random DEK — the actual SQLCipher key —
     /// **not** a passphrase-derived value. An opt-in alternative-unlock feature
     /// can stash it in a biometric-gated OS keystore after a successful unlock
-    /// and later reopen via [`Vault::open_with_key`] without the passphrase.
+    /// and later reopen via [`Vesta::open_with_key`] without the passphrase.
     ///
     /// Because the DEK is stable across passphrase changes (a passphrase change
     /// only re-wraps it), a stashed DEK keeps working after the user changes
@@ -564,7 +564,7 @@ impl Vault {
     }
 
     /// Read the sidecar and require it to be in v2 (DEK) format. Every
-    /// credential-management operation needs the slot model; a `Vault` opened
+    /// credential-management operation needs the slot model; a `Vesta` opened
     /// normally is always v2 (v1 is migrated on `open`), so a v1 here means it
     /// was opened key-only without migrating — a clear, non-destructive error.
     fn read_v2_meta(&self) -> Result<MetaV2> {
@@ -593,7 +593,7 @@ impl Vault {
         f(&self.conn).map_err(Error::Db)
     }
 
-    /// Mutable variant of [`Vault::with_connection`] for transactions.
+    /// Mutable variant of [`Vesta::with_connection`] for transactions.
     ///
     /// # Errors
     ///
@@ -605,7 +605,7 @@ impl Vault {
         f(&mut self.conn).map_err(Error::Db)
     }
 
-    /// The schema version recorded in the `vault_schema` table.
+    /// The schema version recorded in the `vesta_schema` table.
     ///
     /// `terrapi-vault` owns row 0 (format bookkeeping). Downstream
     /// migrations should use `rusqlite_migration`'s own `user_version`.
@@ -615,7 +615,7 @@ impl Vault {
     /// [`Error::Db`] if the table is missing or unreadable.
     pub fn schema_version(&self) -> Result<i64> {
         self.with_connection(|c| {
-            c.query_row("SELECT version FROM vault_schema WHERE id = 0", [], |r| {
+            c.query_row("SELECT version FROM vesta_schema WHERE id = 0", [], |r| {
                 r.get(0)
             })
         })
@@ -683,7 +683,31 @@ fn open_keyed(path: &Path, key: &SecretBox<DerivedKey>) -> Result<Connection> {
         .map_err(map_cipher_err)?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(map_cipher_err)?;
+    // Transparently migrate the legacy `vault_schema` bookkeeping table → `vesta_schema` on first
+    // open of a pre-rename vault. The chokepoint every read/write open passes through, so existing
+    // vaults migrate exactly once; new vaults have no such table yet (no-op).
+    migrate_schema_table(&conn)?;
     Ok(conn)
+}
+
+/// Rename the legacy `vault_schema` table to `vesta_schema` if a pre-rename vault still has it.
+/// Idempotent; a no-op for new / already-migrated vaults. A wrong key surfaces as
+/// [`Error::WrongPassphrase`] from the `sqlite_master` read (same as [`verify_key`]).
+fn migrate_schema_table(conn: &Connection) -> Result<()> {
+    let exists = |name: &str| -> Result<bool> {
+        conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [name],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .map_err(map_cipher_err)
+    };
+    if exists("vault_schema")? && !exists("vesta_schema")? {
+        conn.execute_batch("ALTER TABLE vault_schema RENAME TO vesta_schema;")
+            .map_err(map_cipher_err)?;
+    }
+    Ok(())
 }
 
 /// Like [`open_keyed`] but for a **read-only** secondary connection: applies the
@@ -731,7 +755,7 @@ fn open_v2(
     meta_path: PathBuf,
     passphrase: &str,
     meta: &MetaV2,
-) -> Result<Vault> {
+) -> Result<Vesta> {
     let slot = &meta.slots.password;
     let slot_key = derive_key(passphrase, &slot.salt()?, slot.kdf_params)?;
     let Some(dek) = keyslot::open(
@@ -747,7 +771,7 @@ fn open_v2(
     // The committed sidecar is already v2, so any staged sidecar is a moot
     // migration orphan — clean it up, best-effort.
     let _ = std::fs::remove_file(rekey_staging_path(&meta_path));
-    Ok(Vault {
+    Ok(Vesta {
         conn,
         key: dek,
         vault_path,
@@ -785,8 +809,8 @@ fn migrate_v1_to_v2(
     vault_path: PathBuf,
     meta_path: PathBuf,
     passphrase: &str,
-    v1: &VaultMeta,
-) -> Result<Vault> {
+    v1: &VestaMeta,
+) -> Result<Vesta> {
     // Preserve the vault's chosen Argon2 cost for the new password slot, but raise it to at least
     // the RFC 9106 floor: the v1 cost comes from the plaintext, unauthenticated sidecar, so a
     // tampered/legacy low value must not silently weaken the freshly-wrapped v2 slot.
@@ -807,7 +831,7 @@ fn migrate_v1_to_v2(
     // Commit: atomically replace the v1 sidecar with the staged v2 one.
     std::fs::rename(&staged, &meta_path)?;
 
-    Ok(Vault {
+    Ok(Vesta {
         conn,
         key: dek,
         vault_path,
@@ -824,7 +848,7 @@ fn recover_interrupted_migration(
     vault_path: &Path,
     meta_path: &Path,
     passphrase: &str,
-) -> Result<Option<Vault>> {
+) -> Result<Option<Vesta>> {
     let staged = rekey_staging_path(meta_path);
     if !staged.exists() {
         return Ok(None);
@@ -847,7 +871,7 @@ fn recover_interrupted_migration(
                 return Ok(None);
             };
             std::fs::rename(&staged, meta_path)?;
-            Ok(Some(Vault {
+            Ok(Some(Vesta {
                 conn,
                 key: dek,
                 vault_path: vault_path.to_path_buf(),
@@ -862,7 +886,7 @@ fn recover_interrupted_migration(
                 return Ok(None);
             };
             std::fs::rename(&staged, meta_path)?;
-            Ok(Some(Vault {
+            Ok(Some(Vesta {
                 conn,
                 key,
                 vault_path: vault_path.to_path_buf(),
@@ -914,14 +938,14 @@ fn constant_time_eq(a: &[u8; crate::KEY_LEN], b: &[u8; crate::KEY_LEN]) -> bool 
     diff == 0
 }
 
-/// Create the `vault_schema` bookkeeping table and stamp version 1.
+/// Create the `vesta_schema` bookkeeping table and stamp version 1.
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS vault_schema (
+        "CREATE TABLE IF NOT EXISTS vesta_schema (
              id      INTEGER PRIMARY KEY CHECK (id = 0),
              version INTEGER NOT NULL
          );
-         INSERT OR IGNORE INTO vault_schema (id, version) VALUES (0, 1);",
+         INSERT OR IGNORE INTO vesta_schema (id, version) VALUES (0, 1);",
     )?;
     Ok(())
 }
@@ -979,6 +1003,30 @@ mod tests {
         KdfParams::fast_for_tests()
     }
 
+    #[test]
+    fn migrates_legacy_vault_schema_table_to_vesta_schema() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.terrapi");
+        let v = Vesta::create(&path, "pw", p()).unwrap();
+        // Simulate a pre-rename vault: rename the bookkeeping table back to the legacy name.
+        v.with_connection(|c| c.execute_batch("ALTER TABLE vesta_schema RENAME TO vault_schema;"))
+            .unwrap();
+        v.lock();
+        // Reopen → open_keyed transparently migrates vault_schema -> vesta_schema.
+        let v2 = Vesta::open(&path, "pw").unwrap();
+        assert_eq!(v2.schema_version().unwrap(), 1);
+        let legacy: i64 = v2
+            .with_connection(|c| {
+                c.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='vault_schema'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(legacy, 0, "legacy vault_schema table must be renamed away");
+    }
+
     /// Write a genuine **legacy v1** vault (salt directly derives the SQLCipher
     /// key, v1 sidecar) with a `t(x)=7` row, mirroring the pre-DEK `create`.
     /// Used to exercise the lazy v1→v2 migration on `open`.
@@ -989,7 +1037,7 @@ mod tests {
         init_schema(&conn).unwrap();
         conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (7);")
             .unwrap();
-        VaultMeta::new(&salt, params)
+        VestaMeta::new(&salt, params)
             .write(&meta_path_for(path))
             .unwrap();
         conn.close().unwrap();
@@ -1000,12 +1048,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
         {
-            let v = Vault::create(&path, "pw", p()).unwrap();
+            let v = Vesta::create(&path, "pw", p()).unwrap();
             v.with_connection(|c| c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (42);"))
                 .unwrap();
             v.lock();
         }
-        let v = Vault::open(&path, "pw").unwrap();
+        let v = Vesta::open(&path, "pw").unwrap();
         let x: i64 = v
             .with_connection(|c| c.query_row("SELECT x FROM t", [], |r| r.get(0)))
             .unwrap();
@@ -1017,14 +1065,14 @@ mod tests {
     fn read_only_handle_reads_committed_data_and_rejects_writes() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
-        let primary = Vault::create(&path, "pw", p()).unwrap();
+        let primary = Vesta::create(&path, "pw", p()).unwrap();
         primary
             .with_connection(|c| c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (7);"))
             .unwrap();
 
         // A second, read-only handle opened with a clone of the live DEK sees
         // the committed row...
-        let ro = Vault::open_read_only(&path, primary.derived_key()).unwrap();
+        let ro = Vesta::open_read_only(&path, primary.derived_key()).unwrap();
         let x: i64 = ro
             .with_connection(|c| c.query_row("SELECT x FROM t", [], |r| r.get(0)))
             .unwrap();
@@ -1049,9 +1097,9 @@ mod tests {
     fn read_only_handle_rejects_a_wrong_key() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
-        Vault::create(&path, "pw", p()).unwrap().lock();
+        Vesta::create(&path, "pw", p()).unwrap().lock();
         let bogus = SecretBox::new(Box::new(DerivedKey::from_bytes([0u8; crate::KEY_LEN])));
-        let err = Vault::open_read_only(&path, bogus).unwrap_err();
+        let err = Vesta::open_read_only(&path, bogus).unwrap_err();
         assert!(matches!(err, Error::WrongPassphrase), "got {err:?}");
     }
 
@@ -1059,8 +1107,8 @@ mod tests {
     fn wrong_passphrase_is_distinct_error() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
-        Vault::create(&path, "right", p()).unwrap().lock();
-        let err = Vault::open(&path, "wrong").unwrap_err();
+        Vesta::create(&path, "right", p()).unwrap().lock();
+        let err = Vesta::open(&path, "wrong").unwrap_err();
         assert!(matches!(err, Error::WrongPassphrase), "got {err:?}");
     }
 
@@ -1069,17 +1117,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
         {
-            let mut v = Vault::create(&path, "old", p()).unwrap();
+            let mut v = Vesta::create(&path, "old", p()).unwrap();
             v.with_connection(|c| c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (7);"))
                 .unwrap();
             v.rotate_key("old", "new").unwrap();
             v.lock();
         }
         assert!(matches!(
-            Vault::open(&path, "old").unwrap_err(),
+            Vesta::open(&path, "old").unwrap_err(),
             Error::WrongPassphrase
         ));
-        let v = Vault::open(&path, "new").unwrap();
+        let v = Vesta::open(&path, "new").unwrap();
         let x: i64 = v
             .with_connection(|c| c.query_row("SELECT x FROM t", [], |r| r.get(0)))
             .unwrap();
@@ -1090,7 +1138,7 @@ mod tests {
     fn rotate_key_rejects_wrong_old_passphrase() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
-        let mut v = Vault::create(&path, "old", p()).unwrap();
+        let mut v = Vesta::create(&path, "old", p()).unwrap();
         assert!(matches!(
             v.rotate_key("bogus", "new").unwrap_err(),
             Error::WrongPassphrase
@@ -1106,20 +1154,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
         {
-            let mut v = Vault::create(&path, "old", p()).unwrap();
+            let mut v = Vesta::create(&path, "old", p()).unwrap();
             v.with_connection(|c| c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (9);"))
                 .unwrap();
             let inputs = v.rotation_inputs().unwrap();
             // plan_rotation is the off-thread half; takes only owned inputs.
-            let plan = Vault::plan_rotation(&inputs, "old", "new").unwrap();
+            let plan = Vesta::plan_rotation(&inputs, "old", "new").unwrap();
             v.apply_rotation(plan).unwrap();
             v.lock();
         }
         assert!(matches!(
-            Vault::open(&path, "old").unwrap_err(),
+            Vesta::open(&path, "old").unwrap_err(),
             Error::WrongPassphrase
         ));
-        let v = Vault::open(&path, "new").unwrap();
+        let v = Vesta::open(&path, "new").unwrap();
         let x: i64 = v
             .with_connection(|c| c.query_row("SELECT x FROM t", [], |r| r.get(0)))
             .unwrap();
@@ -1132,12 +1180,12 @@ mod tests {
         // so a wrong old passphrase never reaches apply_rotation / PRAGMA rekey.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
-        let v = Vault::create(&path, "old", p()).unwrap();
+        let v = Vesta::create(&path, "old", p()).unwrap();
         let inputs = v.rotation_inputs().unwrap();
         // `matches!` (not `unwrap_err`) because the Ok variant `RotationPlan`
         // holds a `SecretBox` and deliberately has no `Debug`.
         assert!(matches!(
-            Vault::plan_rotation(&inputs, "bogus", "new"),
+            Vesta::plan_rotation(&inputs, "bogus", "new"),
             Err(Error::WrongPassphrase)
         ));
     }
@@ -1155,7 +1203,7 @@ mod tests {
         ));
         // First open migrates it to v2 and preserves the data.
         {
-            let v = Vault::open(&path, "pw").unwrap();
+            let v = Vesta::open(&path, "pw").unwrap();
             let x: i64 = v
                 .with_connection(|c| c.query_row("SELECT x FROM t", [], |r| r.get(0)))
                 .unwrap();
@@ -1169,13 +1217,13 @@ mod tests {
             StoredMeta::V2(_)
         ));
         assert!(matches!(
-            Vault::open(&path, "nope").unwrap_err(),
+            Vesta::open(&path, "nope").unwrap_err(),
             Error::WrongPassphrase
         ));
-        let mut v = Vault::open(&path, "pw").unwrap();
+        let mut v = Vesta::open(&path, "pw").unwrap();
         let code = v.enroll_recovery(p()).unwrap();
         v.lock();
-        assert!(Vault::open_with_recovery(&path, &code).is_ok());
+        assert!(Vesta::open_with_recovery(&path, &code).is_ok());
     }
 
     #[test]
@@ -1190,7 +1238,7 @@ mod tests {
         // rename: open with the v1 key, stage a v2 sidecar, rekey the DB to a fresh DEK, then leak
         // the connection (the "crash") so the rekeyed pages persist in the `-wal`.
         {
-            let v1 = VaultMeta::read(&meta_path).unwrap();
+            let v1 = VestaMeta::read(&meta_path).unwrap();
             let k1 = derive_key("pw", &v1.salt().unwrap(), v1.kdf_params).unwrap();
             let conn = open_keyed(&path, &k1).unwrap();
             let dek = random_key();
@@ -1205,7 +1253,7 @@ mod tests {
         }
         // The committed (v1) sidecar's key no longer opens the rekeyed DB; open must recover via
         // the staged v2 sidecar, preserve data, and finalize the migration — no brick.
-        let v = Vault::open(&path, "pw").unwrap();
+        let v = Vesta::open(&path, "pw").unwrap();
         let x: i64 = v
             .with_connection(|c| c.query_row("SELECT x FROM t", [], |r| r.get(0)))
             .unwrap();
@@ -1224,7 +1272,7 @@ mod tests {
         let path = dir.path().join("v.memento");
         let code;
         {
-            let mut v = Vault::create(&path, "orig", p()).unwrap();
+            let mut v = Vesta::create(&path, "orig", p()).unwrap();
             v.with_connection(|c| c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (5);"))
                 .unwrap();
             code = v.enroll_recovery(p()).unwrap();
@@ -1233,7 +1281,7 @@ mod tests {
         }
         // Forgot the passphrase: unlock with the recovery code, read data, set a new passphrase.
         {
-            let mut v = Vault::open_with_recovery(&path, &code).unwrap();
+            let mut v = Vesta::open_with_recovery(&path, &code).unwrap();
             let x: i64 = v
                 .with_connection(|c| c.query_row("SELECT x FROM t", [], |r| r.get(0)))
                 .unwrap();
@@ -1244,11 +1292,11 @@ mod tests {
         // Old passphrase dead; new one works; the recovery code STILL works (it survived the reset
         // because the DEK never changed).
         assert!(matches!(
-            Vault::open(&path, "orig").unwrap_err(),
+            Vesta::open(&path, "orig").unwrap_err(),
             Error::WrongPassphrase
         ));
-        assert!(Vault::open(&path, "brandnew").is_ok());
-        assert!(Vault::open_with_recovery(&path, &code).is_ok());
+        assert!(Vesta::open(&path, "brandnew").is_ok());
+        assert!(Vesta::open_with_recovery(&path, &code).is_ok());
     }
 
     #[test]
@@ -1257,25 +1305,25 @@ mod tests {
         let path = dir.path().join("v.memento");
         let printed;
         {
-            let mut v = Vault::create(&path, "pw", p()).unwrap();
+            let mut v = Vesta::create(&path, "pw", p()).unwrap();
             let code = v.enroll_recovery(p()).unwrap();
             printed = code.format().to_string();
             v.lock();
         }
         // The code as it would appear on the printed kit, re-parsed, unlocks the vault.
         let parsed = RecoveryCode::parse(&printed).unwrap();
-        assert!(Vault::open_with_recovery(&path, &parsed).is_ok());
+        assert!(Vesta::open_with_recovery(&path, &parsed).is_ok());
     }
 
     #[test]
     fn wrong_recovery_code_is_distinct_error() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
-        let mut v = Vault::create(&path, "pw", p()).unwrap();
+        let mut v = Vesta::create(&path, "pw", p()).unwrap();
         v.enroll_recovery(p()).unwrap();
         v.lock();
         assert!(matches!(
-            Vault::open_with_recovery(&path, &RecoveryCode::generate()).unwrap_err(),
+            Vesta::open_with_recovery(&path, &RecoveryCode::generate()).unwrap_err(),
             Error::WrongRecoveryCode
         ));
     }
@@ -1284,9 +1332,9 @@ mod tests {
     fn open_with_recovery_without_enrollment_errors() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
-        Vault::create(&path, "pw", p()).unwrap().lock();
+        Vesta::create(&path, "pw", p()).unwrap().lock();
         assert!(matches!(
-            Vault::open_with_recovery(&path, &RecoveryCode::generate()).unwrap_err(),
+            Vesta::open_with_recovery(&path, &RecoveryCode::generate()).unwrap_err(),
             Error::NoRecoverySlot
         ));
     }
@@ -1297,7 +1345,7 @@ mod tests {
         let path = dir.path().join("v.memento");
         let code;
         {
-            let mut v = Vault::create(&path, "pw", p()).unwrap();
+            let mut v = Vesta::create(&path, "pw", p()).unwrap();
             code = v.enroll_recovery(p()).unwrap();
             assert!(v.has_recovery().unwrap());
             v.remove_recovery().unwrap();
@@ -1310,10 +1358,10 @@ mod tests {
             v.lock();
         }
         assert!(matches!(
-            Vault::open_with_recovery(&path, &code).unwrap_err(),
+            Vesta::open_with_recovery(&path, &code).unwrap_err(),
             Error::NoRecoverySlot
         ));
-        assert!(Vault::open(&path, "pw").is_ok()); // passphrase unaffected
+        assert!(Vesta::open(&path, "pw").is_ok()); // passphrase unaffected
     }
 
     #[test]
@@ -1322,14 +1370,14 @@ mod tests {
         let path = dir.path().join("v.memento");
         let code;
         {
-            let mut v = Vault::create(&path, "old", p()).unwrap();
+            let mut v = Vesta::create(&path, "old", p()).unwrap();
             code = v.enroll_recovery(p()).unwrap();
             v.rotate_key("old", "new").unwrap();
             v.lock();
         }
         // The recovery code is untouched by the passphrase change.
-        assert!(Vault::open_with_recovery(&path, &code).is_ok());
-        assert!(Vault::open(&path, "new").is_ok());
+        assert!(Vesta::open_with_recovery(&path, &code).is_ok());
+        assert!(Vesta::open(&path, "new").is_ok());
     }
 
     #[test]
@@ -1348,9 +1396,9 @@ mod tests {
     fn create_refuses_when_both_files_exist() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
-        Vault::create(&path, "pw", p()).unwrap().lock();
+        Vesta::create(&path, "pw", p()).unwrap().lock();
         assert!(matches!(
-            Vault::create(&path, "pw", p()).unwrap_err(),
+            Vesta::create(&path, "pw", p()).unwrap_err(),
             Error::AlreadyExists(_)
         ));
     }
@@ -1359,7 +1407,7 @@ mod tests {
     fn files_returns_db_and_meta_paths() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
-        let v = Vault::create(&path, "pw", p()).unwrap();
+        let v = Vesta::create(&path, "pw", p()).unwrap();
         let (db, meta) = v.files();
         assert_eq!(db, path.as_path());
         assert_eq!(meta, meta_path_for(&path).as_path());
@@ -1376,7 +1424,7 @@ mod tests {
         symlink(&victim, &path).unwrap();
         // `create` must strip the link and write a regular file — never follow it and write
         // through to the (attacker-chosen) target.
-        Vault::create(&path, "pw", p()).unwrap().lock();
+        Vesta::create(&path, "pw", p()).unwrap().lock();
         assert!(std::fs::symlink_metadata(&path)
             .unwrap()
             .file_type()
@@ -1385,7 +1433,7 @@ mod tests {
             !victim.exists(),
             "create must not write through the symlink"
         );
-        assert!(Vault::open(&path, "pw").is_ok());
+        assert!(Vesta::open(&path, "pw").is_ok());
     }
 
     #[test]
@@ -1393,8 +1441,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
         fs::write(&path, b"stale").unwrap();
-        Vault::create(&path, "pw", p()).unwrap().lock();
-        assert!(Vault::open(&path, "pw").is_ok());
+        Vesta::create(&path, "pw", p()).unwrap().lock();
+        assert!(Vesta::open(&path, "pw").is_ok());
     }
 
     #[test]
@@ -1402,8 +1450,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
         fs::write(meta_path_for(&path), b"{}").unwrap();
-        Vault::create(&path, "pw", p()).unwrap().lock();
-        assert!(Vault::open(&path, "pw").is_ok());
+        Vesta::create(&path, "pw", p()).unwrap().lock();
+        assert!(Vesta::open(&path, "pw").is_ok());
     }
 
     #[test]
@@ -1412,13 +1460,13 @@ mod tests {
         let path = dir.path().join("v.memento");
         let key_bytes;
         {
-            let v = Vault::create(&path, "pw", p()).unwrap();
+            let v = Vesta::create(&path, "pw", p()).unwrap();
             v.with_connection(|c| c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (99);"))
                 .unwrap();
             key_bytes = *v.derived_key().expose_secret().expose_bytes();
             v.lock();
         }
-        let v = Vault::open_with_key(&path, &key_bytes).unwrap();
+        let v = Vesta::open_with_key(&path, &key_bytes).unwrap();
         let x: i64 = v
             .with_connection(|c| c.query_row("SELECT x FROM t", [], |r| r.get(0)))
             .unwrap();
@@ -1429,8 +1477,8 @@ mod tests {
     fn open_with_wrong_key_is_wrong_passphrase() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
-        Vault::create(&path, "pw", p()).unwrap().lock();
-        let err = Vault::open_with_key(&path, &[0u8; crate::KEY_LEN]).unwrap_err();
+        Vesta::create(&path, "pw", p()).unwrap().lock();
+        let err = Vesta::open_with_key(&path, &[0u8; crate::KEY_LEN]).unwrap_err();
         assert!(matches!(err, Error::WrongPassphrase), "got {err:?}");
     }
 
@@ -1439,7 +1487,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nope.memento");
         assert!(matches!(
-            Vault::open_with_key(&path, &[0u8; crate::KEY_LEN]).unwrap_err(),
+            Vesta::open_with_key(&path, &[0u8; crate::KEY_LEN]).unwrap_err(),
             Error::MetaMissing(_)
         ));
     }
@@ -1451,7 +1499,7 @@ mod tests {
         let dek_before;
         let dek_after;
         {
-            let mut v = Vault::create(&path, "old", p()).unwrap();
+            let mut v = Vesta::create(&path, "old", p()).unwrap();
             dek_before = *v.derived_key().expose_secret().expose_bytes();
             v.rotate_key("old", "new").unwrap();
             dek_after = *v.derived_key().expose_secret().expose_bytes();
@@ -1467,15 +1515,15 @@ mod tests {
             "DEK must not change on passphrase rotation"
         );
         assert!(
-            Vault::open_with_key(&path, &dek_before).is_ok(),
+            Vesta::open_with_key(&path, &dek_before).is_ok(),
             "the stable DEK still opens the vault"
         );
         // The OLD passphrase no longer derives a working password slot.
         assert!(matches!(
-            Vault::open(&path, "old").unwrap_err(),
+            Vesta::open(&path, "old").unwrap_err(),
             Error::WrongPassphrase
         ));
-        assert!(Vault::open(&path, "new").is_ok());
+        assert!(Vesta::open(&path, "new").is_ok());
     }
 
     #[test]
@@ -1483,7 +1531,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nope.memento");
         assert!(matches!(
-            Vault::open(&path, "pw").unwrap_err(),
+            Vesta::open(&path, "pw").unwrap_err(),
             Error::MetaMissing(_)
         ));
     }

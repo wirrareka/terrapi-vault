@@ -1,6 +1,6 @@
 # worklog — group validated extractor (2026-05-28)
 
-Backlog item #2 from `docs/planning/01-vault-as-service.md` §10 ("Known refinement").
+Backlog item #2 from `docs/planning/01-vesta-as-service.md` §10 ("Known refinement").
 
 ## Problem
 

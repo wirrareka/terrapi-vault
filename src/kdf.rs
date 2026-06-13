@@ -3,10 +3,10 @@
 //! The vault's encryption key is derived from the user's passphrase with
 //! Argon2id (RFC 9106). The derived 32-byte key is the raw SQLCipher key
 //! material; it is never persisted. Only the random salt and the KDF
-//! parameters live on disk (in the sidecar) so that [`Vault::open`] can
+//! parameters live on disk (in the sidecar) so that [`Vesta::open`] can
 //! reproduce the key from the passphrase.
 //!
-//! [`Vault::open`]: crate::Vault::open
+//! [`Vesta::open`]: crate::Vesta::open
 
 use crate::error::{Error, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -133,12 +133,12 @@ pub fn random_salt() -> [u8; SALT_LEN] {
 /// A wrapper around the raw 32-byte key that zeroizes its buffer on drop.
 ///
 /// Used as the secret type inside a [`secrecy::SecretBox`] so the key is
-/// scrubbed from memory when the [`Vault`](crate::Vault) is locked or
+/// scrubbed from memory when the [`Vesta`](crate::Vesta) is locked or
 /// dropped, and cannot be accidentally logged (`SecretBox` has no `Debug`
 /// that prints the contents).
 ///
 /// `Clone` is intentional but exists only for the keystore-handoff path
-/// ([`Vault::derived_key`](crate::Vault::derived_key) → [`Vault::open_with_key`](crate::Vault::open_with_key)):
+/// ([`Vesta::derived_key`](crate::Vesta::derived_key) → [`Vesta::open_with_key`](crate::Vesta::open_with_key)):
 /// each clone is itself a zeroizing `DerivedKey`, but every clone is one more live copy of the
 /// key, so do not clone casually — keep the number of copies minimal.
 #[derive(Clone, Zeroize)]
@@ -148,7 +148,7 @@ pub struct DerivedKey(pub(crate) [u8; KEY_LEN]);
 impl DerivedKey {
     /// Wrap raw 32 bytes as a [`DerivedKey`].
     ///
-    /// Used by [`Vault::open_with_key`](crate::Vault::open_with_key) to open
+    /// Used by [`Vesta::open_with_key`](crate::Vesta::open_with_key) to open
     /// a vault from a key obtained out-of-band (e.g. a biometric-gated
     /// Keychain item) instead of re-deriving from a passphrase. The input
     /// `bytes` array is the caller's responsibility to zeroize; the copy

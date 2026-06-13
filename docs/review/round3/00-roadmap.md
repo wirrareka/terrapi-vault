@@ -34,14 +34,14 @@ because the lib is shipped inside memento/probe. All headline findings were veri
   `deserialize_rejects_unknown_field`).
 
 _Verified: root lib 42 tests (35+5+2, 3 new), clippy -D warnings + fmt clean; services still green
-(39+23+21) — the encryption assertion + validations are transparent to the broker/sync vault usage.
+(39+23+21) — the encryption assertion + validations are transparent to the broker/sync vesta usage.
 `spec/vault-format.md` documents the new limits._
 
 ## R3-P1 — Robustness / correctness — ✅ DONE 2026-05-31
 - **R3-5. ✅ `rotate_key` crash-safe + recoverable**: the new sidecar is staged at `<meta>.rekeying`
   BEFORE `PRAGMA rekey`, then atomically renamed after. If a crash lands between rekey and the
   rename, `open` detects the staged sidecar (whose salt matches the rekeyed DB) and finalizes it —
-  the vault is never bricked. A successful normal open cleans a stale pre-rekey staging file. Also
+  the vesta is never bricked. A successful normal open cleans a stale pre-rekey staging file. Also
   fixed a latent bug surfaced here: `open` now catches `WrongPassphrase` from `open_keyed` (not
   only `verify_key`), so recovery actually runs. `vault.rs` (+ test
   `open_recovers_from_interrupted_rotate_no_brick`).
@@ -50,7 +50,7 @@ _Verified: root lib 42 tests (35+5+2, 3 new), clippy -D warnings + fmt clean; se
 - **R3-7. ✅** `random_salt` uses explicit `OsRng`; `pragma_literal` returns a `Zeroizing<String>`
   so the key-hex is scrubbed from the heap. `kdf.rs`, `vault.rs`. _(The tempdir nonce stays
   `thread_rng` — it is uniqueness-only, not security material.)_
-- **R3-8. ✅ `Vault::files()`** returns `(db, meta)` with the atomic-unit invariant documented on
+- **R3-8. ✅ `Vesta::files()`** returns `(db, meta)` with the atomic-unit invariant documented on
   the type — a backup/sync author can no longer miss that the sidecar must travel with the DB.
   `vault.rs`.
 
@@ -69,10 +69,10 @@ services still green (39+23+21) — all changes transparent downstream._
   link); orphan-DB removal now also drops stale `-wal`/`-shm`; `DerivedKey: Clone` documented as
   the keystore-handoff-only path. `vault.rs`, `kdf.rs`. _(Path-scrubbing from error variants left
   as-is — the paths are useful local debug context and removing them is a net-negative for a
-  personal vault; S3-L3 noted, not actioned.)_
+  personal vesta; S3-L3 noted, not actioned.)_
 - **R3-12. ✅ Tests added** across P0/P1/P2: container-length OOM guard, unknown-field rejection,
   KDF-bound rejection, crash-recovery sim (`open_recovers_from_interrupted_rotate_no_brick`),
-  symlink-strip, `Vault::files()`, container future-version contract.
+  symlink-strip, `Vesta::files()`, container future-version contract.
 
 _Verified: root lib 45 tests; builds with AND without `note-export`; clippy -D warnings + fmt clean;
 services still green (39+23+21)._

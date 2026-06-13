@@ -106,9 +106,9 @@ fn is_uuid_v4_lower(s: &str) -> bool {
 /// Path extractor that validates `{vault_id}` is a lowercase UUIDv4 **before** any handler
 /// (or body parse) runs, rejecting a bogus id with `400`. This is the single choke point that
 /// stops malformed ids from creating accounts or seeding the replay/tail maps.
-pub struct VaultId(pub String);
+pub struct VestaId(pub String);
 
-impl FromRequestParts<AppState> for VaultId {
+impl FromRequestParts<AppState> for VestaId {
     type Rejection = ErrResp;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ErrResp> {
@@ -128,7 +128,7 @@ impl FromRequestParts<AppState> for VaultId {
                 "vault_id must be a lowercase UUIDv4",
             ));
         }
-        Ok(VaultId(vault_id))
+        Ok(VestaId(vault_id))
     }
 }
 
@@ -338,7 +338,7 @@ fn paq(uri: &axum::http::Uri) -> String {
 
 async fn enroll_challenge(
     State(state): State<AppState>,
-    VaultId(vault_id): VaultId,
+    VestaId(vault_id): VestaId,
 ) -> ApiResult<EnrollChallenge> {
     // This is the only fully-unauthenticated endpoint and it hands back enrolment salt+params,
     // so rate-limit it to blunt offline-dictionary harvesting and account-existence probing.
@@ -370,7 +370,7 @@ async fn create_account(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    VaultId(vault_id): VaultId,
+    VestaId(vault_id): VestaId,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Ack>), ErrResp> {
@@ -457,7 +457,7 @@ async fn enroll(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    VaultId(vault_id): VaultId,
+    VestaId(vault_id): VestaId,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Ack>), ErrResp> {
@@ -567,7 +567,7 @@ async fn push(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    VaultId(vault_id): VaultId,
+    VestaId(vault_id): VestaId,
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<PushResponse> {
@@ -645,7 +645,7 @@ async fn pull(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    VaultId(vault_id): VaultId,
+    VestaId(vault_id): VestaId,
     Query(q): Query<PullQuery>,
     headers: HeaderMap,
 ) -> ApiResult<PullResponse> {
@@ -666,7 +666,7 @@ async fn status(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    VaultId(vault_id): VaultId,
+    VestaId(vault_id): VestaId,
     headers: HeaderMap,
 ) -> ApiResult<StatusResponse> {
     auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"").await?;
@@ -687,7 +687,7 @@ async fn list_devices(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    VaultId(vault_id): VaultId,
+    VestaId(vault_id): VestaId,
     headers: HeaderMap,
 ) -> ApiResult<DevicesResponse> {
     auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"").await?;
@@ -773,7 +773,7 @@ async fn tail(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    VaultId(vault_id): VaultId,
+    VestaId(vault_id): VestaId,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {

@@ -8,15 +8,15 @@ for the design and `spec/sync-openapi.yaml` for the wire contract.
 ## Trust model (read first)
 
 - **Server-blind.** The server stores only: `vault_id`, an enrolment verifier (Argon2-secret
-  hash), device ed25519 public keys, and **opaque encrypted ops**. It never sees the vault
-  passphrase, the vault key, or note plaintext.
+  hash), device ed25519 public keys, and **opaque encrypted ops**. It never sees the vesta
+  passphrase, the vesta key, or note plaintext.
 - **At-rest encryption (recommended).** Content is E2E-encrypted, but the DB *metadata*
   (op/device counts, timing, op sizes, cleartext `collection_id`, device pubkeys) is not — so
   set `VESTA_SYNC_DB_KEY_FILE` (or `VESTA_SYNC_DB_KEY`) and the whole DB + WAL are
   SQLCipher-encrypted, protecting that metadata if the disk/backup is stolen. Set it **before
   first run** and back the key up **separately** from the DB.
 - **Device auth is app-layer.** Every `push`/`pull`/`status`/`tail` is signed by the calling
-  device's ed25519 key over a canonical string (method + path + vault id + ts + nonce + body
+  device's ed25519 key over a canonical string (method + path + vesta id + ts + nonce + body
   hash). `account`/`enroll` are self-signed by the key being registered; **both** are gated by
   the passphrase-derived enrolment proof (`account` checks `SHA-256(proof) == verifier.hash`,
   so an account is only created with a genuinely derivable verifier). `vault_id` must be a
@@ -69,7 +69,7 @@ metadata at-rest encryption protects); never route it through the public TLS pro
 
 `VESTA_SYNC_DB` is the only state. It holds opaque ciphertext, so a backup is safe to store
 anywhere — but losing it loses any ops a device hasn't already pulled. Snapshot it
-periodically (e.g. `sqlite3 … '.backup'` or a filesystem snapshot). The vault content itself
+periodically (e.g. `sqlite3 … '.backup'` or a filesystem snapshot). The vesta content itself
 also lives on each device, so this is a convenience/durability backup, not the sole copy.
 
 ## Not yet here (see planning §9 "deferred")

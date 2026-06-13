@@ -24,7 +24,7 @@ handler* on a tokio worker thread. Two compounding problems:
 
 1. **All sync traffic across all vaults is serialized** through one connection + one mutex.
    A `pull` that scans/serializes a large op batch (`pull_ops`, `store.rs:225`) blocks every
-   other device's request for its full duration — there is no per-vault or reader
+   other device's request for its full duration — there is no per-vesta or reader
    parallelism.
 2. **It blocks the runtime.** SQLite I/O (and base64 encode of every payload in
    `pull_ops`, `store.rs:253`) runs on the worker thread without `spawn_blocking`. Under a
@@ -112,7 +112,7 @@ scale this is negligible, but two cheap wins:
   `broadcast::Sender<Arc<str>>` so fan-out to N subscribers shares one allocation instead
   of `tokio::broadcast` cloning the `String` per receiver internally.
 
-Live-tail back-pressure itself is handled correctly: per-vault `broadcast` capacity 256
+Live-tail back-pressure itself is handled correctly: per-vesta `broadcast` capacity 256
 (`state.rs:14`) with `Lagged` → `{"resync":true}` (`http.rs:498`) instead of unbounded
 buffering. Good design.
 
@@ -188,11 +188,11 @@ The `UNIQUE (vault_id, op_id)` index backs the dedup `exists` check in the push 
 **Impact: Low** (admin-only, rare)
 **Location:** `services/vault-broker/src/http.rs:409-412`.
 
-`VACUUM INTO ?1` runs while holding the `Vault` mutex (`http.rs:410`), then the file is
+`VACUUM INTO ?1` runs while holding the `Vesta` mutex (`http.rs:410`), then the file is
 read back with `std::fs::read` (`:421`) on the async thread. On a large at-rest store this
 blocks the runtime worker *and* every other store user (KMS wrap/unwrap, SSH sign) for the
 duration. It's a capability-gated snapshot op so frequency is low, but if the store ever
-grows, wrap the VACUUM + file read in `spawn_blocking` and copy the `Arc<Mutex<Vault>>` in.
+grows, wrap the VACUUM + file read in `spawn_blocking` and copy the `Arc<Mutex<Vesta>>` in.
 
 ---
 

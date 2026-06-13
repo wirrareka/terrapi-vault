@@ -7,7 +7,7 @@
 //! the SSH-CA (`ssh_ca`) and the OpenSearch dynamic-cred engine (`creds`/`opensearch`);
 //! and a tamper-evident hash-chained B3 audit store (`source:"vault"`) with best-effort
 //! OpenSearch shipping (`audit_ship`). Dev (`VESTA_ALLOW_INSECURE_DEV=1`) serves plain
-//! HTTP with header-based identity. See ../../docs/planning/01-vault-as-service.md §4 and
+//! HTTP with header-based identity. See ../../docs/planning/01-vesta-as-service.md §4 and
 //! ../../spec/broker-openapi.yaml.
 
 mod audit_ship;
@@ -36,7 +36,7 @@ mod tls;
 use config::BrokerConfig;
 use ssh_ca::SshCa;
 use state::{AppState, Unsealed};
-use terrapi_vesta::{KdfParams, Vault};
+use terrapi_vesta::{KdfParams, Vesta};
 
 /// How often the expiry sweeper runs. Sub-minute so short automated cert/cred TTLs
 /// (300 s) and idle timeouts are enforced promptly.
@@ -311,7 +311,7 @@ fn warn_if_group_or_world_readable(label: &str, path: &str) {
 fn warn_if_group_or_world_readable(_label: &str, _path: &str) {}
 
 /// Load (or generate on first run) the SSH CA from the just-opened store.
-fn load_ca(store: Vault, group: &str) -> Option<Unsealed> {
+fn load_ca(store: Vesta, group: &str) -> Option<Unsealed> {
     match SshCa::load_or_generate(&store, group) {
         Ok(ssh_ca) => {
             eprintln!("vesta-broker: unsealed; SSH CA ready for group {group}");

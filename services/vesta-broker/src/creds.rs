@@ -1,7 +1,7 @@
 //! Dynamic service-admin credential engines (Phase 3).
 //!
 //! A `CredEngine` mints an **ephemeral backend user** on issue and **deletes it** on
-//! revoke/expiry (Vault database-secrets-engine semantics). Each issued cred is a
+//! revoke/expiry (Vesta database-secrets-engine semantics). Each issued cred is a
 //! session-bound lease; when the lease is revoked — explicitly or by session cascade —
 //! the broker calls the owning engine to tear the user down, so no backend user outlives
 //! its lease.

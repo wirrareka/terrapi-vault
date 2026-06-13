@@ -15,7 +15,7 @@ The broker stores its CA keys + lease state in an at-rest encrypted store (the
 `terrapi-vesta` SQLCipher library). Its master key is derived at start:
 
 - **v1 — manual unseal (implemented, `seal.rs`):** unsealing = opening the broker's
-  at-rest store (`terrapi_vault::Vault`, SQLCipher at `VESTA_STORE_PATH`) with the
+  at-rest store (`terrapi_vault::Vesta`, SQLCipher at `VESTA_STORE_PATH`) with the
   operator passphrase (`VESTA_UNSEAL_PASSPHRASE`). The store's SQLCipher key is derived
   with the lib's Argon2id; a wrong passphrase surfaces as the lib's `WrongPassphrase`.
   Until opened, the broker is **sealed** and every mutating op returns `503` (poll
@@ -62,7 +62,7 @@ ZFS dataset encryption, and WG isolation.
 - **KMS-cap auth (Option J, optional)** — `VESTA_KMS_JWT_ISSUER` enables an identity-minted
   ES256 bearer JWT as the per-call proof of the `kms` cap, **on top of** mTLS (the JWT carries
   the cap; the channel still authenticates). Verifies the issuer's JWKS (OIDC-discovered, or
-  `VESTA_KMS_JWT_JWKS_URI`), `aud` (`VESTA_KMS_JWT_AUDIENCE`, default `vault`), `exp`,
+  `VESTA_KMS_JWT_JWKS_URI`), `aud` (`VESTA_KMS_JWT_AUDIENCE`, default `vesta`), `exp`,
   `scope ⊇ kms`, `residency_group ==` this instance's group, and `tenant_id ==` the request
   path tenant. **Unset ⇒ kms ops stay cap-based** (cert-SAN `kms` capability — the aether
   fleet-backup path; unchanged).
@@ -123,12 +123,12 @@ demon → broker ── mTLS (client cert) → open session → lease short-TTL 
 ## KMS root-of-trust go-live (arm a + b)
 
 Both arms ship **gated off**; turning them on in eu is an operator + cross-service step.
-Vault needs **no code change** — the broker already reads `VESTA_TLS_*` for both its server cert
+Vesta needs **no code change** — the broker already reads `VESTA_TLS_*` for both its server cert
 and the KMS client. Order:
 
 1. **Adopt the dot-form cert (operator, on the broker host).** Infra issued
    `vault.eu.proximi.internal.{pem,key}` (RSA4096, **serverAuth + clientAuth**, SAN +IP, fleet-CA
-   signed; staged `~/kms-eu/`). Place it in the vault-eu jail (`vault:vault`, key `0600`) and point
+   signed; staged `~/kms-eu/`). Place it in the vault-eu jail (`vesta:vesta`, key `0600`) and point
    `VESTA_TLS_CERT`/`VESTA_TLS_KEY` at it — this becomes BOTH the broker server cert (retiring the
    dash-form `vault-eu.proximi.internal`) and the arm (a) KMS client cert. `VESTA_TLS_CLIENT_CA`
    stays the fleet Root CA. Demon broker-clients already pin the dot form, so no peer break.

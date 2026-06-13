@@ -79,7 +79,7 @@ vault-sync+transport, supply chain). Read-only analýza, žiadne zmeny kódu.
 - console: pending-auth map bez capu (DoS); logout cez GET (CSRF); raw IdP error do
   browsera; cookie bez `__Host-` prefixu.
 - sync: `db_key` optional → plaintext SQLite s verifierom (offline dictionary attack);
-  žiadne per-vault quoty; chýba `deny_unknown_fields` + length caps; audit `read_to_string`
+  žiadne per-vesta quoty; chýba `deny_unknown_fields` + length caps; audit `read_to_string`
   na neohraničenom súbore.
 - core lib: KDF params bez dolného floor-u (tampered sidecar vie pinúť 8 KiB/t=1 pre
   nové sloty — `kdf.rs:64`, `vault.rs:334`); nezeroizované intermediates v `recovery.rs`;
@@ -127,7 +127,7 @@ vault-sync+transport, supply chain). Read-only analýza, žiadne zmeny kódu.
 - Rozhodnúť per-tenant OpenSearch role vs. accepted risk (zdokumentovať). [#7]
 
 ### Fáza 3 — vault-sync hardening (≈1–2 týždne, časť = protokol v2)
-- Server-side hneď: rate-limit `/account`+`/enroll`, per-device nonce scoping, per-vault
+- Server-side hneď: rate-limit `/account`+`/enroll`, per-device nonce scoping, per-vesta
   quoty, `db_key` povinný mimo dev, `deny_unknown_fields` + length caps. [#11 + LOW]
 - Device revocation + list endpoint; key-replacement ako explicitný logovaný event. [#13]
 - Protokol v2 (koordinácia memento/probe cez `coordination/`): AEAD-bind `op_id`/`hlc`/

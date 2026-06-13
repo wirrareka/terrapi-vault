@@ -27,7 +27,7 @@ testy zelené počas celej práce.
   fleet Root CA, peer SAN → rola (dev ponecháva header fallback).
 
 ### 3. Phase 2 — SSH-CA
-- `c6a1863` unseal je teraz **store-backed** (otvára `terrapi_vault::Vault` SQLCipher store
+- `c6a1863` unseal je teraz **store-backed** (otvára `terrapi_vault::Vesta` SQLCipher store
   pasfrázou); **ed25519 SSH CA** per group, generovaná + uložená v store, podpisuje OpenSSH
   certy. `GET ssh/ca` + `POST ssh/sign` (session-bound lease, host-cert bez tenanta, 409 bez
   session).
@@ -57,7 +57,7 @@ testy zelené počas celej práce.
   engine = OpenSearch `audit-writer`.
 
 ## Koordinácia (proximiio-infra/coordination/, vlastní iný agent)
-- Vault inbox vyčistený; demon notifikovaný pri každom míľniku (v1 publish, ssh-ca live,
+- Vesta inbox vyčistený; demon notifikovaný pri každom míľniku (v1 publish, ssh-ca live,
   creds live, RethinkDB drop).
 - Vyriešené s demonom: **two-principal model** (`demon-operator` + `demon-system`) pre
   autonómne SSH sessions — zaznamenané v `decisions/demon-vault-session-model.md`.

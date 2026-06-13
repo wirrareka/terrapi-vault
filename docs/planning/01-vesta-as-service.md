@@ -23,7 +23,7 @@
 - `rusqlite (bundled-sqlcipher) + argon2 + secrecy + zeroize` — **no tokio/axum/reqwest, no listener.**
 - Argon2id KDF (RFC 9106) from passphrase, key in `SecretBox` + zeroized, in-place
   `PRAGMA rekey`, plaintext `<name>.meta.json` sidecar (salt + KDF params only).
-- Public API: `Vault::{create,open,open_with_key,rotate_key,with_connection,…}`,
+- Public API: `Vesta::{create,open,open_with_key,rotate_key,with_connection,…}`,
   `KdfParams`, `VaultMeta`, `export_note/import_note`.
 - On-disk format spec'd in `spec/vault-format.md` (doc rev 1.6); has app-level tables
   incl. `audit_log`, `secrets`, `succession_plans` (memento's schema).
@@ -39,7 +39,7 @@ resolving to the library, not a workspace shell. (See §3.)
 
 | | **vesta-broker** (demon) | **vesta-sync** (memento/probe) |
 |---|---|---|
-| Purpose | issue/lease short-TTL fleet creds | sync user's encrypted vault across their devices |
+| Purpose | issue/lease short-TTL fleet creds | sync user's encrypted vesta across their devices |
 | Data | dynamic SSH certs, DB/OpenSearch users, leases | append-only oplog of encrypted row mutations |
 | Tenancy | multi-tenant, per residency group, air-gapped | single user, many devices (personal) |
 | Auth | mTLS over WireGuard vs fleet Root CA | device keypair enrolment |
@@ -142,13 +142,13 @@ API is versioned `/v1/...`. JSON. All mutating ops emit a B3 audit event (§4.5)
     never brokered; if a modern datastore later needs brokered creds we add an engine then.
   - resp: `{ "username", "password", "lease_id", "ttl", "renewable", "max_ttl" }`
   - Broker creates an **ephemeral backend user** with TTL; on lease end/revoke it
-    **deletes** that user (Vault database-secrets-engine semantics).
+    **deletes** that user (Vesta database-secrets-engine semantics).
 
 > **Demon-confirmed parameters (2026-05-26), lock into v1 OpenAPI:**
 > - Host-cert SSH CA = **group scope** (not per-tenant); tenant scoping only for leased
 >   service-admin creds under `<group>/<tenant_id>/<role>`.
 > - Roles: `audit-writer` (OpenSearch RBAC, write-only on `audit-events-*`; demon writes
->   its own `source:"control-plane"` events — distinct from vault's `source:"vault"`). No
+>   its own `source:"control-plane"` events — distinct from vesta's `source:"vault"`). No
 >   `os-metrics-reader` (metrics are Prometheus/PromQL, not OpenSearch); no RethinkDB engine
 >   (legacy RethinkDB uses no auth — owner, 2026-05-26).
 > - **TTLs:** SSH cert 900 s interactive / 300 s automated + touch-per-op (fresh cert per
@@ -176,12 +176,12 @@ API is versioned `/v1/...`. JSON. All mutating ops emit a B3 audit event (§4.5)
     (structurally cannot resolve another tenant/region; no cross-group route exists).
 - Confirm with demon: host-cert CA is group-scoped (fleet hosts), not tenant-scoped.
 
-### 4.5 Audit (point 5) — **vault owns it**
+### 4.5 Audit (point 5) — **vesta owns it**
 - **Decision:** the broker emits canonical **B3** events itself with **`source:"vault"`**
   (free keyword, not enum-gated → cheap to add) to **group-local** OpenSearch
   `audit-events-{group}-YYYY.MM`. Demon does NOT double-record as `control-plane`.
   Rationale: issuance/revoke is the broker's action → single source of truth.
-- Durable local store first (the existing in-vault `audit_log`, hash-chained, evolves
+- Durable local store first (the existing in-vesta `audit_log`, hash-chained, evolves
   into the broker's source of truth), then **best-effort** ship — a ship failure never
   blocks issuance.
 - **Redact at emitter:** never emit secret values, private keys, passwords, signing
@@ -209,14 +209,14 @@ Implements the remote side of memento-core's existing **sync-provider abstractio
 
 - **Op:** `{ op_id (UUIDv7/ULID), device_id, hlc (hybrid logical clock), collection_id,
   encrypted_payload }`. Payload (table, row_id, column values) is **encrypted
-  client-side with the vault key** → server is blind. Ordering uses cleartext `hlc`
-  + `device_id`; grouping uses an opaque `collection_id` (per vault). Server stores
+  client-side with the vesta key** → server is blind. Ordering uses cleartext `hlc`
+  + `device_id`; grouping uses an opaque `collection_id` (per vesta). Server stores
   ciphertext ops only.
 - **Conflict resolution:** start with **per-row LWW keyed by HLC** (pragmatic for the
   notes domain). CRDT text-merge for note bodies is a Phase-4 upgrade, not v1.
 - **Endpoints:** `POST /v1/sync/{collection}/push` (batch ops), `GET /v1/sync/{collection}/pull?since=<hlc>`,
   WS channel for live tail. Storage: SQLite/Postgres of opaque encrypted ops.
-- **Device auth:** device enrols via the vault passphrase → registers a device
+- **Device auth:** device enrols via the vesta passphrase → registers a device
   keypair; server authenticates a device by its pubkey. (Not fleet mTLS — this is
   personal.)
 - **Residency:** as scoped today this is the **owner's personal data**, so the EU/UAE
@@ -249,7 +249,7 @@ on it; the at-rest lib stays dependency-free of tokio/axum.
    Flip `Status: partial → answered`.
 3. `CONTRACTS.md` "Secrets broker" row: `REQUESTED, NOT BUILT` → `COMMITTED (Path A,
    phased)`, pointing at `terrapi-vesta/spec/` (broker OpenAPI to be added) + this doc.
-4. `conventions/ports-env.md` vault row: `TBD` → **`8200` API (WG-only) + `8201`
+4. `conventions/ports-env.md` vesta row: `TBD` → **`8200` API (WG-only) + `8201`
    loopback metrics** (proposed; confirm no collision).
 5. New convention file `conventions/secrets-broker.md` (path/namespace + lease +
    session model) — cross-service contract.
@@ -259,7 +259,7 @@ on it; the at-rest lib stays dependency-free of tokio/axum.
 
 ## 9. Resolved decisions (owner, 2026-05-26)
 - **Broker port:** `8200` API (WG-only) + `127.0.0.1:8201` Prometheus. ✅
-- **vesta-sync auth:** device keypair enrolled via the vault passphrase; server
+- **vesta-sync auth:** device keypair enrolled via the vesta passphrase; server
   authenticates by device pubkey. No terrapi-identity dependency. ✅
 - **vesta-sync hosting:** a small **VPS** (reachable from anywhere; no home-network
   dependency). Sync server stays deploy-agnostic; VPS is the target for Phase 3. ✅
@@ -304,7 +304,7 @@ passphrase verifier, `mode 600` sidecar) gating all mutating ops behind `503` un
 unsealed (`GET /v1/sys/seal-status`). v1 OpenAPI published + demon ack'd.
 
 **Phase 2 — DONE (SSH CA):** the unseal is now **store-backed** (`seal.rs` opens/creates
-a `terrapi_vault::Vault` SQLCipher store with the operator passphrase — `WrongPassphrase`
+a `terrapi_vault::Vesta` SQLCipher store with the operator passphrase — `WrongPassphrase`
 → sealed). `ssh_ca.rs`: an ed25519 CA per group, generated + persisted in that store on
 first run, never exported; signs OpenSSH certs. `GET /v1/{group}/ssh/ca` returns the CA
 public key; `POST /v1/{group}/ssh/sign` issues a short-TTL cert as a **session-bound
@@ -383,8 +383,8 @@ aether fleet-mode backup keys; preserves their zero-knowledge model (KEK never l
 
 **FreeBSD deploy module — DONE:** `deploy/` mirrors `identity/deploy/` — `build.sh`,
 `jail/{Bastillefile,provision.sh}` (bastille vnet jail per group), `rc.d/vesta-broker`
-(unprivileged `vault` user, `REQUIRE zfskeys`), `zfs/{zfskeys,check-encryption.sh}`
-(encrypted `zroot/terrapi/vault` → `/var/db/terrapi-vesta`), `vesta-broker.env.sample` +
+(unprivileged `vesta` user, `REQUIRE zfskeys`), `zfs/{zfskeys,check-encryption.sh}`
+(encrypted `zroot/terrapi/vesta` → `/var/db/terrapi-vesta`), `vesta-broker.env.sample` +
 `roles.json.sample`, `security/{pf,fim,least-privilege,audit_control}`, `alerts/`, and an
 `install.sh` runbook. Crown jewels (SSH-CA key + KMS KEKs in `store.sqlcipher`, `unseal.pass`)
 on the encrypted dataset. Infra confirmed + ready to run host steps on `medina`.
@@ -398,9 +398,9 @@ limits are env-tunable (`VESTA_{MAX_BODY_BYTES,REQUEST_TIMEOUT_SECS,MAX_CONCURRE
 with safe defaults — no deploy change required. Zero new crates (axum `DefaultBodyLimit` +
 `middleware::from_fn` + std/tokio). Uniform JSON `404` fallback for unrouted paths.
 
-**KMS root-of-trust chain (identity ↔ vault) — vault side DONE 2026-06-02 (broker API 1.1.0).**
+**KMS root-of-trust chain (identity ↔ vesta) — vesta side DONE 2026-06-02 (broker API 1.1.0).**
 The chain locked with identity (`coordination/conventions/secrets-broker.md §KMS root-of-trust`);
-vault's three pieces shipped + tested (gated off until identity/infra enable their side):
+vesta's three pieces shipped + tested (gated off until identity/infra enable their side):
 - **Option J — kms-cap JWT verify (`jwt.rs`):** per-call ES256 verify of identity-minted
   workload creds against the issuer's JWKS (cached, refetched on a `kid` miss); enforces
   `iss`/`aud="vault"`/`exp`/`scope ⊇ kms`/`residency_group == instance`/`tenant_id == path`.
@@ -418,7 +418,7 @@ vault's three pieces shipped + tested (gated off until identity/infra enable the
   `kms.master_resealed` so identity retires the old root (boot + 6h `reseal_watch` timer;
   identity holds current+previous during an ack-gated overlap, 7d backstop). Renamed from the
   contract's `kms.rewrap_complete` — accurate, no DEK re-wrap on root rotation.
-- **Pending (not vault code):** adopt the infra-issued dot-form cert as `VESTA_TLS_*` +
+- **Pending (not vesta code):** adopt the infra-issued dot-form cert as `VESTA_TLS_*` +
   eu seal→unseal round-trip; identity enables arm (b) mint (`/kms/v1/workload-cred`) for the
   live JWT round-trip + wires its overlap-window/`kms.master_resealed` consumer.
 

@@ -9,10 +9,10 @@ the [Terrapi](https://github.com/terrapi) brand of developer tools.
 database behind a small, safe lifecycle API:
 
 - **Argon2id** (RFC 9106) key derivation from a user passphrase over a
-  random per-vault salt — tuned for ~500 ms on Apple M-series hardware.
+  random per-vesta salt — tuned for ~500 ms on Apple M-series hardware.
 - The derived 256-bit key never touches disk; it lives in a
   [`secrecy::SecretBox`] and is zeroized on lock/drop.
-- A small plaintext JSON **sidecar** (`<vault>.meta.json`) stores only the
+- A small plaintext JSON **sidecar** (`<vesta>.meta.json`) stores only the
   salt and KDF parameters — no secret material.
 - In-place **key rotation** via SQLCipher `PRAGMA rekey`.
 - Robust **partial-state recovery** on create (orphan DB / orphan sidecar).
@@ -54,11 +54,11 @@ terrapi-vesta = "0.1"
 ```
 
 ```rust
-use terrapi_vault::{Vault, KdfParams};
+use terrapi_vault::{Vesta, KdfParams};
 
 # fn main() -> terrapi_vault::Result<()> {
 // First run — create the vault.
-let vault = Vault::create("notes.memento", "correct horse battery staple",
+let vesta = Vesta::create("notes.memento", "correct horse battery staple",
                           KdfParams::default())?;
 vault.with_connection(|conn| {
     conn.execute_batch("CREATE TABLE note(id INTEGER PRIMARY KEY, body TEXT)")
@@ -66,10 +66,10 @@ vault.with_connection(|conn| {
 vault.lock();
 
 // Later run — unlock.
-let vault = Vault::open("notes.memento", "correct horse battery staple")?;
+let vesta = Vesta::open("notes.memento", "correct horse battery staple")?;
 
 // Rotate the passphrase.
-let mut vault = vault;
+let mut vesta = vesta;
 vault.rotate_key("correct horse battery staple", "new passphrase")?;
 # Ok(())
 # }
@@ -82,8 +82,8 @@ setup through the guarded accessors — the encrypted connection is never
 exposed unguarded:
 
 ```rust,no_run
-# use terrapi_vault::Vault;
-# fn f(vault: &Vault) -> terrapi_vault::Result<()> {
+# use terrapi_vault::Vesta;
+# fn f(vesta: &Vesta) -> terrapi_vault::Result<()> {
 vault.with_connection(|conn| {
     conn.execute_batch("CREATE VIRTUAL TABLE note_fts USING fts5(title, body)")
 })?;
@@ -108,7 +108,7 @@ cargo test print_default_kdf_timing -- --nocapture
 - Derived key in `SecretBox`, zeroized on lock/drop.
 - `PRAGMA key` is set as the first statement on every connection.
 - Wrong passphrase maps to a distinct `Error::WrongPassphrase` (no panic).
-- The vault file on disk is **not** a readable plaintext SQLite database.
+- The vesta file on disk is **not** a readable plaintext SQLite database.
 
 See [`spec/vault-format.md`](spec/vault-format.md) for the full on-disk
 format so the encryption is independently verifiable.

@@ -4,7 +4,7 @@ Secrets / (future) KMS service for the quanto / proximi.io stack.
 
 ## Cross-service coordination (quanto / proximi.io stack)
 
-This service integrates tightly with 4 siblings (identity / vault / kalista /
+This service integrates tightly with 4 siblings (identity / vesta / kalista /
 vulture / infra). Coordinate via **files**, not by relaying messages through the
 human. The shared coordination dir is (temporarily) at:
 `/Users/wired/proximi-admin/proximiio-infra/coordination/` (will move to a neutral
@@ -21,14 +21,14 @@ human. The shared coordination dir is (temporarily) at:
   file) AND drop a note in the affected service's inbox — don't only say it.
 - **Never** put secrets or per-tenant data in `coordination/`. Contracts only.
 
-### Your role in the circle (what vault OWNS)
+### Your role in the circle (what vesta OWNS)
 
 You are the stack's **secrets boundary**. As of 2026-05-26 you are registered in
 `CONTRACTS.md` as owner of the **"Secrets broker"** contract — now **COMMITTED
 (Path A, phased)**. terrapi-vesta is today an embedded SQLCipher at-rest library and is
 growing into a network secrets broker; the control-plane daemon **proximiio.demon** is
 your first consumer (`inbox/vault/demon-{needs-brokering-service,brokered-creds-shape}.md`,
-both answered). Plan: `docs/planning/01-vault-as-service.md`.
+both answered). Plan: `docs/planning/01-vesta-as-service.md`.
 
 You own — and must publish to `coordination/` + this repo — this boundary
 (see `conventions/secrets-broker.md`):

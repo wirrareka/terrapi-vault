@@ -58,9 +58,9 @@ but binding the tuple as AAD gives explicit domain separation against any future
 refactor. **Fix:** pass the canonical target tuple as `aead::Payload.aad`.
 
 **S2-L3. Replay-guard cap is global, not per-vault.** `auth.rs:129-147` — `MAX_SEEN_NONCES` (100k)
-caps the table across all vaults; filling it makes `check_and_record` fail for every vault, and
+caps the table across all vaults; filling it makes `check_and_record` fail for every vesta, and
 nonce strings have no length cap. Gated behind signature verification + single-person instance →
-low impact, but weakens per-vault isolation. **Fix:** per-`vault_id` cap + cap nonce length (≤128 B).
+low impact, but weakens per-vesta isolation. **Fix:** per-`vault_id` cap + cap nonce length (≤128 B).
 
 **S2-L4. Stale KMS doc comments.** `kms.rs:5` ("AES-256-GCM"), `:180`/`:204` ("nonce(12)") describe
 the pre-R9 algorithm; code is XChaCha20 / 24-byte nonce. Doc-only. **Fix:** update the comments.

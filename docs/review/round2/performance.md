@@ -166,11 +166,11 @@ worker. Correct, as the prompt anticipated. No action.
 
 ---
 
-## 5. Broker single `Arc<Mutex<Vault>>` serializes all store access — Med (by design; revisit only if KMS goes hot)
+## 5. Broker single `Arc<Mutex<Vesta>>` serializes all store access — Med (by design; revisit only if KMS goes hot)
 
 **Location:** `vault-broker/src/state.rs:170`; locked at `http.rs:265,416,648,690,721,764`.
 
-**Issue.** One `Mutex<Vault>` guards KMS wrap/unwrap, snapshot, and SSH-CA reads/writes
+**Issue.** One `Mutex<Vesta>` guards KMS wrap/unwrap, snapshot, and SSH-CA reads/writes
 — all broker store operations are serialized through it. Round 1 verified the lock is
 always released before any `.await` (no lock-across-await), and the snapshot `VACUUM
 INTO` case was already flagged (round 1 §7). What round 1 did **not** flag: these
@@ -184,7 +184,7 @@ turns into a head-of-line block for every other issuance.
 
 **Fix sketch.** No change needed now. When/if KMS volume or store size grows: (a) move
 the store-mutex blocks to `spawn_blocking` (mirror vault-sync's `store_op`), and
-(b) if read concurrency is ever wanted, give the `Vault` the same WAL writer+reader
+(b) if read concurrency is ever wanted, give the `Vesta` the same WAL writer+reader
 split vault-sync now has. Track as "do when KMS goes live", not now.
 
 ---

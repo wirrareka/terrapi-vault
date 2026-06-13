@@ -54,7 +54,7 @@ nothing enforces that an additive field also bumps it. **Change:** add
 **MED-1 — `import_note` does not call `meta.validate()` on the *embedded*
 sidecar before opening.** `read_container` checks the container framing version,
 but the inner `meta_json` is written to a temp file (`note_export.rs:174`) and
-handed to `Vault::open`, which *does* validate via `VaultMeta::read`. So it is in
+handed to `Vesta::open`, which *does* validate via `VaultMeta::read`. So it is in
 fact covered transitively — but only by luck of the open path. Worth an explicit
 assertion/comment so a future refactor of `import_note` doesn't drop the
 validation. Low risk, flagged for the record.
@@ -80,7 +80,7 @@ evolution" section to `vault-format.md` and reference it from `lib.rs`.
 
 ## 2. Public API surface & stability
 
-The surface is small and deliberate: `Vault`, `VaultMeta`, `KdfParams`,
+The surface is small and deliberate: `Vesta`, `VaultMeta`, `KdfParams`,
 `DerivedKey`, `export_note`/`import_note`+`ExportedNote`, the consts, and the
 `rusqlite` re-export. `Error` is `#[non_exhaustive]` (`error.rs:12`) — good,
 lets you add variants without a breaking change. `DerivedKey.0` is `pub(crate)`
@@ -149,13 +149,13 @@ a memento-specific format (`NOTE_MAGIC = b"MNOTE\0\0\0"`, `exported_note`
 table with `title`/`body_markdown`/`view_mode` — pure memento domain) inside a
 crate whose stated purpose is "shared encrypted-at-rest SQLCipher vault." `probe`
 (API client) almost certainly never imports a note. This couples the neutral
-vault primitive to one consumer's document shape, and bloats `probe`'s build with
+vesta primitive to one consumer's document shape, and bloats `probe`'s build with
 note logic + the `TempDir` machinery. **Change:** gate it behind a default-off
 `note-export` feature (cheap, non-breaking), or split it into a
 `terrapi-note-export` crate that depends on `terrapi-vault`. Feature-gating is the
 pragmatic move; it keeps the path dep intact while letting `probe` opt out.
 
-**LOW-5 — `Vault` aggregates DB + key + meta + lifecycle.** This is acceptable —
+**LOW-5 — `Vesta` aggregates DB + key + meta + lifecycle.** This is acceptable —
 it's the cohesive "open encrypted store" facade and the parts are genuinely
 coupled (the key derives from the meta's salt to open the DB). Not a god-object;
 no change needed. Noted only to confirm it was assessed.
@@ -181,10 +181,10 @@ both move these files around; a sync that copies the `.terrapi` DB but not the
 or corrupts the vault. Note `rotate_key` (`vault.rs:178`) rewrites the sidecar
 with a *fresh salt* — a backup taken between the `rekey` PRAGMA and the sidecar
 write (or that captures only one of the two) is unrecoverable. **Change:** add a
-`# Backup & sync invariant` doc section to `Vault` itself (not just module docs)
+`# Backup & sync invariant` doc section to `Vesta` itself (not just module docs)
 spelling out: (1) DB + sidecar are one atomic unit; (2) `rotate_key` mutates both
 — don't snapshot mid-rotation; (3) point at `vault-format.md`. Consider a
-`Vault::files(&self) -> [&Path; 2]` helper so a backup tool can't forget one.
+`Vesta::files(&self) -> [&Path; 2]` helper so a backup tool can't forget one.
 
 **LOW-6 — `with_connection` contract under-specifies failure/poisoning.** Doc
 says it propagates `rusqlite::Error`, but doesn't state what happens if the
@@ -206,7 +206,7 @@ reset between calls; leave no open transaction") would help.
    the two version surfaces so memento can tell "newer-app file, upgrade" from
    "corrupt file."
 
-3. **MED-6 — Document the DB+sidecar atomic-backup invariant on `Vault` itself,
+3. **MED-6 — Document the DB+sidecar atomic-backup invariant on `Vesta` itself,
    and flag the `rotate_key` mid-rotation window** (`vault.rs:178`); add a
    `files()` helper. This is the invariant most likely to brick real user data
    via vault-sync.
@@ -216,5 +216,5 @@ reset between calls; leave no open transaction") would help.
    toolchain 1.83). Both remove "surprise" from downstream builds.
 
 5. **MED-2 + LOW-4 — Bound `read_container` allocations against file size**
-   (`note_export.rs:245`) and **feature-gate `note_export`** so the neutral vault
+   (`note_export.rs:245`) and **feature-gate `note_export`** so the neutral vesta
    primitive isn't coupled to memento's document format and `probe` can opt out.

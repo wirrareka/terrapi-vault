@@ -1,11 +1,11 @@
-# vault-console (web)
+# vesta-console (web)
 
-Operator web console for terrapi-vault — **read-only observability**, one per residency group.
+Operator web console for terrapi-vesta — **read-only observability**, one per residency group.
 Mirrors the Kalista web/API standard. **Never a secret editor** (state only; secret ingest stays
-CLI). Plan: `../docs/planning/02-vault-console.md`.
+CLI). Plan: `../docs/planning/02-vesta-console.md`.
 
 > **Status: P1 SPA skeleton.** Builds against the console backend's `/api/v1/*` (the
-> `services/vault-console` crate — not yet built; pending the identity OIDC client. infra side
+> `services/vesta-console` crate — not yet built; pending the identity OIDC client. infra side
 > confirmed: port `:8203`, WG `10.200.0.110`, dual-EKU cert, optional Kalista edge). The backend
 > aggregates the group's brokers' read-only `observe` API (broker OpenAPI ≥ 1.4.0) over mTLS.
 
@@ -20,7 +20,7 @@ pnpm install
 pnpm dev          # Vite on :5273, proxies /api → http://127.0.0.1:8203 (override VITE_API_PROXY)
 VITE_MOCK=1 pnpm dev   # standalone demo — fixture data from src/lib/mock.ts, no backend needed
 pnpm typecheck
-pnpm build        # → dist/  (embedded into the vault-console binary via rust-embed)
+pnpm build        # → dist/  (embedded into the vesta-console binary via rust-embed)
 pnpm gen:api      # regenerate raw broker types from ../spec/broker-openapi.yaml
 ```
 

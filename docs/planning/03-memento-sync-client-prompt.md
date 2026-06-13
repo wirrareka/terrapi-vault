@@ -14,7 +14,7 @@ vault-sync server, and apply remote ops with per-row last-writer-wins.
 ## Read first (the contract — do not guess it)
 
 - `../terrapi-vault/spec/sync-openapi.yaml` — the wire contract (endpoints, headers, schemas).
-- `../terrapi-vault/docs/planning/02-vault-sync-oplog.md` — the full design + rationale.
+- `../terrapi-vault/docs/planning/02-vesta-sync-oplog.md` — the full design + rationale.
 - Your own `crates/memento-core/src/sync.rs` — the **existing** `SyncProvider` trait
   (`LocalOnly` no-op, `GitSync` real whole-file blob sync, `MementoCloud` stub).
 
@@ -26,7 +26,7 @@ decision: introduce an **oplog-capable sync path** (a new provider type and/or a
 the abstraction) WITHOUT breaking `LocalOnly` or `GitSync` or their tests. The hard part is
 not the HTTP — it is wiring op-capture into memento's DB write path so every row mutation
 emits an op, and applying remote ops back into the same SQLCipher store. Plan that integration
-explicitly before coding; surface the options (e.g. a write-through op-log table in the vault
+explicitly before coding; surface the options (e.g. a write-through op-log table in the vesta
 vs. a trigger-based capture) and pick one.
 
 ## What the server expects (summary; the spec is authoritative)
@@ -35,16 +35,16 @@ Base path `/v1/sync/{vault_id}`. `vault_id` is an opaque UUID you choose at acco
 (NOT derived from the passphrase — the server is blind).
 
 - **Device identity:** each device generates an **ed25519** keypair on first run; store the
-  private key in OS secure storage (Keychain / equivalent), never in the vault blob.
+  private key in OS secure storage (Keychain / equivalent), never in the vesta blob.
 - **Request signing:** every `push`/`pull`/`status`/`tail` carries headers `X-Device-Id`,
   `X-Sync-Ts` (unix secs), `X-Sync-Nonce` (unique per request), `X-Sync-Sig` (base64 ed25519).
   Sign the canonical string **exactly**:
   `v1\n{METHOD}\n{path?query}\n{vault_id}\n{ts}\n{nonce}\n{sha256_hex(body)}`
   (for GETs the body is empty → hash of `""`). Reuse the SAME `{path?query}` you put on the
   request. The server allows ±300 s skew and rejects repeated nonces.
-- **Enrolment (server-blind):** derive an **enrolment secret** = Argon2id over the vault
+- **Enrolment (server-blind):** derive an **enrolment secret** = Argon2id over the vesta
   passphrase with a **domain-separation label DISTINCT from the at-rest key derivation** and an
-  **account-level salt** (NOT the vault's own salt). Flow:
+  **account-level salt** (NOT the vesta's own salt). Flow:
   1. First device: `POST /account` with `enroll = { salt_b64, params, hash_b64 }` where
      `hash_b64 = base64(SHA-256(enroll_secret))`, plus its `device = { device_id, pubkey_b64 }`.
      Self-sign the request with the device key.
@@ -68,7 +68,7 @@ Base path `/v1/sync/{vault_id}`. `vault_id` is an opaque UUID you choose at acco
 
 ## Payload crypto (client-only; keep the server blind)
 
-- Derive a dedicated **sync-payload key** from the vault key via a KDF/HKDF with a distinct
+- Derive a dedicated **sync-payload key** from the vesta key via a KDF/HKDF with a distinct
   domain label (do NOT reuse the raw SQLCipher key directly).
 - AEAD per op (XChaCha20-Poly1305 or AES-256-GCM) with a fresh random nonce per op; prepend
   the nonce to the ciphertext. AAD MAY include `op_id`/`collection_id` to bind them.
@@ -122,7 +122,7 @@ above:
    `{ enroll, proof_b64, device }`, where `proof_b64 = base64(enroll_secret)` — the **same**
    value the 2nd device sends to `/enroll`. The server checks `SHA-256(proof_b64) ==
    enroll.hash_b64` and only then creates the account (guarantees the verifier is genuinely
-   derivable; a garbage verifier that would brick the vault is rejected). Without it you get
+   derivable; a garbage verifier that would brick the vesta is rejected). Without it you get
    `400 bad_verifier` / `401 bad_proof`. The first device already knows `enroll_secret`, so just
    include it.
 

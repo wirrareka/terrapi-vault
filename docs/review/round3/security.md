@@ -11,7 +11,7 @@ because this lib is pinned by memento/probe (high blast radius)._
 consumed at `vault.rs:100` / `vault.rs:186`, and worst via `import_note` (`note_export.rs:177`).
 `validate()` checks `version`, `kdf == "argon2id"`, salt length — but **not** `kdf_params`. The
 sidecar is plaintext + unauthenticated. An attacker editing it (or crafting a malicious
-`.memento-note`, whose container-supplied sidecar `import_note` feeds straight into `Vault::open`)
+`.memento-note`, whose container-supplied sidecar `import_note` feeds straight into `Vesta::open`)
 can pin attacker-chosen `m_cost_kib`/`t_cost`/`p_cost`. A huge `m_cost_kib` → `derive_key` attempts
 a multi-TiB allocation on open/import = **DoS**. **Fix:** range-check `KdfParams` in `validate()`
 (RFC 9106 floor `m_cost_kib >= 19_456`, and a ceiling e.g. `<= 4_194_304` / 4 GiB, `t_cost`/`p_cost
@@ -54,7 +54,7 @@ future `rand`/`getrandom` change could weaken it with no compile error. **Fix:**
 - **S3-L2.** `DerivedKey: Clone` (`kdf.rs:87`) copies raw key bytes — bounded (each clone zeroizes)
   but a footgun; document/gate it.
 - **S3-L3.** Error variants embed full filesystem paths (`error.rs:25-26,33`; Kdf string echoes
-  params) — leaks vault locations if logged. No key material. Scrub in user-facing surfaces.
+  params) — leaks vesta locations if logged. No key material. Scrub in user-facing surfaces.
 - **S3-L4.** `prepare_paths_for_create` (`vault.rs:354-369`) `remove_file`s an orphan without a
   symlink/type check — local TOCTOU footgun. Add `symlink_metadata` check / `O_NOFOLLOW`.
 

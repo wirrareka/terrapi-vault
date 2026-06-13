@@ -120,7 +120,7 @@ the stronger fix.
 
 **Improvement:** rename broker `Error` → `ErrorBody` (or vice-versa) so both specs reference an
 identically-named envelope, matching the already-shared Rust type. Add the cross-service note R1/L1
-asked for: "the error envelope is identical across all vault services: `{error, detail[, request_id]}`;
+asked for: "the error envelope is identical across all vesta services: `{error, detail[, request_id]}`;
 `error` is a stable enum, `detail` is human-readable and non-contractual."
 
 ### L2 — Broker payload examples are thin vs sync

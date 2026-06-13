@@ -1086,7 +1086,7 @@ async fn kms_preflight(
     headers: &HeaderMap,
     tenant_id: &str,
     key_id: &str,
-) -> Result<std::sync::Arc<std::sync::Mutex<terrapi_vesta::Vault>>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<std::sync::Arc<std::sync::Mutex<terrapi_vesta::Vesta>>, (StatusCode, Json<ErrorBody>)> {
     // Cheap, local checks first so a sealed broker or a malformed tenant/key_id fails fast —
     // without triggering the JWT path's outbound JWKS round-trip to identity (DoS hardening).
     require_unsealed(state)?;

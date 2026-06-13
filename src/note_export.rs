@@ -3,13 +3,13 @@
 //! A `.memento-note` file is a **self-contained, single-file encrypted
 //! container that reuses the vault's existing crypto unchanged**. It is
 //! deliberately *not* a new cryptographic primitive: the note is stored
-//! inside an ordinary [`Vault`] — the same Argon2id KDF, the same raw-key
-//! SQLCipher database, the same [`VaultMeta`] sidecar — and that vault's
+//! inside an ordinary [`Vesta`] — the same Argon2id KDF, the same raw-key
+//! SQLCipher database, the same [`VestaMeta`] sidecar — and that vault's
 //! two on-disk artifacts (the SQLCipher DB and its JSON sidecar) are then
 //! framed into one portable file with a small plaintext header.
 //!
-//! Because the crypto path is *literally* [`Vault::create`] /
-//! [`Vault::open`], the `.memento-note` format is already covered by the
+//! Because the crypto path is *literally* [`Vesta::create`] /
+//! [`Vesta::open`], the `.memento-note` format is already covered by the
 //! audited vault code and its specification; only the outer framing is new
 //! and it carries **no secret material** (it is the same kind of public
 //! metadata as the sidecar).
@@ -22,7 +22,7 @@
 //! │ container_ver    1 byte   u8     == CONTAINER_VERSION (1)    │
 //! │ meta_len         4 bytes  u32 LE length of the sidecar JSON  │
 //! │ db_len           8 bytes  u64 LE length of the SQLCipher DB  │
-//! │ meta_json        meta_len bytes  the VaultMeta sidecar JSON  │
+//! │ meta_json        meta_len bytes  the VestaMeta sidecar JSON  │
 //! │ db_bytes         db_len  bytes   the SQLCipher database file │
 //! └────────────────────────────────────────────────────────────┘
 //! ```
@@ -55,7 +55,7 @@
 use crate::error::{Error, Result};
 use crate::kdf::KdfParams;
 use crate::meta::meta_path_for;
-use crate::vault::Vault;
+use crate::vesta::Vesta;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -69,7 +69,7 @@ pub const CONTAINER_VERSION: u8 = 1;
 /// Fixed header size: magic (8) + version (1) + meta_len (4) + db_len (8).
 const HEADER_LEN: usize = 8 + 1 + 4 + 8;
 
-/// Upper bound on a declared sidecar length when reading a container — a `VaultMeta` JSON is well
+/// Upper bound on a declared sidecar length when reading a container — a `VestaMeta` JSON is well
 /// under this, so a larger declared `meta_len` is a hostile/corrupt header (alloc-DoS guard).
 const MAX_META_LEN: usize = 64 * 1024;
 
@@ -105,7 +105,7 @@ const NOTE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS exported_note (
 
 /// Export a single note to an encrypted `.memento-note` file at `path`.
 ///
-/// Builds a fresh one-note [`Vault`] (Argon2id over `params` + a random
+/// Builds a fresh one-note [`Vesta`] (Argon2id over `params` + a random
 /// salt + raw-key SQLCipher) in a temporary directory, writes `note` into
 /// it, then frames the encrypted DB and its public sidecar into the
 /// single container file. The temporary encrypted DB is removed before
@@ -126,7 +126,7 @@ pub fn export_note(
     let meta_path = meta_path_for(&db_path);
 
     // Reuse the audited vault crypto path verbatim.
-    let vault = Vault::create(&db_path, passphrase, params)?;
+    let vault = Vesta::create(&db_path, passphrase, params)?;
     vault.with_connection(|c| {
         c.execute_batch(NOTE_SCHEMA)?;
         c.execute(
@@ -178,7 +178,7 @@ pub fn import_note(path: impl AsRef<Path>, passphrase: &str) -> Result<ExportedN
     std::fs::write(&meta_path, &meta_json)?;
     std::fs::write(&db_path, &db_bytes)?;
 
-    let vault = Vault::open(&db_path, passphrase)?;
+    let vault = Vesta::open(&db_path, passphrase)?;
     let note = vault.with_connection(|c| {
         c.query_row(
             "SELECT title, body_markdown, view_mode, created_at, updated_at \
