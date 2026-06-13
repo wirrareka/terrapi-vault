@@ -24,7 +24,7 @@ pub struct Op {
 }
 
 /// An op as returned by `pull`/`tail`, carrying the server-assigned monotonic `seq` (the pull
-/// cursor). `seq` is per-`vault_id`. Fields are explicit (not `#[serde(flatten)] op: Op`) so that
+/// cursor). `seq` is per-`vesta_id`. Fields are explicit (not `#[serde(flatten)] op: Op`) so that
 /// `Op` can carry `deny_unknown_fields` for its request use — flatten is incompatible with it. The
 /// serialized JSON is identical (flat: `{seq, op_id, …}`). This is a RESPONSE type, so it is
 /// deliberately NOT `deny_unknown_fields` (forward-compat for older clients).
@@ -77,7 +77,7 @@ pub struct EnrollVerifier {
     pub hash_b64: String,
 }
 
-/// `POST /v1/sync/{vault_id}/account` — first device creates the sync account.
+/// `POST /v1/sync/{vesta_id}/account` — first device creates the sync account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateAccountRequest {
@@ -91,7 +91,7 @@ pub struct CreateAccountRequest {
     pub device: DeviceRegistration,
 }
 
-/// `GET /v1/sync/{vault_id}/enroll-challenge` — the (non-secret) salt + params a new device
+/// `GET /v1/sync/{vesta_id}/enroll-challenge` — the (non-secret) salt + params a new device
 /// needs to derive its enrolment proof.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollChallenge {
@@ -99,7 +99,7 @@ pub struct EnrollChallenge {
     pub params: terrapi_vesta::KdfParams,
 }
 
-/// `POST /v1/sync/{vault_id}/enroll` — a new device proves the enrolment secret and registers
+/// `POST /v1/sync/{vesta_id}/enroll` — a new device proves the enrolment secret and registers
 /// its key. The request is self-signed by the *new* device key (proves key possession); the
 /// `proof` gates the enrolment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,7 +119,7 @@ pub const MAX_OP_ID_LEN: usize = 128;
 /// body byte-limit is the coarser cap).
 pub const MAX_OPS_PER_PUSH: usize = 1000;
 
-/// `POST /v1/sync/{vault_id}/push`.
+/// `POST /v1/sync/{vesta_id}/push`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PushRequest {
@@ -141,7 +141,7 @@ pub struct PullResponse {
     pub latest_seq: u64,
 }
 
-/// One enrolled device in the `GET /v1/sync/{vault_id}/devices` listing (no pubkey — the view
+/// One enrolled device in the `GET /v1/sync/{vesta_id}/devices` listing (no pubkey — the view
 /// only needs which devices exist and when they enrolled).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -150,13 +150,13 @@ pub struct DeviceInfo {
     pub enrolled_at: i64,
 }
 
-/// `GET /v1/sync/{vault_id}/devices` — the vault's enrolled devices.
+/// `GET /v1/sync/{vesta_id}/devices` — the vault's enrolled devices.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevicesResponse {
     pub devices: Vec<DeviceInfo>,
 }
 
-/// `GET /v1/sync/{vault_id}/status`.
+/// `GET /v1/sync/{vesta_id}/status`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub latest_seq: u64,

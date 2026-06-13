@@ -68,7 +68,7 @@ where
         })
 }
 
-/// Lowercase-UUIDv4 check for `{vault_id}` (no `uuid` crate). Personal vault ids are random
+/// Lowercase-UUIDv4 check for `{vesta_id}` (no `uuid` crate). Personal vault ids are random
 /// UUIDv4 — rejecting anything else keeps attacker-chosen keys out of the store and the
 /// in-memory replay/tail maps entirely.
 fn is_uuid_v4_lower(s: &str) -> bool {
@@ -103,7 +103,7 @@ fn is_uuid_v4_lower(s: &str) -> bool {
     true
 }
 
-/// Path extractor that validates `{vault_id}` is a lowercase UUIDv4 **before** any handler
+/// Path extractor that validates `{vesta_id}` is a lowercase UUIDv4 **before** any handler
 /// (or body parse) runs, rejecting a bogus id with `400`. This is the single choke point that
 /// stops malformed ids from creating accounts or seeding the replay/tail maps.
 pub struct VestaId(pub String);
@@ -112,23 +112,23 @@ impl FromRequestParts<AppState> for VestaId {
     type Rejection = ErrResp;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ErrResp> {
-        let Path(vault_id) = Path::<String>::from_request_parts(parts, state)
+        let Path(vesta_id) = Path::<String>::from_request_parts(parts, state)
             .await
             .map_err(|_| {
                 err(
                     StatusCode::BAD_REQUEST,
-                    "bad_vault_id",
-                    "missing vault_id path segment",
+                    "bad_vesta_id",
+                    "missing vesta_id path segment",
                 )
             })?;
-        if !is_uuid_v4_lower(&vault_id) {
+        if !is_uuid_v4_lower(&vesta_id) {
             return Err(err(
                 StatusCode::BAD_REQUEST,
-                "bad_vault_id",
-                "vault_id must be a lowercase UUIDv4",
+                "bad_vesta_id",
+                "vesta_id must be a lowercase UUIDv4",
             ));
         }
-        Ok(VestaId(vault_id))
+        Ok(VestaId(vesta_id))
     }
 }
 
@@ -136,21 +136,21 @@ pub fn router(state: AppState) -> Router {
     let max_body = state.cfg.max_body_bytes;
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/v1/sync/{vault_id}/account", post(create_account))
+        .route("/v1/sync/{vesta_id}/account", post(create_account))
         .route(
-            "/v1/sync/{vault_id}/enroll-challenge",
+            "/v1/sync/{vesta_id}/enroll-challenge",
             get(enroll_challenge),
         )
-        .route("/v1/sync/{vault_id}/enroll", post(enroll))
-        .route("/v1/sync/{vault_id}/push", post(push))
-        .route("/v1/sync/{vault_id}/pull", get(pull))
-        .route("/v1/sync/{vault_id}/status", get(status))
-        .route("/v1/sync/{vault_id}/devices", get(list_devices))
+        .route("/v1/sync/{vesta_id}/enroll", post(enroll))
+        .route("/v1/sync/{vesta_id}/push", post(push))
+        .route("/v1/sync/{vesta_id}/pull", get(pull))
+        .route("/v1/sync/{vesta_id}/status", get(status))
+        .route("/v1/sync/{vesta_id}/devices", get(list_devices))
         .route(
-            "/v1/sync/{vault_id}/devices/{device_id}",
+            "/v1/sync/{vesta_id}/devices/{device_id}",
             delete(revoke_device),
         )
-        .route("/v1/sync/{vault_id}/tail", get(tail))
+        .route("/v1/sync/{vesta_id}/tail", get(tail))
         // Per-route so metrics run after routing and see the `MatchedPath` template (id-free).
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -263,13 +263,13 @@ fn verify_signed(
     sh: &SignedHeaders,
     method: &str,
     path_and_query: &str,
-    vault_id: &str,
+    vesta_id: &str,
     body: &[u8],
 ) -> Result<(), ErrResp> {
     let canonical = auth::canonical_string(
         method,
         path_and_query,
-        vault_id,
+        vesta_id,
         sh.ts,
         &sh.nonce,
         &auth::sha256_hex(body),
@@ -299,13 +299,13 @@ async fn auth_registered(
     state: &AppState,
     method: &Method,
     path_and_query: &str,
-    vault_id: &str,
+    vesta_id: &str,
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<String, ErrResp> {
     let sh = signed_headers(headers)?;
     check_skew(sh.ts)?;
-    let vid = vault_id.to_owned();
+    let vid = vesta_id.to_owned();
     let did = sh.device_id.clone();
     let pubkey = store_op(state, move |s| s.device_pubkey(&vid, &did))
         .await?
@@ -323,7 +323,7 @@ async fn auth_registered(
         &sh,
         method.as_str(),
         path_and_query,
-        vault_id,
+        vesta_id,
         body,
     )?;
     Ok(sh.device_id)
@@ -338,19 +338,19 @@ fn paq(uri: &axum::http::Uri) -> String {
 
 async fn enroll_challenge(
     State(state): State<AppState>,
-    VestaId(vault_id): VestaId,
+    VestaId(vesta_id): VestaId,
 ) -> ApiResult<EnrollChallenge> {
     // This is the only fully-unauthenticated endpoint and it hands back enrolment salt+params,
     // so rate-limit it to blunt offline-dictionary harvesting and account-existence probing.
     // (A TLS-terminating proxy does per-IP limiting in front; this is the in-process backstop.)
-    if !state.challenge_rl.allow(&vault_id) {
+    if !state.challenge_rl.allow(&vesta_id) {
         return Err(err(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
             "too many enrolment challenges; slow down",
         ));
     }
-    let rec = store_op(&state, move |s| s.enroll_record(&vault_id))
+    let rec = store_op(&state, move |s| s.enroll_record(&vesta_id))
         .await?
         .map_err(db_err)?;
     let (salt, params, _hash) = rec.ok_or_else(|| {
@@ -370,14 +370,14 @@ async fn create_account(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    VestaId(vault_id): VestaId,
+    VestaId(vesta_id): VestaId,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Ack>), ErrResp> {
     // Unauthenticated surface (only a self-signed proof): rate-limit so an attacker can't cheaply
     // mass-create accounts (disk-fill) or flood the replay-nonce guard. Shared with the challenge
     // bucket; a TLS proxy does per-IP limiting in front, this is the in-process backstop.
-    if !state.enroll_rl.allow(&vault_id) {
+    if !state.enroll_rl.allow(&vesta_id) {
         return Err(err(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
@@ -391,7 +391,7 @@ async fn create_account(
         &state,
         &method,
         &paq(&uri),
-        &vault_id,
+        &vesta_id,
         &headers,
         &body,
         &req.device.device_id,
@@ -426,7 +426,7 @@ async fn create_account(
         ));
     }
     let (vid, enroll, did) = (
-        vault_id.clone(),
+        vesta_id.clone(),
         req.enroll.clone(),
         req.device.device_id.clone(),
     );
@@ -457,13 +457,13 @@ async fn enroll(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    VestaId(vault_id): VestaId,
+    VestaId(vesta_id): VestaId,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Ack>), ErrResp> {
     // Unauthenticated surface (proof + self-signed key only): rate-limit like /account so device
     // enrolment can't be used to flood the account/nonce state.
-    if !state.enroll_rl.allow(&vault_id) {
+    if !state.enroll_rl.allow(&vesta_id) {
         return Err(err(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
@@ -473,7 +473,7 @@ async fn enroll(
     let req: EnrollRequest = serde_json::from_slice(&body)
         .map_err(|e| err(StatusCode::BAD_REQUEST, "bad_body", &e.to_string()))?;
     // Gate on the enrolment proof (server holds only SHA-256 of the secret).
-    let vid = vault_id.clone();
+    let vid = vesta_id.clone();
     let rec = store_op(&state, move |s| s.enroll_record(&vid))
         .await?
         .map_err(db_err)?;
@@ -499,13 +499,13 @@ async fn enroll(
         &state,
         &method,
         &paq(&uri),
-        &vault_id,
+        &vesta_id,
         &headers,
         &body,
         &req.device.device_id,
         &req.device.pubkey_b64,
     )?;
-    let (vid2, did) = (vault_id.clone(), req.device.device_id.clone());
+    let (vid2, did) = (vesta_id.clone(), req.device.device_id.clone());
     let dev_log = req.device.device_id.clone();
     let upsert = store_op(&state, move |s| s.register_device(&vid2, &did, &pubkey))
         .await?
@@ -515,7 +515,7 @@ async fn enroll(
     // metadata the at-rest model guards, so this stays a local log, not an emitted record.)
     if upsert == crate::store::DeviceUpsert::KeyReplaced {
         eprintln!(
-            "vesta-sync: WARNING device '{dev_log}' key REPLACED on vault {vault_id} — verify this \
+            "vesta-sync: WARNING device '{dev_log}' key REPLACED on vault {vesta_id} — verify this \
              was an intentional re-key, not a hijack of an existing device id."
         );
     }
@@ -529,7 +529,7 @@ fn self_signed_pubkey(
     state: &AppState,
     method: &Method,
     path_and_query: &str,
-    vault_id: &str,
+    vesta_id: &str,
     headers: &HeaderMap,
     body: &[u8],
     body_device_id: &str,
@@ -557,7 +557,7 @@ fn self_signed_pubkey(
         &sh,
         method.as_str(),
         path_and_query,
-        vault_id,
+        vesta_id,
         body,
     )?;
     Ok(pubkey)
@@ -567,12 +567,12 @@ async fn push(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    VestaId(vault_id): VestaId,
+    VestaId(vesta_id): VestaId,
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<PushResponse> {
     let device_id =
-        auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, &body).await?;
+        auth_registered(&state, &method, &paq(&uri), &vesta_id, &headers, &body).await?;
     let req: PushRequest = serde_json::from_slice(&body)
         .map_err(|e| err(StatusCode::BAD_REQUEST, "bad_body", &e.to_string()))?;
     // Bound the batch size and reject oversized/empty identifier fields before they hit the store.
@@ -606,7 +606,7 @@ async fn push(
     }
     // Append + get back exactly this push's stored ops (with their assigned `seq`), built in the
     // same write transaction — no post-commit re-read, so no pooled-reader visibility question.
-    let vid = vault_id.clone();
+    let vid = vesta_id.clone();
     let ops = req.ops;
     let (accepted, duplicates, latest_seq, new_ops) =
         store_op(&state, move |s| s.push_ops(&vid, &ops))
@@ -626,7 +626,7 @@ async fn push(
             .iter()
             .filter_map(|o| serde_json::to_string(o).ok())
             .collect();
-        state.publish(&vault_id, &messages);
+        state.publish(&vesta_id, &messages);
     }
     Ok(Json(PushResponse {
         accepted,
@@ -645,17 +645,17 @@ async fn pull(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    VestaId(vault_id): VestaId,
+    VestaId(vesta_id): VestaId,
     Query(q): Query<PullQuery>,
     headers: HeaderMap,
 ) -> ApiResult<PullResponse> {
-    auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"").await?;
+    auth_registered(&state, &method, &paq(&uri), &vesta_id, &headers, b"").await?;
     let limit = q
         .limit
         .unwrap_or(state.cfg.max_pull)
         .min(state.cfg.max_pull);
     let since = q.since.unwrap_or(0);
-    let vid = vault_id.clone();
+    let vid = vesta_id.clone();
     let (ops, latest_seq) = store_op(&state, move |s| s.pull_ops(&vid, since, limit))
         .await?
         .map_err(db_err)?;
@@ -666,11 +666,11 @@ async fn status(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    VestaId(vault_id): VestaId,
+    VestaId(vesta_id): VestaId,
     headers: HeaderMap,
 ) -> ApiResult<StatusResponse> {
-    auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"").await?;
-    let vid = vault_id.clone();
+    auth_registered(&state, &method, &paq(&uri), &vesta_id, &headers, b"").await?;
+    let vid = vesta_id.clone();
     let (latest_seq, op_count, device_count) = store_op(&state, move |s| s.status(&vid))
         .await?
         .map_err(db_err)?;
@@ -681,17 +681,17 @@ async fn status(
     }))
 }
 
-/// `GET /v1/sync/{vault_id}/devices` — list the vault's enrolled devices (id + enrolment time).
+/// `GET /v1/sync/{vesta_id}/devices` — list the vault's enrolled devices (id + enrolment time).
 /// Device-signed like any read; lets a client show its devices and spot one it doesn't recognise.
 async fn list_devices(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    VestaId(vault_id): VestaId,
+    VestaId(vesta_id): VestaId,
     headers: HeaderMap,
 ) -> ApiResult<DevicesResponse> {
-    auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"").await?;
-    let vid = vault_id.clone();
+    auth_registered(&state, &method, &paq(&uri), &vesta_id, &headers, b"").await?;
+    let vid = vesta_id.clone();
     let rows = store_op(&state, move |s| s.list_devices(&vid))
         .await?
         .map_err(db_err)?;
@@ -705,7 +705,7 @@ async fn list_devices(
     Ok(Json(DevicesResponse { devices }))
 }
 
-/// `DELETE /v1/sync/{vault_id}/devices/{device_id}` — revoke a device's key so it can no longer
+/// `DELETE /v1/sync/{vesta_id}/devices/{device_id}` — revoke a device's key so it can no longer
 /// sign requests (it must re-enrol with the passphrase proof to return). Device-signed; any
 /// enrolled device of this (single-user) vault may revoke a lost/compromised one. `404` if the
 /// device is unknown.
@@ -713,14 +713,14 @@ async fn revoke_device(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    Path((vault_id, target_device_id)): Path<(String, String)>,
+    Path((vesta_id, target_device_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Ack> {
-    if !is_uuid_v4_lower(&vault_id) {
+    if !is_uuid_v4_lower(&vesta_id) {
         return Err(err(
             StatusCode::BAD_REQUEST,
-            "bad_vault_id",
-            "vault_id must be a lowercase UUIDv4",
+            "bad_vesta_id",
+            "vesta_id must be a lowercase UUIDv4",
         ));
     }
     // Bound the path-supplied device id (consistent with the push op-id caps) before it reaches
@@ -732,12 +732,12 @@ async fn revoke_device(
             "device_id is empty or exceeds the length limit",
         ));
     }
-    let caller = auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"").await?;
+    let caller = auth_registered(&state, &method, &paq(&uri), &vesta_id, &headers, b"").await?;
     // Refuse to revoke the LAST remaining device — that would lock the vault out of all signing
     // (a new device could only return via the passphrase enrol path). A compromised device can
     // still revoke its siblings (any device is the single user in this model), but never strand
     // the vault with zero keys.
-    let vid_count = vault_id.clone();
+    let vid_count = vesta_id.clone();
     let devices = store_op(&state, move |s| s.list_devices(&vid_count))
         .await?
         .map_err(db_err)?;
@@ -748,7 +748,7 @@ async fn revoke_device(
             "cannot revoke the last remaining device; enrol another device first",
         ));
     }
-    let (vid, did) = (vault_id.clone(), target_device_id.clone());
+    let (vid, did) = (vesta_id.clone(), target_device_id.clone());
     let removed = store_op(&state, move |s| s.revoke_device(&vid, &did))
         .await?
         .map_err(db_err)?;
@@ -760,12 +760,12 @@ async fn revoke_device(
         ));
     }
     eprintln!(
-        "vesta-sync: device '{target_device_id}' revoked on vault {vault_id} by device '{caller}'"
+        "vesta-sync: device '{target_device_id}' revoked on vault {vesta_id} by device '{caller}'"
     );
     Ok(Json(Ack { ok: true }))
 }
 
-/// `GET /v1/sync/{vault_id}/tail` — WebSocket live tail. The upgrade request is device-signed
+/// `GET /v1/sync/{vesta_id}/tail` — WebSocket live tail. The upgrade request is device-signed
 /// exactly like a GET (empty body); after it verifies, the socket streams each newly-pushed
 /// `StoredOp` as a JSON text frame. A subscriber that falls behind the buffer is sent
 /// `{"resync":true}` and should do a full `pull`.
@@ -773,16 +773,16 @@ async fn tail(
     State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    VestaId(vault_id): VestaId,
+    VestaId(vesta_id): VestaId,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
     if let Err(rejection) =
-        auth_registered(&state, &method, &paq(&uri), &vault_id, &headers, b"").await
+        auth_registered(&state, &method, &paq(&uri), &vesta_id, &headers, b"").await
     {
         return rejection.into_response();
     }
-    let rx = state.subscribe(&vault_id);
+    let rx = state.subscribe(&vesta_id);
     ws.on_upgrade(move |socket| tail_loop(socket, rx))
 }
 
@@ -1148,7 +1148,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_uuid_vault_id_is_400() {
+    async fn non_uuid_vesta_id_is_400() {
         let st = state();
         // A bogus (non-UUIDv4) vault id is rejected at the extractor, before any store touch.
         let req = Request::builder()
@@ -1159,7 +1159,7 @@ mod tests {
         let (status, body) = send(&st, req).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let e: ErrorBody = serde_json::from_slice(&body).unwrap();
-        assert_eq!(e.error, "bad_vault_id");
+        assert_eq!(e.error, "bad_vesta_id");
     }
 
     /// End-to-end live tail over a real WebSocket: an enrolled device opens a (device-signed)

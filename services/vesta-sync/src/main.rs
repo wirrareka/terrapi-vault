@@ -1,7 +1,7 @@
 //! vesta-sync — personal multi-device vault sync for memento/probe (Svet B).
 //!
 //! Server-blind row-level **oplog**: stores only opaque encrypted ops (`{op_id, device_id,
-//! hlc, collection_id, encrypted_payload}`) partitioned by `vault_id`, plus device public
+//! hlc, collection_id, encrypted_payload}`) partitioned by `vesta_id`, plus device public
 //! keys and an enrolment verifier. Never holds the vault key or plaintext. Device-keypair
 //! (ed25519) request auth; enrolment via a passphrase-derived secret (Argon2 verifier).
 //! Per-row LWW / CRDT live client-side. Carries NONE of the platform (no OpenSearch, tenants,

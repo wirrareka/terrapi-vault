@@ -24,7 +24,7 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub replay: Arc<ReplayGuard>,
     /// Per-vault token bucket guarding the unauthenticated `enroll-challenge` (read) endpoint.
-    /// Keyed by `vault_id` so probing one vault cannot throttle another.
+    /// Keyed by `vesta_id` so probing one vault cannot throttle another.
     pub challenge_rl: Arc<KeyedRateBucket>,
     /// Separate per-vault token bucket for the unauthenticated `account` + `enroll` (write)
     /// endpoints, so a flood of cheap `enroll-challenge` probes cannot starve the owner's actual
@@ -35,7 +35,7 @@ pub struct AppState {
     pub sem: Arc<tokio::sync::Semaphore>,
     /// Prometheus metrics, scraped on the loopback metrics listener.
     pub metrics: Arc<Metrics>,
-    /// Per-`vault_id` broadcast of newly-pushed ops (pre-serialised JSON) to live-tail
+    /// Per-`vesta_id` broadcast of newly-pushed ops (pre-serialised JSON) to live-tail
     /// WebSocket subscribers. Created lazily on first subscribe; the message is a `StoredOp`.
     tails: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
 }
@@ -66,23 +66,23 @@ impl AppState {
             .sum()
     }
 
-    /// Subscribe to the live tail for `vault_id` (creating its channel on first use).
+    /// Subscribe to the live tail for `vesta_id` (creating its channel on first use).
     #[must_use]
-    pub fn subscribe(&self, vault_id: &str) -> broadcast::Receiver<String> {
+    pub fn subscribe(&self, vesta_id: &str) -> broadcast::Receiver<String> {
         let mut tails = self.tails.lock().expect("tails lock");
         // Drop channels nobody is listening to any more so the map is bounded by the number of
-        // vaults with a live subscriber — not by every vault_id ever tailed.
+        // vaults with a live subscriber — not by every vesta_id ever tailed.
         tails.retain(|_, tx| tx.receiver_count() > 0);
         tails
-            .entry(vault_id.to_owned())
+            .entry(vesta_id.to_owned())
             .or_insert_with(|| broadcast::channel(TAIL_CAPACITY).0)
             .subscribe()
     }
 
-    /// Fan out freshly-stored ops to any live-tail subscribers of `vault_id`. No-op if none.
-    pub fn publish(&self, vault_id: &str, messages: &[String]) {
+    /// Fan out freshly-stored ops to any live-tail subscribers of `vesta_id`. No-op if none.
+    pub fn publish(&self, vesta_id: &str, messages: &[String]) {
         let tails = self.tails.lock().expect("tails lock");
-        if let Some(tx) = tails.get(vault_id) {
+        if let Some(tx) = tails.get(vesta_id) {
             for m in messages {
                 // `send` errors only when there are no receivers — harmless here.
                 let _ = tx.send(m.clone());

@@ -54,12 +54,12 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 pub fn canonical_string(
     method: &str,
     path_and_query: &str,
-    vault_id: &str,
+    vesta_id: &str,
     ts: i64,
     nonce: &str,
     body_sha256_hex: &str,
 ) -> String {
-    format!("v1\n{method}\n{path_and_query}\n{vault_id}\n{ts}\n{nonce}\n{body_sha256_hex}")
+    format!("v1\n{method}\n{path_and_query}\n{vesta_id}\n{ts}\n{nonce}\n{body_sha256_hex}")
 }
 
 /// Decode a base64 ed25519 public key (32 bytes).
@@ -208,13 +208,13 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD;
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let pubkey_b64 = b64.encode(sk.verifying_key().to_bytes());
-        let vault_id = "11111111-1111-4111-8111-111111111111";
+        let vesta_id = "11111111-1111-4111-8111-111111111111";
         let body = br#"{"ops":[]}"#;
         let body_hash = sha256_hex(body);
         let canonical = canonical_string(
             "POST",
             "/v1/sync/11111111-1111-4111-8111-111111111111/push",
-            vault_id,
+            vesta_id,
             1_700_000_000,
             "f47ac10b-58cc-4372-a567-0e02b2c3d479",
             &body_hash,

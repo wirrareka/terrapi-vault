@@ -81,7 +81,7 @@ pub async fn concurrency_limit(
 }
 
 /// Record `vault_sync_http_*` for a served request. Applied as a `route_layer`, so it runs
-/// after routing and the `MatchedPath` template (e.g. `/v1/sync/{vault_id}/push`) is the
+/// after routing and the `MatchedPath` template (e.g. `/v1/sync/{vesta_id}/push`) is the
 /// (bounded, id-free) label — never the concrete vault id.
 pub async fn record_metrics(
     State(state): State<AppState>,

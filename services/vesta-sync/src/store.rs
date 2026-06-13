@@ -1,7 +1,7 @@
 //! Server-blind op store (SQLite via the lib's `rusqlite` re-export; optionally
 //! SQLCipher-encrypted at rest — see [`Store::open`]'s `key`). Holds only: the per-vault
 //! enrolment verifier, device public keys, and opaque encrypted ops. Never the vault key or
-//! plaintext. `seq` is a per-`vault_id` monotonic cursor for `pull`.
+//! plaintext. `seq` is a per-`vesta_id` monotonic cursor for `pull`.
 
 use crate::dto::{EnrollVerifier, Op, StoredOp};
 use base64::Engine as _;
@@ -120,21 +120,21 @@ impl Store {
              PRAGMA foreign_keys = ON;
              PRAGMA busy_timeout = 5000;
              CREATE TABLE IF NOT EXISTS accounts (
-                 vault_id      TEXT PRIMARY KEY,
+                 vesta_id      TEXT PRIMARY KEY,
                  enroll_salt   BLOB NOT NULL,
                  enroll_params TEXT NOT NULL,
                  enroll_hash   BLOB NOT NULL,
                  created_at    INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS devices (
-                 vault_id    TEXT NOT NULL,
+                 vesta_id    TEXT NOT NULL,
                  device_id   TEXT NOT NULL,
                  pubkey      BLOB NOT NULL,
                  enrolled_at INTEGER NOT NULL,
-                 PRIMARY KEY (vault_id, device_id)
+                 PRIMARY KEY (vesta_id, device_id)
              );
              CREATE TABLE IF NOT EXISTS ops (
-                 vault_id      TEXT NOT NULL,
+                 vesta_id      TEXT NOT NULL,
                  seq           INTEGER NOT NULL,
                  op_id         TEXT NOT NULL,
                  device_id     TEXT NOT NULL,
@@ -143,10 +143,33 @@ impl Store {
                  collection_id TEXT NOT NULL,
                  payload       BLOB NOT NULL,
                  created_at    INTEGER NOT NULL,
-                 PRIMARY KEY (vault_id, seq),
-                 UNIQUE (vault_id, op_id)
+                 PRIMARY KEY (vesta_id, seq),
+                 UNIQUE (vesta_id, op_id)
              );",
-        )
+        )?;
+        Self::migrate_vault_id_columns(conn)
+    }
+
+    /// Transparently rename the legacy `vault_id` column → `vesta_id` on an existing server DB
+    /// (the vault→vesta rename). Idempotent; a no-op on a fresh DB (the CREATEs above already use
+    /// `vesta_id`). SQLite's `ALTER TABLE … RENAME COLUMN` rewrites the PK / UNIQUE references too.
+    fn migrate_vault_id_columns(conn: &Connection) -> rusqlite::Result<()> {
+        for table in ["accounts", "devices", "ops"] {
+            let has = |col: &str| -> rusqlite::Result<bool> {
+                conn.query_row(
+                    &format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+                    [col],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|n| n > 0)
+            };
+            if has("vault_id")? && !has("vesta_id")? {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE {table} RENAME COLUMN vault_id TO vesta_id;"
+                ))?;
+            }
+        }
+        Ok(())
     }
 
     /// Create the account + register the first device, atomically. Returns `false` (and
@@ -158,7 +181,7 @@ impl Store {
     /// permanently brick enrolment for this vault); [`AccountError::Db`] on a storage error.
     pub fn create_account(
         &self,
-        vault_id: &str,
+        vesta_id: &str,
         enroll: &EnrollVerifier,
         device_id: &str,
         pubkey: &[u8; 32],
@@ -166,8 +189,8 @@ impl Store {
         let conn = self.writer.lock().expect("writer lock");
         let tx = conn.unchecked_transaction()?;
         if tx
-            .prepare("SELECT 1 FROM accounts WHERE vault_id = ?1")?
-            .exists([vault_id])?
+            .prepare("SELECT 1 FROM accounts WHERE vesta_id = ?1")?
+            .exists([vesta_id])?
         {
             return Ok(false);
         }
@@ -186,14 +209,14 @@ impl Store {
             serde_json::to_string(&enroll.params).map_err(|_| AccountError::InvalidVerifier)?;
         let now = now_unix();
         tx.execute(
-            "INSERT INTO accounts (vault_id, enroll_salt, enroll_params, enroll_hash, created_at)
+            "INSERT INTO accounts (vesta_id, enroll_salt, enroll_params, enroll_hash, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![vault_id, salt, params_json, hash, now],
+            params![vesta_id, salt, params_json, hash, now],
         )?;
         tx.execute(
-            "INSERT INTO devices (vault_id, device_id, pubkey, enrolled_at)
+            "INSERT INTO devices (vesta_id, device_id, pubkey, enrolled_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![vault_id, device_id, pubkey.as_slice(), now],
+            params![vesta_id, device_id, pubkey.as_slice(), now],
         )?;
         tx.commit()?;
         Ok(true)
@@ -201,11 +224,11 @@ impl Store {
 
     /// The enrolment challenge (salt + params) a new device needs, plus the verifier hash.
     /// `None` if no such account.
-    pub fn enroll_record(&self, vault_id: &str) -> rusqlite::Result<Option<EnrollRecord>> {
+    pub fn enroll_record(&self, vesta_id: &str) -> rusqlite::Result<Option<EnrollRecord>> {
         self.with_reader(|c| {
             c.query_row(
-                "SELECT enroll_salt, enroll_params, enroll_hash FROM accounts WHERE vault_id = ?1",
-                [vault_id],
+                "SELECT enroll_salt, enroll_params, enroll_hash FROM accounts WHERE vesta_id = ?1",
+                [vesta_id],
                 |r| {
                     let salt: Vec<u8> = r.get(0)?;
                     let params_json: String = r.get(1)?;
@@ -224,22 +247,22 @@ impl Store {
     /// routine enrol.
     pub fn register_device(
         &self,
-        vault_id: &str,
+        vesta_id: &str,
         device_id: &str,
         pubkey: &[u8; 32],
     ) -> rusqlite::Result<DeviceUpsert> {
         let conn = self.writer.lock().expect("writer lock");
         let existing: Option<Vec<u8>> = conn
             .query_row(
-                "SELECT pubkey FROM devices WHERE vault_id = ?1 AND device_id = ?2",
-                params![vault_id, device_id],
+                "SELECT pubkey FROM devices WHERE vesta_id = ?1 AND device_id = ?2",
+                params![vesta_id, device_id],
                 |r| r.get(0),
             )
             .optional()?;
         conn.execute(
-            "INSERT OR REPLACE INTO devices (vault_id, device_id, pubkey, enrolled_at)
+            "INSERT OR REPLACE INTO devices (vesta_id, device_id, pubkey, enrolled_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![vault_id, device_id, pubkey.as_slice(), now_unix()],
+            params![vesta_id, device_id, pubkey.as_slice(), now_unix()],
         )?;
         Ok(match existing {
             None => DeviceUpsert::Created,
@@ -251,23 +274,23 @@ impl Store {
     /// Revoke (delete) a device's key. Returns `true` if a device was removed, `false` if no such
     /// device existed (idempotent). A revoked device can no longer sign requests (its pubkey is
     /// gone) until it re-enrols with the passphrase proof.
-    pub fn revoke_device(&self, vault_id: &str, device_id: &str) -> rusqlite::Result<bool> {
+    pub fn revoke_device(&self, vesta_id: &str, device_id: &str) -> rusqlite::Result<bool> {
         let conn = self.writer.lock().expect("writer lock");
         let n = conn.execute(
-            "DELETE FROM devices WHERE vault_id = ?1 AND device_id = ?2",
-            params![vault_id, device_id],
+            "DELETE FROM devices WHERE vesta_id = ?1 AND device_id = ?2",
+            params![vesta_id, device_id],
         )?;
         Ok(n > 0)
     }
 
     /// List a vault's registered devices (id + enrolment time). The pubkey is public but omitted
     /// here — the operator view only needs which devices exist and when they enrolled.
-    pub fn list_devices(&self, vault_id: &str) -> rusqlite::Result<Vec<(String, i64)>> {
+    pub fn list_devices(&self, vesta_id: &str) -> rusqlite::Result<Vec<(String, i64)>> {
         self.with_reader(|c| {
             let mut stmt = c.prepare(
-                "SELECT device_id, enrolled_at FROM devices WHERE vault_id = ?1 ORDER BY enrolled_at",
+                "SELECT device_id, enrolled_at FROM devices WHERE vesta_id = ?1 ORDER BY enrolled_at",
             )?;
-            let rows = stmt.query_map([vault_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            let rows = stmt.query_map([vesta_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
         })
     }
@@ -275,13 +298,13 @@ impl Store {
     /// A registered device's ed25519 public key, if any.
     pub fn device_pubkey(
         &self,
-        vault_id: &str,
+        vesta_id: &str,
         device_id: &str,
     ) -> rusqlite::Result<Option<[u8; 32]>> {
         let raw: Option<Vec<u8>> = self.with_reader(|c| {
             c.query_row(
-                "SELECT pubkey FROM devices WHERE vault_id = ?1 AND device_id = ?2",
-                params![vault_id, device_id],
+                "SELECT pubkey FROM devices WHERE vesta_id = ?1 AND device_id = ?2",
+                params![vesta_id, device_id],
                 |r| r.get(0),
             )
             .optional()
@@ -289,12 +312,12 @@ impl Store {
         Ok(raw.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()))
     }
 
-    /// Highest `seq` stored for `vault_id` (0 if none).
-    pub fn latest_seq(&self, vault_id: &str) -> rusqlite::Result<u64> {
+    /// Highest `seq` stored for `vesta_id` (0 if none).
+    pub fn latest_seq(&self, vesta_id: &str) -> rusqlite::Result<u64> {
         let seq: i64 = self.with_reader(|c| {
             c.query_row(
-                "SELECT COALESCE(MAX(seq), 0) FROM ops WHERE vault_id = ?1",
-                [vault_id],
+                "SELECT COALESCE(MAX(seq), 0) FROM ops WHERE vesta_id = ?1",
+                [vesta_id],
                 |r| r.get(0),
             )
         })?;
@@ -309,28 +332,28 @@ impl Store {
     /// with `InvalidPayload`.
     pub fn push_ops(
         &self,
-        vault_id: &str,
+        vesta_id: &str,
         ops: &[Op],
     ) -> Result<(u64, u64, u64, Vec<StoredOp>), PushError> {
         let conn = self.writer.lock().expect("writer lock");
         let tx = conn.unchecked_transaction()?;
         let mut seq: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(seq), 0) FROM ops WHERE vault_id = ?1",
-            [vault_id],
+            "SELECT COALESCE(MAX(seq), 0) FROM ops WHERE vesta_id = ?1",
+            [vesta_id],
             |r| r.get(0),
         )?;
         let (mut accepted, mut duplicates) = (0u64, 0u64);
         let mut stored = Vec::new();
         {
-            let mut exists = tx.prepare("SELECT 1 FROM ops WHERE vault_id = ?1 AND op_id = ?2")?;
+            let mut exists = tx.prepare("SELECT 1 FROM ops WHERE vesta_id = ?1 AND op_id = ?2")?;
             let mut insert = tx.prepare(
                 "INSERT INTO ops
-                   (vault_id, seq, op_id, device_id, hlc_wall, hlc_counter, collection_id, payload, created_at)
+                   (vesta_id, seq, op_id, device_id, hlc_wall, hlc_counter, collection_id, payload, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             let now = now_unix();
             for op in ops {
-                if exists.exists(params![vault_id, op.op_id])? {
+                if exists.exists(params![vesta_id, op.op_id])? {
                     duplicates += 1;
                     continue;
                 }
@@ -339,7 +362,7 @@ impl Store {
                     .map_err(|_| PushError::InvalidPayload)?;
                 seq += 1;
                 insert.execute(params![
-                    vault_id,
+                    vesta_id,
                     seq,
                     op.op_id,
                     op.device_id,
@@ -369,7 +392,7 @@ impl Store {
     /// current high-water `seq` so the client knows whether more remains.
     pub fn pull_ops(
         &self,
-        vault_id: &str,
+        vesta_id: &str,
         since: u64,
         limit: u32,
     ) -> rusqlite::Result<(Vec<StoredOp>, u64)> {
@@ -377,12 +400,12 @@ impl Store {
             let mut stmt = c.prepare(
                 "SELECT seq, op_id, device_id, hlc_wall, hlc_counter, collection_id, payload
                    FROM ops
-                  WHERE vault_id = ?1 AND seq > ?2
+                  WHERE vesta_id = ?1 AND seq > ?2
                   ORDER BY seq ASC
                   LIMIT ?3",
             )?;
             let rows = stmt.query_map(
-                params![vault_id, i64::try_from(since).unwrap_or(i64::MAX), limit],
+                params![vesta_id, i64::try_from(since).unwrap_or(i64::MAX), limit],
                 |r| {
                     let seq: i64 = r.get(0)?;
                     let payload: Vec<u8> = r.get(6)?;
@@ -404,27 +427,27 @@ impl Store {
             )?;
             rows.collect::<rusqlite::Result<_>>()
         })?;
-        let latest = self.latest_seq(vault_id)?;
+        let latest = self.latest_seq(vesta_id)?;
         Ok((ops, latest))
     }
 
-    /// `(latest_seq, op_count, device_count)` for `vault_id`.
-    pub fn status(&self, vault_id: &str) -> rusqlite::Result<(u64, u64, u64)> {
+    /// `(latest_seq, op_count, device_count)` for `vesta_id`.
+    pub fn status(&self, vesta_id: &str) -> rusqlite::Result<(u64, u64, u64)> {
         let (op_count, device_count): (i64, i64) = self.with_reader(|c| {
             let op_count = c.query_row(
-                "SELECT COUNT(*) FROM ops WHERE vault_id = ?1",
-                [vault_id],
+                "SELECT COUNT(*) FROM ops WHERE vesta_id = ?1",
+                [vesta_id],
                 |r| r.get(0),
             )?;
             let device_count = c.query_row(
-                "SELECT COUNT(*) FROM devices WHERE vault_id = ?1",
-                [vault_id],
+                "SELECT COUNT(*) FROM devices WHERE vesta_id = ?1",
+                [vesta_id],
                 |r| r.get(0),
             )?;
             Ok((op_count, device_count))
         })?;
         Ok((
-            self.latest_seq(vault_id)?,
+            self.latest_seq(vesta_id)?,
             u64::try_from(op_count).unwrap_or(0),
             u64::try_from(device_count).unwrap_or(0),
         ))
@@ -454,6 +477,37 @@ pub enum AccountError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrates_legacy_vault_id_columns_to_vesta_id() {
+        let s = Store::open_memory().unwrap();
+        let c = s.writer.lock().unwrap();
+        // Simulate a pre-rename server DB: rename the columns back to the legacy `vault_id`.
+        c.execute_batch(
+            "ALTER TABLE accounts RENAME COLUMN vesta_id TO vault_id;
+             ALTER TABLE devices RENAME COLUMN vesta_id TO vault_id;
+             ALTER TABLE ops RENAME COLUMN vesta_id TO vault_id;",
+        )
+        .unwrap();
+        Store::migrate_vault_id_columns(&c).unwrap();
+        for t in ["accounts", "devices", "ops"] {
+            let new: i64 = c
+                .query_row(
+                    &format!("SELECT count(*) FROM pragma_table_info('{t}') WHERE name='vesta_id'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let old: i64 = c
+                .query_row(
+                    &format!("SELECT count(*) FROM pragma_table_info('{t}') WHERE name='vault_id'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!((new, old), (1, 0), "{t}: vault_id -> vesta_id");
+        }
+    }
 
     fn op(id: &str, wall: u64) -> Op {
         Op {

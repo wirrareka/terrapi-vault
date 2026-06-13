@@ -66,7 +66,7 @@ mod tests {
     fn render_includes_counters_and_gauges() {
         let m = Metrics::default();
         m.record_request(
-            "/v1/sync/{vault_id}/push",
+            "/v1/sync/{vesta_id}/push",
             "POST",
             200,
             Duration::from_millis(5),
@@ -79,10 +79,10 @@ mod tests {
         assert!(text.contains("vault_sync_tail_subscribers 4"));
         assert!(text.contains("vault_sync_http_inflight 2"));
         assert!(text.contains(
-            "vault_sync_http_requests_total{route=\"/v1/sync/{vault_id}/push\",method=\"POST\",status=\"200\"} 1"
+            "vault_sync_http_requests_total{route=\"/v1/sync/{vesta_id}/push\",method=\"POST\",status=\"200\"} 1"
         ));
         assert!(text.contains(
-            "vault_sync_http_request_duration_ms_count{route=\"/v1/sync/{vault_id}/push\"} 1"
+            "vault_sync_http_request_duration_ms_count{route=\"/v1/sync/{vesta_id}/push\"} 1"
         ));
     }
 }

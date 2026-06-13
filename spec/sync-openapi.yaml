@@ -4,7 +4,7 @@ info:
   version: 1.0.0
   description: |
     Server-blind row-level oplog for memento/probe. The server stores only opaque encrypted
-    ops partitioned by `vault_id`, device public keys, and an enrolment verifier — never the
+    ops partitioned by `vesta_id`, device public keys, and an enrolment verifier — never the
     vault key or plaintext. Per-row LWW / CRDT are client-side. NOT multi-tenant; carries
     none of the platform (no OpenSearch / tenants / residency). See
     docs/planning/02-vault-sync-oplog.md. Source of truth for the wire contract.
@@ -17,12 +17,12 @@ info:
     **canonical string** (no trailing newline):
 
     ```
-    v1\n{METHOD}\n{PATH_AND_QUERY}\n{vault_id}\n{ts}\n{nonce}\n{body_sha256_hex}
+    v1\n{METHOD}\n{PATH_AND_QUERY}\n{vesta_id}\n{ts}\n{nonce}\n{body_sha256_hex}
     ```
 
     - `METHOD` — uppercase HTTP method (`GET`/`POST`).
     - `PATH_AND_QUERY` — exact request target incl. query string, e.g.
-      `/v1/sync/<vault_id>/pull?since=0&limit=100` (must byte-match what the server receives).
+      `/v1/sync/<vesta_id>/pull?since=0&limit=100` (must byte-match what the server receives).
     - `ts` — the `X-Sync-Ts` value (unix **seconds**, decimal, no padding).
     - `nonce` — the `X-Sync-Nonce` value; an opaque unique token (a UUIDv4 is fine).
     - `body_sha256_hex` — lowercase hex SHA-256 of the **raw request body bytes**. For a GET /
@@ -46,7 +46,7 @@ info:
     | `pubkey_b64` | `6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=` |
     | `METHOD` | `POST` |
     | `PATH_AND_QUERY` | `/v1/sync/11111111-1111-4111-8111-111111111111/push` |
-    | `vault_id` | `11111111-1111-4111-8111-111111111111` |
+    | `vesta_id` | `11111111-1111-4111-8111-111111111111` |
     | `ts` | `1700000000` |
     | `nonce` | `f47ac10b-58cc-4372-a567-0e02b2c3d479` |
     | body | `{"ops":[]}` |
@@ -64,8 +64,8 @@ servers:
 # error-code catalog all live in `info.description` above (the client-facing contract).
 components:
   parameters:
-    VaultId:
-      name: vault_id
+    VestaId:
+      name: vesta_id
       in: path
       required: true
       schema: { type: string, format: uuid }
@@ -121,7 +121,7 @@ components:
           type: string
           description: stable machine-readable code
           enum:
-            - bad_vault_id      # 400 — vault_id is not a lowercase UUIDv4
+            - bad_vesta_id      # 400 — vesta_id is not a lowercase UUIDv4
             - bad_body          # 400 — request JSON did not parse
             - bad_verifier      # 400 — enrol verifier malformed (hash not 32-byte base64)
             - bad_proof         # 400/401 — proof not base64 / did not match the verifier
@@ -163,17 +163,17 @@ paths:
           description: ok
           content: { application/json: { schema: { type: object, required: [status, version], properties: { status: { type: string, enum: [ok] }, version: { type: string } } } } }
 
-  /v1/sync/{vault_id}/account:
+  /v1/sync/{vesta_id}/account:
     post:
       summary: Create the sync account (first device). Self-signed; proof-gated.
       description: >
-        `vault_id` must be a lowercase UUIDv4 (else `400 bad_vault_id`). The body carries
+        `vesta_id` must be a lowercase UUIDv4 (else `400 bad_vesta_id`). The body carries
         `proof_b64` — the client-side enrolment secret — and the server checks
         `SHA-256(proof_b64) == enroll.hash_b64` before creating the account. This guarantees the
         verifier is genuinely derivable (a later device with the same passphrase can enrol) and
         rejects a malformed verifier that would otherwise brick the vault. The proof is checked
         then discarded, never stored.
-      parameters: [ { $ref: '#/components/parameters/VaultId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
+      parameters: [ { $ref: '#/components/parameters/VestaId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
       requestBody:
         required: true
         content:
@@ -187,27 +187,27 @@ paths:
                 device:    { $ref: '#/components/schemas/DeviceRegistration' }
       responses:
         '201': { description: created }
-        '400': { description: 'bad_vault_id / bad_verifier / bad_proof', content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
+        '400': { description: 'bad_vesta_id / bad_verifier / bad_proof', content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
         '401': { description: bad self-signature or proof does not match the verifier, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
         '409': { description: account already exists, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
 
-  /v1/sync/{vault_id}/enroll-challenge:
+  /v1/sync/{vesta_id}/enroll-challenge:
     get:
       summary: Non-secret salt + Argon2 params a new device needs to derive its enrolment proof.
-      description: Unauthenticated and rate-limited (`429 rate_limited` on excess). `vault_id` must be a lowercase UUIDv4.
-      parameters: [ { $ref: '#/components/parameters/VaultId' } ]
+      description: Unauthenticated and rate-limited (`429 rate_limited` on excess). `vesta_id` must be a lowercase UUIDv4.
+      parameters: [ { $ref: '#/components/parameters/VestaId' } ]
       responses:
         '200':
           description: challenge
           content: { application/json: { schema: { type: object, properties: { salt_b64: { type: string }, params: { type: object } } } } }
-        '400': { description: bad_vault_id, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
+        '400': { description: bad_vesta_id, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
         '404': { description: no account, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
         '429': { description: rate limited, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
 
-  /v1/sync/{vault_id}/enroll:
+  /v1/sync/{vesta_id}/enroll:
     post:
       summary: Enrol a new device (self-signed by the new key, gated by the enrolment proof).
-      parameters: [ { $ref: '#/components/parameters/VaultId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
+      parameters: [ { $ref: '#/components/parameters/VestaId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
       requestBody:
         required: true
         content:
@@ -223,17 +223,17 @@ paths:
         '401': { description: bad proof or self-signature, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
         '404': { description: no account }
 
-  /v1/sync/{vault_id}/push:
+  /v1/sync/{vesta_id}/push:
     post:
       summary: Append ops (device-signed). Idempotent on op_id.
       description: >
-        Each op is assigned a fresh per-`vault_id` `seq` and appended. **Idempotent on `op_id`**:
+        Each op is assigned a fresh per-`vesta_id` `seq` and appended. **Idempotent on `op_id`**:
         an `op_id` already stored is skipped and counted in `duplicates` (never re-applied and it
         does not consume a new `seq`), so a client may safely retry a push after a network error.
         `accepted` + `duplicates` == `len(ops)`. `latest_seq` is the vault's new high-water seq.
         A device may only author ops under its own `device_id` (else `403 device_mismatch`); a
         single malformed `encrypted_payload` rejects the whole batch (`400 bad_payload`).
-      parameters: [ { $ref: '#/components/parameters/VaultId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
+      parameters: [ { $ref: '#/components/parameters/VestaId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
       requestBody:
         required: true
         content:
@@ -250,7 +250,7 @@ paths:
         '403': { description: an op.device_id did not match the calling device, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
         '400': { description: malformed body or payload, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
 
-  /v1/sync/{vault_id}/pull:
+  /v1/sync/{vesta_id}/pull:
     get:
       summary: Ops with seq > since (device-signed). Sign over an empty body.
       description: >
@@ -260,7 +260,7 @@ paths:
         loop, advancing `since` to the last `seq`, until they meet. `latest_seq` is the vault's
         current high-water seq (so an empty page with `since == latest_seq` means fully caught up).
       parameters:
-        - { $ref: '#/components/parameters/VaultId' }
+        - { $ref: '#/components/parameters/VestaId' }
         - { name: since, in: query, schema: { type: integer, default: 0 }, description: return ops with seq strictly greater than this }
         - { name: limit, in: query, schema: { type: integer }, description: page size; clamped to the server max (default 500) }
         - { $ref: '#/components/parameters/DeviceId' }
@@ -271,33 +271,33 @@ paths:
         '200':
           description: ops
           content: { application/json: { schema: { type: object, required: [ops, latest_seq], properties: { ops: { type: array, items: { $ref: '#/components/schemas/StoredOp' } }, latest_seq: { type: integer } } } } }
-        '400': { description: bad_vault_id, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
+        '400': { description: bad_vesta_id, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
         '401': { description: unauthenticated, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
 
-  /v1/sync/{vault_id}/status:
+  /v1/sync/{vesta_id}/status:
     get:
       summary: Vault sync status (device-signed). Sign over an empty body.
-      parameters: [ { $ref: '#/components/parameters/VaultId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
+      parameters: [ { $ref: '#/components/parameters/VestaId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
       responses:
         '200':
           description: status
           content: { application/json: { schema: { type: object, properties: { latest_seq: { type: integer }, op_count: { type: integer }, device_count: { type: integer } } } } }
         '401': { description: unauthenticated }
 
-  /v1/sync/{vault_id}/devices:
+  /v1/sync/{vesta_id}/devices:
     get:
       summary: List enrolled devices (device-signed). Sign over an empty body.
       description: >
         Returns the vault's enrolled devices (id + enrolment time; no public keys). Lets a client
         show its devices and spot one it does not recognise (a candidate for revocation).
-      parameters: [ { $ref: '#/components/parameters/VaultId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
+      parameters: [ { $ref: '#/components/parameters/VestaId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
       responses:
         '200':
           description: devices
           content: { application/json: { schema: { type: object, properties: { devices: { type: array, items: { type: object, properties: { device_id: { type: string }, enrolled_at: { type: integer } } } } } } } }
         '401': { description: unauthenticated }
 
-  /v1/sync/{vault_id}/devices/{device_id}:
+  /v1/sync/{vesta_id}/devices/{device_id}:
     delete:
       summary: Revoke a device (device-signed). Sign over an empty body.
       description: >
@@ -306,7 +306,7 @@ paths:
         lost/compromised one (including itself). Idempotent only in effect — an unknown device is
         `404`.
       parameters:
-        - { $ref: '#/components/parameters/VaultId' }
+        - { $ref: '#/components/parameters/VestaId' }
         - { name: device_id, in: path, required: true, schema: { type: string }, description: the device id to revoke }
         - { $ref: '#/components/parameters/DeviceId' }
         - { $ref: '#/components/parameters/SyncTs' }
@@ -317,7 +317,7 @@ paths:
         '401': { description: unauthenticated }
         '404': { description: no_such_device, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
 
-  /v1/sync/{vault_id}/tail:
+  /v1/sync/{vesta_id}/tail:
     get:
       summary: WebSocket live tail (device-signed upgrade).
       description: >
@@ -327,10 +327,10 @@ paths:
         server's buffer (≈256 ops) — on receiving it, drop the socket state and do a full `pull`
         from your last `seq`, then optionally re-`tail`. The server does not read client frames
         except to detect close. See `TailFrame`.
-      parameters: [ { $ref: '#/components/parameters/VaultId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
+      parameters: [ { $ref: '#/components/parameters/VestaId' }, { $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/SyncTs' }, { $ref: '#/components/parameters/SyncNonce' }, { $ref: '#/components/parameters/SyncSig' } ]
       responses:
         '101':
           description: switching protocols; thereafter each WS text frame is a TailFrame
           content: { application/json: { schema: { $ref: '#/components/schemas/TailFrame' } } }
-        '400': { description: bad_vault_id, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
+        '400': { description: bad_vesta_id, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
         '401': { description: unauthenticated, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
