@@ -1,7 +1,7 @@
 //! v1 broker HTTP surface (axum). All v1 ops are implemented: sessions + leases (against
 //! the lease engine), the SSH-CA (`ssh/ca`, `ssh/sign`), and dynamic creds (`creds`, via
 //! the OpenSearch engine). Issuance is session-bound + sealed-gated; every state-changing
-//! op emits a B3 audit event (`source:"vault"`).
+//! op emits a B3 audit event (`source:"vesta"`).
 
 use crate::auth::{Capability, Principal};
 use crate::dto::{

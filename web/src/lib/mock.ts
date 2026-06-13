@@ -79,9 +79,9 @@ const objectStore: ObjectStoreResponse = {
 
 const audit: AuditResponse = {
   records: [
-    { broker: B1, seq: 41, event: { ts: "2026-06-06T18:00:01Z", source: "vault", action: "creds.issue", outcome: "success", target: { kind: "creds", id: "role=audit-writer;tenant=" + T1 } } },
-    { broker: B1, seq: 42, event: { ts: "2026-06-06T18:01:10Z", source: "vault", action: "object_store.presign", outcome: "success", target: { kind: "object-store", id: "key=t/" + T1 + "/berlin/v3.pmtiles" } } },
-    { broker: B2, seq: 17, event: { ts: "2026-06-06T18:02:30Z", source: "vault", action: "ssh.sign", outcome: "success", target: { kind: "ssh", id: "serial=4472" } } },
+    { broker: B1, seq: 41, event: { ts: "2026-06-06T18:00:01Z", source: "vesta", action: "creds.issue", outcome: "success", target: { kind: "creds", id: "role=audit-writer;tenant=" + T1 } } },
+    { broker: B1, seq: 42, event: { ts: "2026-06-06T18:01:10Z", source: "vesta", action: "object_store.presign", outcome: "success", target: { kind: "object-store", id: "key=t/" + T1 + "/berlin/v3.pmtiles" } } },
+    { broker: B2, seq: 17, event: { ts: "2026-06-06T18:02:30Z", source: "vesta", action: "ssh.sign", outcome: "success", target: { kind: "ssh", id: "serial=4472" } } },
   ],
   next_seq: 43,
 };

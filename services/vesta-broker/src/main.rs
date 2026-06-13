@@ -5,7 +5,7 @@
 //! at-rest store) that seals mutating ops behind `503`; the full v1 route surface; a
 //! session/lease engine with cascade-revoke, CSPRNG ids and a TTL/idle expiry `sweeper`;
 //! the SSH-CA (`ssh_ca`) and the OpenSearch dynamic-cred engine (`creds`/`opensearch`);
-//! and a tamper-evident hash-chained B3 audit store (`source:"vault"`) with best-effort
+//! and a tamper-evident hash-chained B3 audit store (`source:"vesta"`) with best-effort
 //! OpenSearch shipping (`audit_ship`). Dev (`VESTA_ALLOW_INSECURE_DEV=1`) serves plain
 //! HTTP with header-based identity. See ../../docs/planning/01-vesta-as-service.md §4 and
 //! ../../spec/broker-openapi.yaml.
@@ -113,7 +113,7 @@ async fn unseal_and_maybe_reseal(
     Ok((outcome.master_key, Some(reseal)))
 }
 
-/// Emit B3 `kms.master_resealed` (`source:"vault"`) so identity retires the old root. At-least-once
+/// Emit B3 `kms.master_resealed` (`source:"vesta"`) so identity retires the old root. At-least-once
 /// (identity dedups by `{old,new}`); a lost emit is covered by identity's overlap backstop.
 fn emit_master_resealed(state: &AppState, r: &ResealEvent) {
     use vesta_transport::audit::{Actor, ActorKind, AuditEvent, Outcome, Target};

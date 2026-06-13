@@ -1,6 +1,6 @@
 //! B3 audit shipping to group-local OpenSearch.
 //!
-//! Vesta owns its audit (`source:"vault"`). The durable tamper-evident hash chain
+//! Vesta owns its audit (`source:"vesta"`). The durable tamper-evident hash chain
 //! (`HashChainSink`) is the source of truth and the **shipping queue**: a background task
 //! tails the chain file from a persisted byte **cursor**, bulk-indexes the new events'
 //! B3 docs into `audit-events-{group}-YYYY.MM` (per the event's own timestamp), and only

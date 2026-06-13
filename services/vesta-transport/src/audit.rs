@@ -1,4 +1,4 @@
-//! Canonical B3 audit event (`source:"vault"`) + local sinks.
+//! Canonical B3 audit event (`source:"vesta"`) + local sinks.
 //!
 //! Ownership decision (coordination/conventions/secrets-broker.md): the broker emits
 //! its own B3 events; consumers do NOT double-record. The durable local store
@@ -48,7 +48,7 @@ pub enum Outcome {
     Failure,
 }
 
-/// One canonical B3 audit document. `source` is fixed to `"vault"`.
+/// One canonical B3 audit document. `source` is fixed to `"vesta"`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
     /// RFC3339 millis UTC.
@@ -84,7 +84,7 @@ impl AuditEvent {
         Self {
             ts,
             schema_version: 1,
-            source: "vault",
+            source: "vesta",
             node,
             residency_group,
             actor,
@@ -475,8 +475,8 @@ mod tests {
     }
 
     #[test]
-    fn source_is_always_vault() {
-        assert_eq!(sample().source, "vault");
+    fn source_is_always_vesta() {
+        assert_eq!(sample().source, "vesta");
         assert_eq!(sample().schema_version, 1);
     }
 
@@ -484,7 +484,7 @@ mod tests {
     fn serializes_without_any_secret_field() {
         let json = serde_json::to_string(&sample()).unwrap();
         // The type cannot represent secret material; assert the shape is metadata-only.
-        assert!(json.contains("\"source\":\"vault\""));
+        assert!(json.contains("\"source\":\"vesta\""));
         assert!(json.contains("\"action\":\"ssh.sign\""));
         assert!(!json.to_lowercase().contains("password"));
         assert!(!json.to_lowercase().contains("private_key"));
