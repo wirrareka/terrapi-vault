@@ -99,7 +99,10 @@ fn check_claims(claims: &Claims, expected_group: &str) -> Result<VerifiedKms, Jw
 /// so unknown-`kid` floods can't amplify into per-request fetches. One per broker (`AppState`).
 pub struct JwtVerifier {
     issuer: String,
-    audience: String,
+    /// Accepted `aud` values — the configured primary (`vesta` after the rename) PLUS the legacy
+    /// `"vault"` during the cutover window, so identity can flip minting `vault`→`vesta` without a
+    /// flag day (a token's `aud` must match one). Drop `"vault"` in Stage 4 once identity has flipped.
+    audiences: Vec<String>,
     expected_group: String,
     /// Explicit JWKS URL override (`VESTA_KMS_JWT_JWKS_URI`); else discovered from the issuer.
     jwks_uri: Option<String>,
@@ -121,9 +124,14 @@ impl JwtVerifier {
             .timeout(Duration::from_secs(5))
             .build()
             .expect("reqwest client");
+        // Accept the configured audience plus the legacy "vault" (cutover back-compat).
+        let mut audiences = vec![audience];
+        if !audiences.iter().any(|a| a == "vault") {
+            audiences.push("vault".to_owned());
+        }
         Self {
             issuer,
-            audience,
+            audiences,
             expected_group,
             jwks_uri,
             http,
@@ -149,7 +157,7 @@ impl JwtVerifier {
 
         let mut v = Validation::new(Algorithm::ES256);
         v.set_issuer(&[&self.issuer]);
-        v.set_audience(&[&self.audience]);
+        v.set_audience(&self.audiences);
         v.set_required_spec_claims(&["exp", "iss", "aud"]);
         v.validate_nbf = true;
         let data = decode::<Claims>(token, &key, &v).map_err(|_| JwtError::Invalid)?;
@@ -311,6 +319,17 @@ mod tests {
             .encode(br#"{"alg":"ES256","typ":"JWT"}"#);
         let token = format!("{header}.e30.c2ln");
         assert!(matches!(v.verify(&token).await, Err(JwtError::Header(_))));
+    }
+
+    /// The verifier accepts the configured primary `aud` PLUS the legacy `"vault"` during the
+    /// rename cutover, and never duplicates `"vault"` when it is itself the configured value.
+    #[test]
+    fn verifier_dual_accepts_primary_and_legacy_vault_audience() {
+        let v = JwtVerifier::new("iss".into(), "vesta".into(), "eu".into(), None);
+        assert!(v.audiences.iter().any(|a| a == "vesta"));
+        assert!(v.audiences.iter().any(|a| a == "vault")); // back-compat
+        let v2 = JwtVerifier::new("iss".into(), "vault".into(), "eu".into(), None);
+        assert_eq!(v2.audiences.iter().filter(|a| *a == "vault").count(), 1);
     }
 
     /// A flood of tokens with unknown `kid`s must NOT trigger one JWKS fetch per request:

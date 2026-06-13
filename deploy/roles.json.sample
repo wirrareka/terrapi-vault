@@ -24,7 +24,12 @@
       "caps": ["object-store-read"]
     },
     "vault-console.eu.proximi.internal": {
-      "role": "vault-console",
+      "role": "vesta-console",
+      "caps": ["observe"]
+    },
+    "vesta-console.eu.proximi.internal": {
+      "_comment": "Stage-3 cutover: map BOTH the legacy vault-console SAN and the re-minted vesta-console SAN to observe, so the console keeps working before AND after infra re-mints its cert. Drop the vault-console entry in Stage 4.",
+      "role": "vesta-console",
       "caps": ["observe"]
     }
   }

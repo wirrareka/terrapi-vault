@@ -115,7 +115,8 @@ pub struct IdentityKmsConfig {
 pub struct KmsJwtConfig {
     /// Pinned `iss`, matched exactly (incl. trailing slash), e.g. `https://identity.eu.proximi.fi/`.
     pub issuer: String,
-    /// Expected `aud` — `"vault"` (literal) unless overridden.
+    /// Primary expected `aud` — `"vesta"` unless overridden. The verifier ALSO accepts the legacy
+    /// `"vault"` during the rename cutover (see [`crate::jwt::JwtVerifier`]).
     pub audience: String,
     /// Explicit JWKS URL (`VESTA_KMS_JWT_JWKS_URI`); `None` → discover via OIDC `/.well-known`.
     pub jwks_uri: Option<String>,
@@ -181,7 +182,7 @@ impl BrokerConfig {
                 audience: std::env::var("VESTA_KMS_JWT_AUDIENCE")
                     .ok()
                     .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "vault".to_owned()),
+                    .unwrap_or_else(|| "vesta".to_owned()),
                 jwks_uri: std::env::var("VESTA_KMS_JWT_JWKS_URI")
                     .ok()
                     .filter(|s| !s.is_empty()),
