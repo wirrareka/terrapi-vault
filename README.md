@@ -1,11 +1,11 @@
-# terrapi-vault
+# terrapi-vesta
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 Encrypted-at-rest storage foundation for the **Memento** notes app, part of
 the [Terrapi](https://github.com/terrapi) brand of developer tools.
 
-`terrapi-vault` wraps a single [SQLCipher](https://www.zetetic.net/sqlcipher/)
+`terrapi-vesta` wraps a single [SQLCipher](https://www.zetetic.net/sqlcipher/)
 database behind a small, safe lifecycle API:
 
 - **Argon2id** (RFC 9106) key derivation from a user passphrase over a
@@ -32,16 +32,16 @@ This repo is the at-rest **library** (this crate, at the root — what `memento`
 consume as a path dependency) plus the network **services** it has grown into, under
 [`services/`](services/):
 
-- **`vault-broker`** — the stack's network **secrets broker** (Path A): mTLS-over-WireGuard,
+- **`vesta-broker`** — the stack's network **secrets broker** (Path A): mTLS-over-WireGuard,
   one instance per residency group, port `8200`. SSH signed-cert CA, leased service-admin
   creds, KMS wrap/unwrap, object-store presigned URLs, and a read-only `observe` API.
   Contract: [`spec/broker-openapi.yaml`](spec/broker-openapi.yaml).
-- **`vault-sync`** — personal multi-device, **end-to-end / server-blind** sync for memento/probe
+- **`vesta-sync`** — personal multi-device, **end-to-end / server-blind** sync for memento/probe
   (device-keypair auth, row-level oplog). Contract: [`spec/sync-openapi.yaml`](spec/sync-openapi.yaml).
-- **`vault-console`** — operator web/API console (read-only observability), one per group,
+- **`vesta-console`** — operator web/API console (read-only observability), one per group,
   port `8203`; aggregates the brokers' `observe` API. SPA in [`web/`](web/). Plan:
-  [`docs/planning/02-vault-console.md`](docs/planning/02-vault-console.md).
-- **`vault-transport`** — shared transport/audit types for the services.
+  [`docs/planning/02-vesta-console.md`](docs/planning/02-vesta-console.md).
+- **`vesta-transport`** — shared transport/audit types for the services.
 
 The library stays platform-neutral (no networking/UI deps) so memento/probe are never
 constrained; the services are a separate workspace under `services/`.
@@ -50,7 +50,7 @@ constrained; the services are a separate workspace under `services/`.
 
 ```toml
 [dependencies]
-terrapi-vault = "0.1"
+terrapi-vesta = "0.1"
 ```
 
 ```rust

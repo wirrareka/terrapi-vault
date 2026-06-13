@@ -1,24 +1,24 @@
-# vault-sync — row-level oplog (Svet B) — design v1
+# vesta-sync — row-level oplog (Svet B) — design v1
 
-Owner decision (2026-05-29): vault-sync v1 is a **row-level oplog**, not whole-file blob
+Owner decision (2026-05-29): vesta-sync v1 is a **row-level oplog**, not whole-file blob
 sync. Server-blind, device-keypair auth, per-row LWW by HLC. CRDT text-merge is Phase 4.
-See planning §5 of `01-vault-as-service.md` and the memory `vault-sync-oplog-decision`.
+See planning §5 of `01-vault-as-service.md` and the memory `vesta-sync-oplog-decision`.
 
 ## 0. Reality this must fit
 
-- `memento`/`probe` embed the **at-rest lib** (`terrapi-vault`) to encrypt a local
+- `memento`/`probe` embed the **at-rest lib** (`terrapi-vesta`) to encrypt a local
   SQLCipher file (+ plaintext `<vault>.meta.json` KDF sidecar, no secrets).
 - `memento-core` ships a `SyncProvider` trait that is **whole-file blob** today
   (`async push/pull(vault_path)`, `status()`; `LocalOnly` no-op, `GitSync` real,
   `MementoCloud` stub). **The oplog needs a NEW client provider** in memento-core — out of
   scope for this repo; built/coordinated separately. **This repo delivers the server + the
   published wire contract.**
-- vault-sync carries **none** of Svet A: no OpenSearch, no tenants, no residency air-gap, no
+- vesta-sync carries **none** of Svet A: no OpenSearch, no tenants, no residency air-gap, no
   B3-to-OpenSearch. (Dependency firewall — see `core-lib-neutrality-principle`.)
 
 ## 1. Roles
 
-- **Server (vault-sync):** a dumb, signed, append-only **op store**, partitioned by
+- **Server (vesta-sync):** a dumb, signed, append-only **op store**, partitioned by
   `vault_id`, payloads opaque. Assigns a per-vault monotonic `seq`. Never holds the vault
   key or plaintext. Runs on a mac mini / small VPS.
 - **Client (memento-core, future):** captures each local DB row change as an op, encrypts
@@ -91,9 +91,9 @@ ops     (vault_id TEXT, seq INTEGER, op_id TEXT, device_id TEXT,
 
 `seq` is allocated as `COALESCE(MAX(seq),0)+1` per `vault_id` inside the push transaction.
 
-## 6. Crate layout (`services/vault-sync`)
+## 6. Crate layout (`services/vesta-sync`)
 
-Binary crate (like vault-broker). Planned modules:
+Binary crate (like vesta-broker). Planned modules:
 - `dto.rs` — wire types (Op, requests/responses), serde.
 - `store.rs` — SQLite schema + accounts/devices/ops queries (rusqlite).
 - `auth.rs` — ed25519 request-signature verification + enrolment Argon2 verifier + replay guard.
@@ -102,7 +102,7 @@ Binary crate (like vault-broker). Planned modules:
 - `main.rs` — wire-up + `axum::serve`.
 
 Deps (services workspace): `axum`, `tokio`, `serde`, `serde_json`, `base64`, `time`,
-`thiserror`, `terrapi-vault` (rusqlite re-export + Argon2 KDF), `vault-transport` (`Hlc`), an
+`thiserror`, `terrapi-vesta` (rusqlite re-export + Argon2 KDF), `vesta-transport` (`Hlc`), an
 ed25519 verifier (`ed25519-dalek` or reuse `ssh-key`). **No** reqwest/OpenSearch/residency.
 
 ## 7. Phasing (server)
@@ -120,12 +120,12 @@ ed25519 verifier (`ed25519-dalek` or reuse `ssh-key`). **No** reqwest/OpenSearch
   receives the vault passphrase, the vault key, or plaintext note content.
 - `encrypted_payload` is opaque bytes. `collection_id` is the only low-entropy metadata; the
   client MAY HMAC it under a vault-derived key to blind it further (recommended, documented).
-- No platform deps; no residency; not multi-tenant. If vault-sync ever serves *tenant* data
+- No platform deps; no residency; not multi-tenant. If vesta-sync ever serves *tenant* data
   it must adopt the per-group air-gap (flagged scope boundary, planning §5).
 
 ## 9. Implementation status (2026-05-29)
 
-**Server — Phases 1–4 DONE.** `services/vault-sync` is now a real axum server (was a
+**Server — Phases 1–4 DONE.** `services/vesta-sync` is now a real axum server (was a
 print-only skeleton):
 - `store.rs` — SQLite op store via the lib's `rusqlite` (plain sqlite; payloads already E2E).
   Accounts / devices / ops; per-vault `seq` allocation in the push transaction; idempotent
@@ -137,8 +137,8 @@ print-only skeleton):
   `pull` / `status` / `healthz`. Device-signed (registered) + self-signed (account/enroll)
   auth; `DefaultBodyLimit`. Full end-to-end `oneshot` tests (two-device create→enroll→push→
   pull→status, plus unsigned-401 and replay-401).
-- `config.rs` — env (`VAULT_SYNC_BIND` default `127.0.0.1:8300`, `VAULT_SYNC_DB`,
-  `VAULT_SYNC_MAX_BODY_BYTES`, `VAULT_SYNC_MAX_PULL`).
+- `config.rs` — env (`VESTA_SYNC_BIND` default `127.0.0.1:8300`, `VESTA_SYNC_DB`,
+  `VESTA_SYNC_MAX_BODY_BYTES`, `VESTA_SYNC_MAX_PULL`).
 - New dep: `ed25519-dalek` (workspace) for raw device-signature verification.
 - Contract published: `spec/sync-openapi.yaml` (v1.0.0). 12 tests pass; clippy `-D warnings`
   + `cargo fmt --check` clean.
@@ -150,7 +150,7 @@ subscriber that lags is sent `{"resync":true}` and should do a full `pull`. `pus
 freshly-stored ops out via `AppState::publish`. Covered by `http::tests::
 push_notifies_tail_subscribers`. Added `axum`+`ws` / `tokio`+`sync` features.
 
-**Deploy — DONE 2026-05-29 (lightweight).** `deploy/vault-sync.env.sample` +
+**Deploy — DONE 2026-05-29 (lightweight).** `deploy/vesta-sync.env.sample` +
 `docs/sync-bootstrap.md` runbook: trust model, TLS-in-front guidance (WG/Tailscale `/32` or a
 Caddy/nginx reverse proxy — the binary speaks plain HTTP), launchd/systemd notes, endpoint
 table, backups. No FreeBSD bastille module (personal, not the broker's platform deploy).
@@ -159,12 +159,12 @@ table, backups. No FreeBSD bastille module (personal, not the broker's platform 
 - **memento-core client provider** — the new `SyncProvider` that captures DB row changes as
   ops, encrypts payloads (AEAD under a vault-derived key, domain-separated), pushes/pulls, and
   applies incoming ops with per-row LWW by HLC. Cross-repo (memento), coordinated separately.
-- ~~SQLCipher-at-rest for the server DB~~ — **DONE 2026-05-30** (opt-in `VAULT_SYNC_DB_KEY[_FILE]`,
+- ~~SQLCipher-at-rest for the server DB~~ — **DONE 2026-05-30** (opt-in `VESTA_SYNC_DB_KEY[_FILE]`,
   keys DB+WAL via `PRAGMA key`). CRDT text-merge remains Phase 4.
 
 ## Threat model — what the server learns (metadata exposure)
 
-vault-sync is **content** server-blind: the vault key never reaches the server and
+vesta-sync is **content** server-blind: the vault key never reaches the server and
 `encrypted_payload` is never decrypted (the server stores it as an opaque blob). But a
 server-blind oplog is **not** metadata-blind. An honest-but-curious or compromised server, or
 anyone who can read its DB, observes:
@@ -182,7 +182,7 @@ anyone who can read its DB, observes:
 (only `SHA-256` of it is stored), row contents.
 
 Accepted for the personal/single-user scope (the server is the owner's own host, TLS-fronted,
-not multi-tenant, not under the residency air-gap). If vault-sync ever serves others' data,
+not multi-tenant, not under the residency air-gap). If vesta-sync ever serves others' data,
 revisit:
 - **`collection_id`** — make HMAC-blinding **mandatory** (keyed by a vault-derived key) so the
   server can't see which collections change. Today it is a client `MAY`.
@@ -190,7 +190,7 @@ revisit:
 - **Timing** — op `created_at` + `hlc.wall_ms` reveal activity; batching/jitter on the client
   reduces it. No server change needed (server only timestamps receipt).
 - **At-rest** — ✅ **DONE (2026-05-30)**: the server DB is SQLCipher-encryptable at rest. Set
-  `VAULT_SYNC_DB_KEY` / `VAULT_SYNC_DB_KEY_FILE` and every connection (DB **and** WAL) is keyed
+  `VESTA_SYNC_DB_KEY` / `VESTA_SYNC_DB_KEY_FILE` and every connection (DB **and** WAL) is keyed
   via `PRAGMA key`, so a stolen disk/backup yields neither content nor the metadata above. Opt-in
   for back-compat; recommended for any persistent deploy. (`store.rs` `apply_key`, `config.rs`.)
 

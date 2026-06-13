@@ -1,8 +1,8 @@
 # OpenSearch cred-engine integration test
 
-The OpenSearch dynamic-cred engine (`vault-broker/src/opensearch.rs`) has an integration
+The OpenSearch dynamic-cred engine (`vesta-broker/src/opensearch.rs`) has an integration
 test that runs the full **create → exists → delete → gone** cycle against a live cluster
-via the security REST API. It is **skipped** unless `VAULT_OS_TEST_URL` is set, so the
+via the security REST API. It is **skipped** unless `VESTA_OS_TEST_URL` is set, so the
 normal `cargo test` (and CI without a cluster) stays green.
 
 ## Spin up a throwaway OpenSearch (Docker)
@@ -22,27 +22,27 @@ until `GET https://localhost:9200/_cluster/health` (basic auth `admin:…`, `-k`
 
 ```sh
 cd services
-VAULT_OS_TEST_URL='https://localhost:9200' \
-VAULT_OS_TEST_ADMIN_USER='admin' \
-VAULT_OS_TEST_ADMIN_PASSWORD='Vault-IT-Passw0rd!' \
-VAULT_OS_TEST_ROLE='readall' \
+VESTA_OS_TEST_URL='https://localhost:9200' \
+VESTA_OS_TEST_ADMIN_USER='admin' \
+VESTA_OS_TEST_ADMIN_PASSWORD='Vault-IT-Passw0rd!' \
+VESTA_OS_TEST_ROLE='readall' \
 cargo test opensearch::tests::issue_creates_and_revoke_deletes_a_real_user -- --nocapture
 ```
 
-`VAULT_OS_TEST_ROLE` defaults to `readall` (a built-in role) so the security API validates
+`VESTA_OS_TEST_ROLE` defaults to `readall` (a built-in role) so the security API validates
 the role mapping without extra setup; in production the role is `audit-writer`
 (`opensearch-infra/audit/security/audit-writer.role.json`).
 
 ### Audit shipping integration test
 
 The B3 audit shipper (`audit_ship.rs`) has its own integration test against the same
-cluster, gated on `VAULT_AUDIT_OS_TEST_URL`:
+cluster, gated on `VESTA_AUDIT_OS_TEST_URL`:
 
 ```sh
 cd services
-VAULT_AUDIT_OS_TEST_URL='https://localhost:9200' \
-VAULT_AUDIT_OS_TEST_USER='admin' \
-VAULT_AUDIT_OS_TEST_PASSWORD='Vault-IT-Passw0rd!' \
+VESTA_AUDIT_OS_TEST_URL='https://localhost:9200' \
+VESTA_AUDIT_OS_TEST_USER='admin' \
+VESTA_AUDIT_OS_TEST_PASSWORD='Vault-IT-Passw0rd!' \
 cargo test audit_ship::tests::ships_events_into_an_index -- --nocapture
 ```
 
@@ -57,7 +57,7 @@ docker rm -f vault-os-it
 
 ## Production runtime config (not the test)
 
-The broker registers the OpenSearch engine when `VAULT_OS_URL` is set:
-`VAULT_OS_URL`, `VAULT_OS_ADMIN_USER`, `VAULT_OS_ADMIN_PASSWORD`,
-`VAULT_OS_ROLE` (default `audit-writer`), `VAULT_OS_MAX_TTL_SECS` (default 28800),
-`VAULT_OS_INSECURE_TLS=1` (dev/self-signed only — never in prod).
+The broker registers the OpenSearch engine when `VESTA_OS_URL` is set:
+`VESTA_OS_URL`, `VESTA_OS_ADMIN_USER`, `VESTA_OS_ADMIN_PASSWORD`,
+`VESTA_OS_ROLE` (default `audit-writer`), `VESTA_OS_MAX_TTL_SECS` (default 28800),
+`VESTA_OS_INSECURE_TLS=1` (dev/self-signed only — never in prod).

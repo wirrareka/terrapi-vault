@@ -1,8 +1,8 @@
 # Vault — website presentation brief (for the web designer)
 
 A brief for building the **Vault** showcase/landing section on the Terrapi website. Everything here
-is grounded in the actual product/tech (the `terrapi-vault` at-rest library + the `vault-broker`
-secrets broker + `vault-console`). **Do not invent security claims, audits, or compliance
+is grounded in the actual product/tech (the `terrapi-vesta` at-rest library + the `vesta-broker`
+secrets broker + `vesta-console`). **Do not invent security claims, audits, or compliance
 certifications** — the wording below is what we can stand behind today. Flag anything you'd like
 reworded; marketing owns final copy, this is the accurate substrate.
 
@@ -61,7 +61,7 @@ Lead with **least privilege by construction**. Five pillars (pick 3–4 for the 
 | Per-region isolation | "One broker per region. No cross-region reach." | Separate instance per residency group; a credential is scoped to `<group>/<tenant>/<role>` and cannot resolve another region/tenant. |
 | Read-only operator console | "See the state, never the secret." | Aggregates each region's brokers into a read-only web view: leases, sessions, SSH serials + revocations, key inventory, audit tail. OIDC + MFA login. |
 | Tamper-evident audit | "Every issuance is on a hash-chained record." | Hash-chained audit events, redacted at the source (no secret values in the log), shipped to the region-local store. |
-| Encrypted at rest | "The broker's own state is encrypted at rest." | Built on the `terrapi-vault` library: SQLCipher + Argon2id (RFC 9106) key derivation; the 256-bit key is held in memory only and zeroized on lock. |
+| Encrypted at rest | "The broker's own state is encrypted at rest." | Built on the `terrapi-vesta` library: SQLCipher + Argon2id (RFC 9106) key derivation; the 256-bit key is held in memory only and zeroized on lock. |
 
 ---
 
@@ -135,7 +135,7 @@ Lead with **least privilege by construction**. Five pillars (pick 3–4 for the 
 
 ## 8. Credibility links (for the technical reader / footer)
 
-- Repo: `terrapi-vault` (open-source core + services).
+- Repo: `terrapi-vesta` (open-source core + services).
 - Broker API contract: `spec/broker-openapi.yaml` (OpenAPI).
 - Sync API contract: `spec/sync-openapi.yaml` (the server-blind personal-sync sibling).
 - At-rest format spec: `spec/vault-format.md` (documented precisely enough for an independent

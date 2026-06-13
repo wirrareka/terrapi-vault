@@ -1,7 +1,7 @@
 # Memento — website presentation brief (for the web designer)
 
 A brief for building the **Memento** showcase/landing section on the Terrapi website. Everything
-here is grounded in the actual product/tech (the `terrapi-vault` library + `vault-sync` that Memento
+here is grounded in the actual product/tech (the `terrapi-vesta` library + `vesta-sync` that Memento
 is built on). **Do not invent security claims** — the wording below is what we can stand behind.
 Flag anything you'd like reworded; marketing owns final copy, this is the accurate substrate.
 
@@ -102,10 +102,10 @@ Lead with **trust through design, not promises**. Three pillars:
 
 ## 8. Credibility links (for the technical reader / footer)
 
-- On-disk encryption format spec (open, CC-BY-4.0): `terrapi-vault/spec/vault-format.md`
-- Sync protocol (server-blind design): `terrapi-vault/spec/sync-openapi.yaml`
-- Library source (open, dual-licensed): the `terrapi-vault` repository
+- On-disk encryption format spec (open, CC-BY-4.0): `terrapi-vesta/spec/vault-format.md`
+- Sync protocol (server-blind design): `terrapi-vesta/spec/sync-openapi.yaml`
+- Library source (open, dual-licensed): the `terrapi-vesta` repository
 
-> Source of these facts: `terrapi-vault` `spec/vault-format.md` (§1, §3, §13), `spec/sync-openapi.yaml`,
+> Source of these facts: `terrapi-vesta` `spec/vault-format.md` (§1, §3, §13), `spec/sync-openapi.yaml`,
 > `docs/sync-bootstrap.md`, and the library/sync source. If anything above changes, re-confirm before
 > publishing.

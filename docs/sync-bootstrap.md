@@ -1,8 +1,8 @@
-# vault-sync — bootstrap & deploy runbook (Svet B, personal)
+# vesta-sync — bootstrap & deploy runbook (Svet B, personal)
 
-vault-sync is the **personal** multi-device oplog server for memento/probe. It is NOT a
+vesta-sync is the **personal** multi-device oplog server for memento/probe. It is NOT a
 platform service: no residency, no tenants, no fleet mTLS. It runs as a single small binary
-on a machine you control (mac mini / a small VPS). See `docs/planning/02-vault-sync-oplog.md`
+on a machine you control (mac mini / a small VPS). See `docs/planning/02-vesta-sync-oplog.md`
 for the design and `spec/sync-openapi.yaml` for the wire contract.
 
 ## Trust model (read first)
@@ -12,7 +12,7 @@ for the design and `spec/sync-openapi.yaml` for the wire contract.
   passphrase, the vault key, or note plaintext.
 - **At-rest encryption (recommended).** Content is E2E-encrypted, but the DB *metadata*
   (op/device counts, timing, op sizes, cleartext `collection_id`, device pubkeys) is not — so
-  set `VAULT_SYNC_DB_KEY_FILE` (or `VAULT_SYNC_DB_KEY`) and the whole DB + WAL are
+  set `VESTA_SYNC_DB_KEY_FILE` (or `VESTA_SYNC_DB_KEY`) and the whole DB + WAL are
   SQLCipher-encrypted, protecting that metadata if the disk/backup is stolen. Set it **before
   first run** and back the key up **separately** from the DB.
 - **Device auth is app-layer.** Every `push`/`pull`/`status`/`tail` is signed by the calling
@@ -32,15 +32,15 @@ for the design and `spec/sync-openapi.yaml` for the wire contract.
 
 ## Configure
 
-Copy `deploy/vault-sync.env.sample` → your service's env file and set `VAULT_SYNC_BIND` +
-`VAULT_SYNC_DB`. Defaults: bind `127.0.0.1:8300`, db `vault-sync.db` in the working dir.
+Copy `deploy/vesta-sync.env.sample` → your service's env file and set `VESTA_SYNC_BIND` +
+`VESTA_SYNC_DB`. Defaults: bind `127.0.0.1:8300`, db `vesta-sync.db` in the working dir.
 
 ## Run
 
 ```sh
-VAULT_SYNC_BIND=127.0.0.1:8300 VAULT_SYNC_DB=/var/lib/vault-sync/vault-sync.db \
-  vault-sync
-# → "vault-sync <ver> starting: bind=… db=…"  then  "vault-sync listening on …"
+VESTA_SYNC_BIND=127.0.0.1:8300 VESTA_SYNC_DB=/var/lib/vesta-sync/vesta-sync.db \
+  vesta-sync
+# → "vesta-sync <ver> starting: bind=… db=…"  then  "vesta-sync listening on …"
 ```
 
 ### launchd (mac mini) / systemd (VPS)
@@ -49,7 +49,7 @@ Run it as an unprivileged user, restart-on-failure, with the env file loaded and
 directory writable by that user. `GET /healthz` is a liveness probe (returns
 `{"status":"ok","version":"<ver>"}`). Every response carries an `X-Request-Id` (echoed or
 generated) for correlation; transient `408`/`429`/`503` carry `Retry-After`.
-Prometheus metrics are on a **separate loopback listener** (`VAULT_SYNC_METRICS_BIND`, default
+Prometheus metrics are on a **separate loopback listener** (`VESTA_SYNC_METRICS_BIND`, default
 `127.0.0.1:8301`) — `GET /metrics`. Keep it loopback/WG-only (it exposes op/device counts, the
 metadata at-rest encryption protects); never route it through the public TLS proxy.
 
@@ -67,7 +67,7 @@ metadata at-rest encryption protects); never route it through the public TLS pro
 
 ## Backups
 
-`VAULT_SYNC_DB` is the only state. It holds opaque ciphertext, so a backup is safe to store
+`VESTA_SYNC_DB` is the only state. It holds opaque ciphertext, so a backup is safe to store
 anywhere — but losing it loses any ops a device hasn't already pulled. Snapshot it
 periodically (e.g. `sqlite3 … '.backup'` or a filesystem snapshot). The vault content itself
 also lives on each device, so this is a convenience/durability backup, not the sole copy.
@@ -77,4 +77,4 @@ also lives on each device, so this is a convenience/durability backup, not the s
 - The **memento-core client** `SyncProvider` (op capture + AEAD payloads + LWW apply) — the
   other half of this; coordinated in the memento repo.
 - SQLCipher-at-rest for the server DB (defense-in-depth; payloads are already E2E-encrypted).
-- A full `deploy/` module (the broker's FreeBSD bastille pattern) if vault-sync ever needs it.
+- A full `deploy/` module (the broker's FreeBSD bastille pattern) if vesta-sync ever needs it.

@@ -1,7 +1,7 @@
-# 02 — vault-console (operator web view) — planning
+# 02 — vesta-console (operator web view) — planning
 
 Status: **BUILT — eu enablement pending** (2026-06-08). P1a (broker `observe` API/cap) +
-the `vault-console` crate (SPA + backend fan-out + embed + deploy module) **and P1b (OIDC RP:
+the `vesta-console` crate (SPA + backend fan-out + embed + deploy module) **and P1b (OIDC RP:
 authorization_code+PKCE, `private_key_jwt` RS256 with the cert key + bound kid, `acr=mfa`
 enforced)** are all shipped in **v0.1.8**. Remaining = the eu host window (infra: jail/WG `.110`/
 cert/edge + broker `roles.json` `observe` entry; operator: Route53 + create the staged identity
@@ -17,7 +17,7 @@ API). Modelled on the **Kalista web/API standard**.
 ### Non-goals (hard)
 - **Not a secret editor / KV UI.** The console never displays or accepts a *secret value*
   (SSH CA key, KMS master/KEKs, DO Spaces keys, leased passwords). Secret ingest stays
-  **CLI / one-time env import** (e.g. `VAULT_KMS_SEAL_INIT`). The console adds **zero**
+  **CLI / one-time env import** (e.g. `VESTA_KMS_SEAL_INIT`). The console adds **zero**
   "show me the secret" surface — that is the security point of a secrets boundary.
 - Not tenant-facing. **Operator-only**, single trust tier. No customer/tenant views.
 - Not multi-region aggregating: the eu/uae **residency air-gap is hard** — one console per group.
@@ -28,7 +28,7 @@ API). Modelled on the **Kalista web/API standard**.
 |---|---|
 | 1 | Brokers run **HA / multiple instances per group**. |
 | 2 | **One console per residency group**, aggregating that group's brokers (never cross-group). |
-| 3 | **Separate binary** `vault-console` (NOT a listener inside vault-broker). |
+| 3 | **Separate binary** `vesta-console` (NOT a listener inside vesta-broker). |
 | 4 | Reachable **both** WG-only (direct/jump box) **and** behind Kalista edge (OIDC). |
 | 5 | Console port: **TBD — coordinate with infra** (`conventions/ports-env.md`). |
 | 6 | Auth: **OIDC RP via identity** (PKCE+nonce, issuer allow-list) **+ local break-glass admin**. |
@@ -39,9 +39,9 @@ API). Modelled on the **Kalista web/API standard**.
 | 11 | Audit source = **per-broker local hash-chained store** (via the observe API), merged in the console. OpenSearch rich-search later. |
 | 12 | **P1 strictly read-only.** Mutations (revoke/rotate/reload) → P2. |
 | 13 | **Mirror Kalista stack**; on the Rust side use **rusqlite** (not sqlx) if a DB is needed — consistent with the lib. |
-| 14 | `web/` at repo root; the console binary lives in `services/vault-console/`. |
+| 14 | `web/` at repo root; the console binary lives in `services/vesta-console/`. |
 | 15 | **EN-only** (i18n skeleton kept, no translated content). |
-| 16 | Shipped in the **same release** as the broker (same tag); separate `vault-console` binary in the artifact. |
+| 16 | Shipped in the **same release** as the broker (same tag); separate `vesta-console` binary in the artifact. |
 
 ## Architecture — the spine
 
@@ -50,13 +50,13 @@ share the broker's in-memory state (leases/sessions live in `LeaseEngine`, not t
 store). So:
 
 ```
-        operator browser ──OIDC(MFA) / session cookie──▶  vault-console (one per group)
+        operator browser ──OIDC(MFA) / session cookie──▶  vesta-console (one per group)
                                                               │  (aggregates the group's brokers)
                                 ┌─────────────────────────────┼─────────────────────────────┐
                           mTLS-over-WG (client cert)     mTLS-over-WG                    mTLS-over-WG
-              vault-console.<group>.proximi.internal → `observe` cap on each broker
+              vesta-console.<group>.proximi.internal → `observe` cap on each broker
                                 │                             │                             │
-                          vault-broker #1               vault-broker #2               vault-broker #N
+                          vesta-broker #1               vesta-broker #2               vesta-broker #N
                           (read-only observe API)       (…)                           (…)
 ```
 
@@ -64,8 +64,8 @@ Two auth planes:
 - **Human → console:** OIDC RP via identity (MFA) + local break-glass; session cookie; CSRF;
   rate-limit. (Kalista `kalista-control-plane/src/auth/*` + `middleware/*` pattern.)
 - **Console → broker:** the console is just **another broker mTLS client**. It presents a
-  fleet-CA client cert SAN `vault-console.<group>.proximi.internal` → a **new read-only
-  `observe` capability**. Reuses the existing broker mTLS + `VAULT_ROLES_CONFIG` machinery —
+  fleet-CA client cert SAN `vesta-console.<group>.proximi.internal` → a **new read-only
+  `observe` capability**. Reuses the existing broker mTLS + `VESTA_ROLES_CONFIG` machinery —
   no new transport security.
 
 ### Consequence: the broker gains a read-only `observe` API + cap **(confirm)**
@@ -75,7 +75,7 @@ currently only in-process:
 - `GET /v1/sys/observe/leases` — active leases (id, role, tenant, parent/session, ttl, expiry). No secret values.
 - `GET /v1/sys/observe/sessions` — active operator sessions (principal SAN, opened, idle/ttl).
 - `GET /v1/{group}/observe/ssh` — issued SSH cert serials + the revocation list.
-- `GET /v1/sys/observe/roles` — registered SAN→{role,caps} (the loaded `VAULT_ROLES_CONFIG`).
+- `GET /v1/sys/observe/roles` — registered SAN→{role,caps} (the loaded `VESTA_ROLES_CONFIG`).
 - `GET /v1/{group}/observe/kms` — KMS key inventory (key_id + current version per target; **never** KEK/DEK bytes).
 - `GET /v1/{group}/observe/object-store` — presign activity counters (issued/expired; from metrics/audit).
 - `GET /v1/sys/observe/audit?since=<seq>` — tail of the local hash-chained B3 audit (already redacted at emitter).
@@ -89,8 +89,8 @@ All read-only, `observe`-capped, residency-checked, rate-limited. The broker's a
 
 ## Console internals
 
-- **Crate:** `services/vault-console` (workspace member, like vault-broker/sync/transport),
-  binary `vault-console`. Its own `[package.version]` tracks the services workspace.
+- **Crate:** `services/vesta-console` (workspace member, like vesta-broker/sync/transport),
+  binary `vesta-console`. Its own `[package.version]` tracks the services workspace.
 - **Stack (Kalista mirror):** axum + `openidconnect` (RP) + `rust-embed` (embeds `web/dist`)
   + `utoipa` (OpenAPI gen, `print-openapi`). SPA: React + TS + Vite + Tailwind + shadcn/ui
   (Radix) + TanStack Query/Table + react-router + react-hook-form + zod + zustand + recharts
@@ -110,7 +110,7 @@ up/seal state across the group. **No secret values, ever.**
 
 ## P2 (gated mutations — deferred)
 Viewer/operator RBAC split; CSRF-guarded actions proxied to the broker (which already audits):
-revoke lease/session, rotate a KMS key, reload `VAULT_ROLES_CONFIG` / license trust bundle,
+revoke lease/session, rotate a KMS key, reload `VESTA_ROLES_CONFIG` / license trust bundle,
 trigger a store snapshot, revoke an SSH serial. Each is an authenticated broker call under a
 **write** cap distinct from `observe`.
 
@@ -120,27 +120,27 @@ auth story for a native flow (likely device-token, not browser OIDC) — design 
 
 ## Topology & deploy
 
-- **One `vault-console` per group**, its own bastille jail (or co-located with a broker), WG
+- **One `vesta-console` per group**, its own bastille jail (or co-located with a broker), WG
   IP allocated by infra. Binds the human listener on the **(infra-assigned) port**, WG-only by
   default; optionally fronted by **Kalista edge** (OIDC) for off-WG operator access (#4).
-- Console → brokers: WG mTLS using a fleet-CA client cert `vault-console.<group>.proximi.internal`.
+- Console → brokers: WG mTLS using a fleet-CA client cert `vesta-console.<group>.proximi.internal`.
 - Discovers its group's brokers via config (list of broker WG addrs) — **(confirm:** static
   config list vs a small registry**)**.
-- Release: same tag as the broker; the release tarball ships **both** `vault-broker` and
-  `vault-console` (or a sibling `vault-console-*.tar.gz`). `deploy/` gains the console jail +
+- Release: same tag as the broker; the release tarball ships **both** `vesta-broker` and
+  `vesta-console` (or a sibling `vesta-console-*.tar.gz`). `deploy/` gains the console jail +
   env (OIDC client id/secret, issuer, broker list, listener bind). **(confirm packaging)**
 
 ## Coordination dependencies (send once this plan is approved)
-- **infra:** (a) console **port** allocation in `ports-env.md`; (b) a `vault-console` jail per
+- **infra:** (a) console **port** allocation in `ports-env.md`; (b) a `vesta-console` jail per
   group + WG IP; (c) the console's **server cert** (if edge-exposed) + **client cert**
-  `vault-console.<group>.proximi.internal` (fleet-CA, EKU clientAuth) to reach brokers;
+  `vesta-console.<group>.proximi.internal` (fleet-CA, EKU clientAuth) to reach brokers;
   (d) optional **Kalista edge route** to the console (OIDC). 
-- **identity:** register **vault-console as an OIDC client** (redirect URI `…/api/v1/auth/callback`,
+- **identity:** register **vesta-console as an OIDC client** (redirect URI `…/api/v1/auth/callback`,
   PKCE, require `acr=mfa`), issuer `https://identity.<group>.proximi.fi/`.
 
 ## Phasing
 - **P0 (this doc):** plan + coordination.
-- **P1:** broker `observe` API + `observe` cap (broker side) → `vault-console` crate: OIDC+local
+- **P1:** broker `observe` API + `observe` cap (broker side) → `vesta-console` crate: OIDC+local
   auth, MFA, session, embed, read-only views + aggregation. Single operator role. EN-only.
 - **P2:** viewer/operator RBAC split + gated mutations (proxied, audited).
 - **P3:** native client (probe/memento) over the same API.
@@ -151,7 +151,7 @@ auth story for a native flow (likely device-token, not browser OIDC) — design 
 2. **P1 is stateless — no DB.** In-memory pending-OIDC + sessions; local break-glass admin from
    env (hashed). rusqlite only if a later phase needs persistent sessions / console-login audit.
 3. **Broker discovery = static config list** of the group's broker WG addrs (no registry).
-4. **Release packaging = same release tag, separate `vault-console-<ver>-<target>.tar.gz`**
-   artifact (its own deploy unit / per-group jail), alongside the `vault-broker` artifact.
+4. **Release packaging = same release tag, separate `vesta-console-<ver>-<target>.tar.gz`**
+   artifact (its own deploy unit / per-group jail), alongside the `vesta-broker` artifact.
 5. **Audit = per-broker local hash-chained store, merged in the console. OpenSearch is NOT
    involved** (keep it simple; no OS dependency in the console path).

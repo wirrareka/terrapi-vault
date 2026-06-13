@@ -1,4 +1,4 @@
-# terrapi-vault — Claude Code notes
+# terrapi-vesta — Claude Code notes
 
 Secrets / (future) KMS service for the quanto / proximi.io stack.
 
@@ -25,7 +25,7 @@ human. The shared coordination dir is (temporarily) at:
 
 You are the stack's **secrets boundary**. As of 2026-05-26 you are registered in
 `CONTRACTS.md` as owner of the **"Secrets broker"** contract — now **COMMITTED
-(Path A, phased)**. terrapi-vault is today an embedded SQLCipher at-rest library and is
+(Path A, phased)**. terrapi-vesta is today an embedded SQLCipher at-rest library and is
 growing into a network secrets broker; the control-plane daemon **proximiio.demon** is
 your first consumer (`inbox/vault/demon-{needs-brokering-service,brokered-creds-shape}.md`,
 both answered). Plan: `docs/planning/01-vault-as-service.md`.
@@ -48,14 +48,14 @@ You own — and must publish to `coordination/` + this repo — this boundary
   do not double-record. Redact at emitter.
 
 Services, one workspace (do not merge their data models):
-- **vault-broker** — the above (fleet creds), per residency group, port `8200`.
-- **vault-sync** — personal multi-device sync for memento/probe: E2E/server-blind,
+- **vesta-broker** — the above (fleet creds), per residency group, port `8200`.
+- **vesta-sync** — personal multi-device sync for memento/probe: E2E/server-blind,
   device-keypair auth, row-level oplog (CRDT/LWW). Not multi-tenant; not under the
   residency air-gap as scoped today (revisit if it ever serves tenant data).
-- **vault-console** — operator web/API console, one per group, port `8203`; read-only,
+- **vesta-console** — operator web/API console, one per group, port `8203`; read-only,
   aggregates the group's brokers' `observe` API over mTLS; React SPA in `web/`. Never
-  surfaces a secret value. Plan: `docs/planning/02-vault-console.md`.
-- **vault-transport** — shared transport/audit types for the services (no data model of its own).
+  surfaces a secret value. Plan: `docs/planning/02-vesta-console.md`.
+- **vesta-transport** — shared transport/audit types for the services (no data model of its own).
 
 Rules specific to you:
 - Source of truth = spec/OpenAPI in this repo; `CONTRACTS.md` only points at it. When a

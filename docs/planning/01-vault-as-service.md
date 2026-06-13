@@ -1,25 +1,25 @@
-# terrapi-vault → service(s): planning doc
+# terrapi-vesta → service(s): planning doc
 
 > **Status:** COMMITTED + largely shipped (this was the original 2026-05-26 plan; approved and
 > executed). The broker is **RELEASED through v0.1.7** (Path A: mTLS+authz, SSH-CA, leased creds,
 > KMS wrap/unwrap + root-of-trust, object-store presign, read-only `observe` API). For the **current
 > state** see `CHANGELOG.md` + `spec/broker-openapi.yaml`; for the operator console see
-> `docs/planning/02-vault-console.md`. This file is kept as the historical design record — read it
+> `docs/planning/02-vesta-console.md`. This file is kept as the historical design record — read it
 > for the *why*, not the current surface.
 
 ## 0. Decisions taken (owner, 2026-05-26)
 
 1. **Demon broker = Full Path A** — build a full network secrets broker inside the
-   terrapi-vault repo (stack-native, reuse fleet Root CA + WG + residency model).
-2. **Two separate services, one shared codebase** — `vault-broker` (fleet creds)
-   and `vault-sync` (personal multi-device sync) as distinct binaries from one Rust
+   terrapi-vesta repo (stack-native, reuse fleet Root CA + WG + residency model).
+2. **Two separate services, one shared codebase** — `vesta-broker` (fleet creds)
+   and `vesta-sync` (personal multi-device sync) as distinct binaries from one Rust
    workspace; shared transport/auth/audit/crypto.
 3. **Sync model = row-level CRDT/oplog** for memento/probe across devices.
 4. **Process** — this planning doc first → owner approval → THEN coordination writes.
 
 ## 1. Today's reality (baseline)
 
-`terrapi-vault` is an **embedded SQLCipher at-rest library** (single crate, MIT/Apache):
+`terrapi-vesta` is an **embedded SQLCipher at-rest library** (single crate, MIT/Apache):
 - `rusqlite (bundled-sqlcipher) + argon2 + secrecy + zeroize` — **no tokio/axum/reqwest, no listener.**
 - Argon2id KDF (RFC 9106) from passphrase, key in `SecretBox` + zeroized, in-place
   `PRAGMA rekey`, plaintext `<name>.meta.json` sidecar (salt + KDF params only).
@@ -27,17 +27,17 @@
   `KdfParams`, `VaultMeta`, `export_note/import_note`.
 - On-disk format spec'd in `spec/vault-format.md` (doc rev 1.6); has app-level tables
   incl. `audit_log`, `secrets`, `succession_plans` (memento's schema).
-- **Consumers:** `memento` and `probe` pin `terrapi-vault = { path = "../terrapi-vault" }`
+- **Consumers:** `memento` and `probe` pin `terrapi-vesta = { path = "../terrapi-vault" }`
   and re-use its `rusqlite` re-export. `memento-core` already ships a **sync-provider
   abstraction** — the sync server (§5) implements the remote side of it.
 
 **Hard migration constraint:** memento/probe resolve the lib at path `../terrapi-vault`.
-The repo **root must remain the `terrapi-vault` lib package** so that path keeps
+The repo **root must remain the `terrapi-vesta` lib package** so that path keeps
 resolving to the library, not a workspace shell. (See §3.)
 
 ## 2. Two products, deliberately not merged
 
-| | **vault-broker** (demon) | **vault-sync** (memento/probe) |
+| | **vesta-broker** (demon) | **vesta-sync** (memento/probe) |
 |---|---|---|
 | Purpose | issue/lease short-TTL fleet creds | sync user's encrypted vault across their devices |
 | Data | dynamic SSH certs, DB/OpenSearch users, leases | append-only oplog of encrypted row mutations |
@@ -46,13 +46,13 @@ resolving to the library, not a workspace shell. (See §3.)
 | Server sees plaintext? | yes (it mints creds) | **never** (E2E; server is blind) |
 | Audit | canonical B3 → group OpenSearch | local only (personal) |
 
-They share: the Rust workspace, the `vault-transport` crate (axum scaffold, WG-only
+They share: the Rust workspace, the `vesta-transport` crate (axum scaffold, WG-only
 bind, mTLS, B3 emitter, residency guard), the at-rest crypto, and the lease/oplog
 primitives where they overlap. They do **not** share a data model or a listener.
 
 ### 2.1 Guiding principle — platform features must not constrain memento/probe
 
-terrapi-vault may grow **whatever the proximi.io platform wants** (broker, dynamic
+terrapi-vesta may grow **whatever the proximi.io platform wants** (broker, dynamic
 OpenSearch creds, residency, B3 audit, mTLS-over-WG). **But that growth lives
 OUTSIDE the core lib crate and never reaches memento/probe.** OpenSearch,
 tenants, residency, WireGuard, the fleet Root CA are **platform (Svet A) concerns
@@ -60,15 +60,15 @@ only** — they have nothing to do with memento (notes) or probe (API client), w
 merely embed the at-rest library to encrypt a local SQLCipher file (Svet B).
 
 **Dependency firewall (hard rule, CI-enforced):**
-- The **root `terrapi-vault` lib crate stays neutral**: only `rusqlite + argon2 +
+- The **root `terrapi-vesta` lib crate stays neutral**: only `rusqlite + argon2 +
   secrecy + zeroize + serde` as today. **No tokio/axum/reqwest, no OpenSearch
   client, no residency/tenant/WG logic** ever enters it. memento/probe must keep
   building unchanged with zero new transitive deps.
-- All platform machinery (broker, `vault-transport`, dynamic-cred engines, B3 emitter,
+- All platform machinery (broker, `vesta-transport`, dynamic-cred engines, B3 emitter,
   residency guard) lives in **separate workspace members** that memento/probe do **not**
   depend on. If anything platform-flavoured ever needs to touch the lib, it goes behind
   an **off-by-default cargo feature** the apps never enable.
-- `vault-sync` (Svet B) carries **none** of Svet A: no OpenSearch, no tenants, no
+- `vesta-sync` (Svet B) carries **none** of Svet A: no OpenSearch, no tenants, no
   residency air-gap, no B3-to-OpenSearch — only E2E oplog + device auth.
 - CI gate: `cargo build` + `cargo tree` in memento/probe show no new platform deps.
 
@@ -86,18 +86,18 @@ though the lib is fine). That violates the neutrality principle (§2.1).
 **Chosen layout — the lib root stays pristine; services are their OWN workspace:**
 
 ```
-terrapi-vault/                 # ROOT = the existing lib crate — Cargo.toml UNCHANGED
-  Cargo.toml                   # [package] terrapi-vault (memento/probe pin path="../terrapi-vault")
+terrapi-vesta/                 # ROOT = the existing lib crate — Cargo.toml UNCHANGED
+  Cargo.toml                   # [package] terrapi-vesta (memento/probe pin path="../terrapi-vault")
   rust-toolchain.toml          # 1.83 — UNCHANGED (MSRV proof)
   src/ …  spec/ …  docs/ …
   services/                    # NEW: a separate cargo workspace (own toolchain if needed)
-    Cargo.toml                 # [workspace] members = [vault-transport, vault-broker, vault-sync]
-    vault-transport/           # shared scaffold (axum, WG bind, mTLS, B3, residency, HLC)
-    vault-broker/              # bin — Full Path A (demon)  [Svet A]
-    vault-sync/                # bin — row-level oplog sync (memento/probe)  [Svet B]
+    Cargo.toml                 # [workspace] members = [vesta-transport, vesta-broker, vesta-sync]
+    vesta-transport/           # shared scaffold (axum, WG bind, mTLS, B3, residency, HLC)
+    vesta-broker/              # bin — Full Path A (demon)  [Svet A]
+    vesta-sync/                # bin — row-level oplog sync (memento/probe)  [Svet B]
 ```
 
-- Services depend on the lib via `terrapi-vault = { path = ".." }` (a path dep, NOT a
+- Services depend on the lib via `terrapi-vesta = { path = ".." }` (a path dep, NOT a
   workspace member) — they get the at-rest crypto without dragging the lib's toolchain.
 - Root Cargo.toml is **literally unchanged** → memento/probe carry **zero** regression risk.
 - If services need a newer channel than 1.83, add `services/rust-toolchain.toml`
@@ -106,7 +106,7 @@ terrapi-vault/                 # ROOT = the existing lib crate — Cargo.toml UN
 Verification gate: `cargo build` in **memento** and **probe** still succeed unchanged
 (CI), and `cargo +1.83 build` of the lib stays green.
 
-## 4. vault-broker — Full Path A (answers demon's 6 points)
+## 4. vesta-broker — Full Path A (answers demon's 6 points)
 
 Deployment: **per residency group**, WG-only listener. `residency_group` is a
 per-instance constant → a broker instance structurally cannot serve another group
@@ -203,7 +203,7 @@ API is versioned `/v1/...`. JSON. All mutating ops emit a B3 audit event (§4.5)
   everything-else, and revoke at the Root CA / broker CRL. This is exactly demon's
   "one host-bound long-lived secret" principle.
 
-## 5. vault-sync — row-level oplog (memento/probe)
+## 5. vesta-sync — row-level oplog (memento/probe)
 
 Implements the remote side of memento-core's existing **sync-provider abstraction**.
 
@@ -220,12 +220,12 @@ Implements the remote side of memento-core's existing **sync-provider abstractio
   keypair; server authenticates a device by its pubkey. (Not fleet mTLS — this is
   personal.)
 - **Residency:** as scoped today this is the **owner's personal data**, so the EU/UAE
-  air-gap does NOT apply. ⚠️ If vault-sync ever serves *tenant* data it must adopt the
+  air-gap does NOT apply. ⚠️ If vesta-sync ever serves *tenant* data it must adopt the
   per-group air-gap. Flagged as an explicit scope boundary.
 - **Deploy:** small server the owner runs (mac mini or a VPS); clients = memento/probe
   on mac mini + laptop.
 
-## 6. Shared `vault-transport` crate
+## 6. Shared `vesta-transport` crate
 axum server scaffold · WG-only bind helper · mTLS-against-Root-CA verifier · B3 audit
 emitter (best-effort ship + hash-chained local) · residency guard (per-instance group
 constant) · lease parent/child tree + cascade revoke · HLC clock. Both services depend
@@ -238,7 +238,7 @@ on it; the at-rest lib stays dependency-free of tokio/axum.
   auth + B3 audit + `ssh/sign` + bootstrap doc. Gives demon points 1, 2a, 5, 6.
 - **Phase 2** — leased service-admin creds (OpenSearch/DB engines) + full lease model +
   session-bound cascade + namespace/residency enforcement. Completes demon's needs.
-- **Phase 3** — vault-sync MVP (push/pull oplog, LWW, E2E, device enrol) for memento/probe.
+- **Phase 3** — vesta-sync MVP (push/pull oplog, LWW, E2E, device enrol) for memento/probe.
 - **Phase 4** — hardening: SSH KRL/CRL at scale, CRDT text merge, KMS-wrap unseal, metrics, load.
 
 ## 8. Coordination writes (executed ONLY after approval)
@@ -248,23 +248,23 @@ on it; the at-rest lib stays dependency-free of tokio/axum.
 2. `inbox/vault/demon-brokered-creds-shape.md` → answer all 5 follow-ups (point to §4).
    Flip `Status: partial → answered`.
 3. `CONTRACTS.md` "Secrets broker" row: `REQUESTED, NOT BUILT` → `COMMITTED (Path A,
-   phased)`, pointing at `terrapi-vault/spec/` (broker OpenAPI to be added) + this doc.
+   phased)`, pointing at `terrapi-vesta/spec/` (broker OpenAPI to be added) + this doc.
 4. `conventions/ports-env.md` vault row: `TBD` → **`8200` API (WG-only) + `8201`
    loopback metrics** (proposed; confirm no collision).
 5. New convention file `conventions/secrets-broker.md` (path/namespace + lease +
    session model) — cross-service contract.
 6. `inbox/demon/vault-committed-path-a.md` notify note.
-7. `terrapi-vault/CLAUDE.md` → add the "Your role in the circle" block (from
+7. `terrapi-vesta/CLAUDE.md` → add the "Your role in the circle" block (from
    `05-vault-agent-prompt.md`) under the existing coordination block, before `# context-mode`.
 
 ## 9. Resolved decisions (owner, 2026-05-26)
 - **Broker port:** `8200` API (WG-only) + `127.0.0.1:8201` Prometheus. ✅
-- **vault-sync auth:** device keypair enrolled via the vault passphrase; server
+- **vesta-sync auth:** device keypair enrolled via the vault passphrase; server
   authenticates by device pubkey. No terrapi-identity dependency. ✅
-- **vault-sync hosting:** a small **VPS** (reachable from anywhere; no home-network
+- **vesta-sync hosting:** a small **VPS** (reachable from anywhere; no home-network
   dependency). Sync server stays deploy-agnostic; VPS is the target for Phase 3. ✅
 - **Unseal:** manual passphrase at boot for v1; KMS-wrap deferred to Phase 4. ✅
-- **Repo:** single repo + workspace (this plan); revisit a `vault-broker` repo split
+- **Repo:** single repo + workspace (this plan); revisit a `vesta-broker` repo split
   only after the broker stabilises.
 
 Coordination writes (§8) executed 2026-05-26 after this approval.
@@ -273,16 +273,16 @@ Coordination writes (§8) executed 2026-05-26 after this approval.
 
 **Phase 0 — DONE & verified.** Separate `services/` workspace (own toolchain 1.91.1
 via `services/rust-toolchain.toml`); root lib package byte-for-byte unchanged (1.83
-MSRV intact). `vault-transport`, `vault-broker`, `vault-sync` build, test, clippy
+MSRV intact). `vesta-transport`, `vesta-broker`, `vesta-sync` build, test, clippy
 clean. CI added (`.github/workflows/ci.yml`): lib-msrv (1.83), lib-neutrality
 (dependency firewall), services (1.91.1). Verified `memento-core` + `probe-core`
 still build against the lib.
 
-**Phase 1 — broker skeleton DONE.** `vault-broker` runs on `8200`:
+**Phase 1 — broker skeleton DONE.** `vesta-broker` runs on `8200`:
 - Auth boundary (`Principal` from mTLS SAN → role); rustls/WG termination is the next step.
 - `/v1/sys/session` (open/end) + `/v1/sys/leases/{renew,revoke}` **implemented** on a
-  real session→child-lease engine with cascade-revoke (`vault-transport::lease`, unit-tested).
-- B3 audit emitter `source:"vault"` (`vault-transport::audit`, JSONL local sink, tested).
+  real session→child-lease engine with cascade-revoke (`vesta-transport::lease`, unit-tested).
+- B3 audit emitter `source:"vault"` (`vesta-transport::audit`, JSONL local sink, tested).
 - `/v1/{group}/ssh/{ca,sign}` + `/v1/{group}/{tenant_id}/creds/{role}` are typed **501**
   stubs; shapes fixed. Group-mismatch → 404; bad tenant_id → 400.
 - v1 contract published: `spec/broker-openapi.yaml`. Bootstrap: `docs/broker-bootstrap.md`.
@@ -323,7 +323,7 @@ no auth, so it is never brokered (owner, 2026-05-26).
 **OpenSearch engine — DONE:** `opensearch.rs` — the modern `audit-writer` adapter behind
 `CredEngine` (async): mints an ephemeral OpenSearch internal user via the security REST
 API (`PUT …/internalusers/{u}`, admin basic-auth, rustls) mapped to the security role, and
-deletes it on revoke/expiry. Registered when `VAULT_OS_*` is configured. Integration-tested
+deletes it on revoke/expiry. Registered when `VESTA_OS_*` is configured. Integration-tested
 against a live single-node OpenSearch (full create→exists→delete cycle; `docs/dev/opensearch-it.md`).
 The `CredEngine` trait is now async (`async_trait`) and `teardown` awaits deletes lock-free.
 
@@ -339,9 +339,9 @@ session end.
 (source of truth) synchronously, then enqueues for a background task that **bulk-indexes**
 to group-local OpenSearch `audit-events-{group}-YYYY.MM` (`_bulk` NDJSON). Best-effort +
 non-blocking: `emit` only enqueues, a ship failure never blocks issuance (event stays in
-JSONL). Enabled by `VAULT_AUDIT_OS_*`. Integration-tested against a live cluster.
+JSONL). Enabled by `VESTA_AUDIT_OS_*`. Integration-tested against a live cluster.
 
-**Hash-chained audit store — DONE:** `HashChainSink` (vault-transport) — the durable local
+**Hash-chained audit store — DONE:** `HashChainSink` (vesta-transport) — the durable local
 JSONL is now tamper-evident: each record carries `seq` + `prev` + `hash =
 SHA256(prev ++ seq ++ event_bytes)` (event bytes recovered byte-exact via `RawValue`).
 The chain tip is recovered on restart so appends continue across reboots; `audit::verify`
@@ -355,7 +355,7 @@ advances the cursor only on a confirmed ship. So a ship failure / crash / shutdo
 nothing — the next tick or process start **replays** the backlog; shutdown does a best-effort
 final flush. Shipping never blocks issuance (reads the durable file out of band).
 
-**Role authz — DONE:** SAN→role mapping is config-driven (`VAULT_ROLES_CONFIG` JSON →
+**Role authz — DONE:** SAN→role mapping is config-driven (`VESTA_ROLES_CONFIG` JSON →
 `{role, caps}`) and **per-role least-privilege is enforced**: the matcher reads the cert's
 first SAN dNSName; the `Principal` carries its `Capability` set (`ssh-ca|ssh-sign|creds|
 session|leases`); each handler calls `require_cap` → `403` if not granted. Prod requires the
@@ -378,13 +378,13 @@ aether fleet-mode backup keys; preserves their zero-knowledge model (KEK never l
   for aether Ask 2), cap `snapshot`.
 - **Metrics** — `127.0.0.1:8201/metrics` Prometheus text (per-action audit counters +
   `vault_sealed` gauge), loopback-only.
-- **Unattended unseal** — `VAULT_UNSEAL_PASSPHRASE_FILE` (mode-600 fallback). Broker-master-key
+- **Unattended unseal** — `VESTA_UNSEAL_PASSPHRASE_FILE` (mode-600 fallback). Broker-master-key
   KMS-wrap now lands as the KMS root-of-trust arm (a) — see the status entry below.
 
 **FreeBSD deploy module — DONE:** `deploy/` mirrors `identity/deploy/` — `build.sh`,
-`jail/{Bastillefile,provision.sh}` (bastille vnet jail per group), `rc.d/vault-broker`
+`jail/{Bastillefile,provision.sh}` (bastille vnet jail per group), `rc.d/vesta-broker`
 (unprivileged `vault` user, `REQUIRE zfskeys`), `zfs/{zfskeys,check-encryption.sh}`
-(encrypted `zroot/terrapi/vault` → `/var/db/terrapi-vault`), `vault-broker.env.sample` +
+(encrypted `zroot/terrapi/vault` → `/var/db/terrapi-vesta`), `vesta-broker.env.sample` +
 `roles.json.sample`, `security/{pf,fim,least-privilege,audit_control}`, `alerts/`, and an
 `install.sh` runbook. Crown jewels (SSH-CA key + KMS KEKs in `store.sqlcipher`, `unseal.pass`)
 on the encrypted dataset. Infra confirmed + ready to run host steps on `medina`.
@@ -394,7 +394,7 @@ applied in `http::router` (outer→inner): conservative security headers · per-
 metrics labelled by the `MatchedPath` *template* (tenant ids never reach `:8201`) +
 `vault_http_inflight` gauge · per-principal (per mTLS SAN) token-bucket rate limit (`429`) ·
 global concurrency cap (`503`) · request timeout (`408`) · body-size limit (`413`). All five
-limits are env-tunable (`VAULT_{MAX_BODY_BYTES,REQUEST_TIMEOUT_SECS,MAX_CONCURRENCY,RATE_PER_SEC,RATE_BURST}`)
+limits are env-tunable (`VESTA_{MAX_BODY_BYTES,REQUEST_TIMEOUT_SECS,MAX_CONCURRENCY,RATE_PER_SEC,RATE_BURST}`)
 with safe defaults — no deploy change required. Zero new crates (axum `DefaultBodyLimit` +
 `middleware::from_fn` + std/tokio). Uniform JSON `404` fallback for unrouted paths.
 
@@ -404,23 +404,23 @@ vault's three pieces shipped + tested (gated off until identity/infra enable the
 - **Option J — kms-cap JWT verify (`jwt.rs`):** per-call ES256 verify of identity-minted
   workload creds against the issuer's JWKS (cached, refetched on a `kid` miss); enforces
   `iss`/`aud="vault"`/`exp`/`scope ⊇ kms`/`residency_group == instance`/`tenant_id == path`.
-  Opt-in `VAULT_KMS_JWT_ISSUER`; unset ⇒ kms stays cap-based (aether unchanged).
+  Opt-in `VESTA_KMS_JWT_ISSUER`; unset ⇒ kms stays cap-based (aether unchanged).
 - **`kms.rewrap` (`POST …/kms/{key_id}/rewrap`):** server-side re-wrap onto the current KEK
   version (plaintext DEK never leaves the broker) for the ack-gated rotation flow.
 - **Arm (a) — identity-sealed master key (`identity_kms.rs`):** at boot the broker exchanges
   a stored `{kek_id, wrapped}` blob for its master key via identity's native-mTLS KMS listener
-  (`POST /kms/v1/{seal,unseal}`), auth = the broker's own `VAULT_TLS_*` client cert (the
+  (`POST /kms/v1/{seal,unseal}`), auth = the broker's own `VESTA_TLS_*` client cert (the
   dot-form `vault.<group>.proximi.internal`); manual passphrase = break-glass fallback. Opt-in
-  `VAULT_IDENTITY_KMS_URL`; one-time bootstrap `VAULT_KMS_SEAL_INIT=1`. Worklog:
+  `VESTA_IDENTITY_KMS_URL`; one-time bootstrap `VESTA_KMS_SEAL_INIT=1`. Worklog:
   `docs/worklog/2026-06-02-kms-root-of-trust.md`.
 - **Root-rotation handling — DONE:** on an identity ROOT rotation the broker re-seals its
   master key (only — KEKs/DEKs are unchanged) under the current root and emits B3
   `kms.master_resealed` so identity retires the old root (boot + 6h `reseal_watch` timer;
   identity holds current+previous during an ack-gated overlap, 7d backstop). Renamed from the
   contract's `kms.rewrap_complete` — accurate, no DEK re-wrap on root rotation.
-- **Pending (not vault code):** adopt the infra-issued dot-form cert as `VAULT_TLS_*` +
+- **Pending (not vault code):** adopt the infra-issued dot-form cert as `VESTA_TLS_*` +
   eu seal→unseal round-trip; identity enables arm (b) mint (`/kms/v1/workload-cred`) for the
   live JWT round-trip + wires its overlap-window/`kms.master_resealed` consumer.
 
 **Next:** additional `CredEngine` adapters for any *modern* datastore that needs brokered
-creds (RethinkDB is out); `vault-sync` (Svet B) client integration (memento/probe).
+creds (RethinkDB is out); `vesta-sync` (Svet B) client integration (memento/probe).
