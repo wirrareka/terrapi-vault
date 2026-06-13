@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use vesta_transport::http::HttpMetrics;
 
-/// Prometheus series prefix (`vault_sync_*`).
-const PREFIX: &str = "vault_sync";
+/// Prometheus series prefixes. Dual-emitted during the vault→vesta rename cutover (infra migrates
+/// dashboards/alerts to `vesta_sync_*`, then `vault_sync_*` is dropped in Stage 4).
+const PREFIXES: [&str; 2] = ["vault_sync", "vesta_sync"];
 
 #[derive(Default)]
 pub struct Metrics {
@@ -38,20 +39,28 @@ impl Metrics {
     /// domain series. `tail_subscribers` is the live gauge (computed by the caller at scrape).
     #[must_use]
     pub fn render(&self, tail_subscribers: u64) -> String {
+        let mut out = String::new();
+        for prefix in PREFIXES {
+            out.push_str(&self.render_prefixed(tail_subscribers, prefix));
+        }
+        out
+    }
+
+    fn render_prefixed(&self, tail_subscribers: u64, prefix: &str) -> String {
         use std::fmt::Write as _;
-        let mut out = self.http.render(PREFIX);
+        let mut out = self.http.render(prefix);
         let _ = writeln!(
             out,
-            "# HELP {PREFIX}_tail_subscribers Active live-tail WebSocket subscribers.\n# TYPE {PREFIX}_tail_subscribers gauge\n{PREFIX}_tail_subscribers {tail_subscribers}"
+            "# HELP {prefix}_tail_subscribers Active live-tail WebSocket subscribers.\n# TYPE {prefix}_tail_subscribers gauge\n{prefix}_tail_subscribers {tail_subscribers}"
         );
         let _ = writeln!(
             out,
-            "# HELP {PREFIX}_ops_accepted_total Ops newly stored by push.\n# TYPE {PREFIX}_ops_accepted_total counter\n{PREFIX}_ops_accepted_total {}",
+            "# HELP {prefix}_ops_accepted_total Ops newly stored by push.\n# TYPE {prefix}_ops_accepted_total counter\n{prefix}_ops_accepted_total {}",
             self.ops_accepted.load(Ordering::Relaxed)
         );
         let _ = writeln!(
             out,
-            "# HELP {PREFIX}_ops_duplicate_total Ops deduped by push (op_id seen).\n# TYPE {PREFIX}_ops_duplicate_total counter\n{PREFIX}_ops_duplicate_total {}",
+            "# HELP {prefix}_ops_duplicate_total Ops deduped by push (op_id seen).\n# TYPE {prefix}_ops_duplicate_total counter\n{prefix}_ops_duplicate_total {}",
             self.ops_duplicate.load(Ordering::Relaxed)
         );
         out

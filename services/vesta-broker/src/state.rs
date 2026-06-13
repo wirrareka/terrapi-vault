@@ -53,22 +53,41 @@ impl Metrics {
     }
 
     /// Render the Prometheus text exposition for `/metrics`. `sealed` is the live gauge.
+    ///
+    /// Dual-emits the `vault_*` and `vesta_*` series (same underlying values) during the
+    /// vault→vesta rename cutover, so infra can migrate dashboards/alerts to `vesta_*` gap-free;
+    /// the `vault_*` series is dropped in Stage 4.
     #[must_use]
     pub fn render(&self, sealed: bool) -> String {
+        let mut out = self.render_prefixed(sealed, "vault");
+        out.push_str(&self.render_prefixed(sealed, "vesta"));
+        out
+    }
+
+    fn render_prefixed(&self, sealed: bool, prefix: &str) -> String {
         use std::fmt::Write as _;
         let mut out = String::new();
-        out.push_str("# HELP vault_sealed 1 if the broker is sealed, 0 if unsealed.\n");
-        out.push_str("# TYPE vault_sealed gauge\n");
-        let _ = writeln!(out, "vault_sealed {}", u8::from(sealed));
-        out.push_str("# HELP vault_audit_events_total B3 audit events emitted, by action.\n");
-        out.push_str("# TYPE vault_audit_events_total counter\n");
+        let _ = writeln!(
+            out,
+            "# HELP {prefix}_sealed 1 if the broker is sealed, 0 if unsealed."
+        );
+        let _ = writeln!(out, "# TYPE {prefix}_sealed gauge");
+        let _ = writeln!(out, "{prefix}_sealed {}", u8::from(sealed));
+        let _ = writeln!(
+            out,
+            "# HELP {prefix}_audit_events_total B3 audit events emitted, by action."
+        );
+        let _ = writeln!(out, "# TYPE {prefix}_audit_events_total counter");
         let events = self.events.lock().expect("metrics lock");
         let mut actions: Vec<_> = events.iter().collect();
         actions.sort_by(|a, b| a.0.cmp(b.0));
         for (action, n) in actions {
-            let _ = writeln!(out, "vault_audit_events_total{{action=\"{action}\"}} {n}");
+            let _ = writeln!(
+                out,
+                "{prefix}_audit_events_total{{action=\"{action}\"}} {n}"
+            );
         }
-        out.push_str(&self.http.render("vault"));
+        out.push_str(&self.http.render(prefix));
         out
     }
 }
