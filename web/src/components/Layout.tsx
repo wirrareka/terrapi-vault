@@ -121,27 +121,26 @@ export function AppLayout() {
             <span className="truncate" title={me?.subject}>
               {me ? (me.email ?? me.subject) : "—"}
             </span>
-            <div className="flex items-center gap-0.5">
-              <button
-                type="button"
-                onClick={toggleTheme}
-                className="flex items-center rounded px-1.5 py-1 hover:bg-accent hover:text-foreground"
-                title={theme === "dark" ? "Switch to light" : "Switch to dark"}
-                aria-label="Toggle theme"
-              >
-                {theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
-              </button>
-              <button
-                type="button"
-                onClick={() => void logout()}
-                className="flex items-center rounded px-1.5 py-1 hover:bg-accent hover:text-foreground"
-                title="Sign out"
-                aria-label="Sign out"
-              >
-                <LogOut className="h-3.5 w-3.5" />
-              </button>
-            </div>
+            <button
+              type="button"
+              onClick={toggleTheme}
+              className="flex shrink-0 items-center rounded px-1.5 py-1 hover:bg-accent hover:text-foreground"
+              title={theme === "dark" ? "Switch to light" : "Switch to dark"}
+              aria-label="Toggle theme"
+            >
+              {theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
+            </button>
           </div>
+          <button
+            type="button"
+            onClick={() => void logout()}
+            className="flex w-full items-center justify-center gap-1.5 rounded-md border px-2 py-1.5 font-medium transition-colors hover:bg-accent hover:text-foreground"
+            title="Sign out"
+            aria-label="Sign out"
+          >
+            <LogOut className="h-3.5 w-3.5" />
+            Sign out
+          </button>
         </div>
       </aside>
 
