@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Query, Request, State};
+use axum::extract::{Form, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{AppendHeaders, IntoResponse, Redirect, Response};
@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::broker::BrokerHub;
 use crate::oidc::{OidcClient, Operator};
-use crate::session::{PendingAuth, Sessions, COOKIE_NAME};
+use crate::session::{PendingAuth, SeenJtis, Sessions, COOKIE_NAME};
 
 /// Pre-auth (login-binding) cookie name. Set at `/auth/login`, required to match at the callback —
 /// this is what binds an OIDC login to the browser that started it (login-CSRF / fixation defence).
@@ -30,6 +30,8 @@ pub struct AppState {
     pub oidc: Option<Arc<OidcClient>>,
     pub sessions: Arc<Sessions>,
     pub pending: Arc<PendingAuth>,
+    /// Seen Back-Channel Logout `jti`s, for replay rejection on `/auth/backchannel-logout`.
+    pub seen_jtis: Arc<SeenJtis>,
     /// `allow_insecure_dev`: grants a `dev` operator session (no OIDC) — local only.
     pub dev: bool,
 }
@@ -44,6 +46,13 @@ pub fn router(state: AppState) -> Router {
         // (SameSite=Lax permits top-level cross-site GETs), letting any page force-logout an
         // operator. The SPA calls it via `apiPost` then navigates to `/`.
         .route("/api/v1/auth/logout", post(auth_logout))
+        // OIDC Back-Channel Logout (BCL 1.0): identity POSTs a signed Logout Token here on
+        // session-end / admin force-logout / revoke fan-out. Server-to-server (no operator cookie);
+        // the signed token IS the authn. NEVER touches a secret.
+        .route(
+            "/api/v1/auth/backchannel-logout",
+            post(auth_backchannel_logout),
+        )
         .route("/api/v1/brokers", get(brokers))
         .route("/api/v1/observe/leases", get(obs_leases))
         .route("/api/v1/observe/sessions", get(obs_sessions))
@@ -195,11 +204,13 @@ async fn auth_callback(
         return (StatusCode::BAD_REQUEST, "unknown or expired state").into_response();
     };
     match oidc.complete(&code, &verifier, &nonce).await {
-        Ok(op) => {
-            let sid = s.sessions.create(op);
+        Ok((op, oidc_sid)) => {
+            // Capture the login id_token's `sid` so a Back-Channel Logout Token can target this
+            // session. `cookie` is the opaque session cookie value (distinct from the OIDC `sid`).
+            let cookie = s.sessions.create(op, oidc_sid);
             (
                 AppendHeaders([
-                    (header::SET_COOKIE, session_cookie(&sid)),
+                    (header::SET_COOKIE, session_cookie(&cookie)),
                     (header::SET_COOKIE, cleared_auth_binding_cookie()),
                 ]),
                 Redirect::to("/"),
@@ -225,6 +236,55 @@ async fn auth_logout(State(s): State<AppState>, headers: HeaderMap) -> Response 
         Json(json!({ "ok": true })),
     )
         .into_response()
+}
+
+#[derive(Deserialize)]
+struct LogoutTokenForm {
+    logout_token: Option<String>,
+}
+
+/// OIDC Back-Channel Logout (BCL 1.0 §2). Identity POSTs a signed Logout Token
+/// (`application/x-www-form-urlencoded`, single `logout_token`) when a session ends, an admin
+/// force-logs-out, or a revoke fans out — making "revoke once → dropped from the console" real.
+/// We validate the token (sig via identity JWKS, `iss`/`aud`, `iat` freshness, `events`, no
+/// `nonce`, `jti` replay) and end the matching console session(s). Returns **200** on success
+/// (idempotent — 200 even if nothing matched), **400** on an invalid/replayed token. The signed
+/// token is the authentication; there is no operator cookie on this server-to-server call.
+async fn auth_backchannel_logout(
+    State(s): State<AppState>,
+    Form(f): Form<LogoutTokenForm>,
+) -> Response {
+    let Some(oidc) = s.oidc.as_ref() else {
+        return (StatusCode::NOT_IMPLEMENTED, "OIDC not configured").into_response();
+    };
+    let Some(token) = f.logout_token else {
+        return bcl_error("missing logout_token");
+    };
+    let lt = match oidc.verify_logout_token(&token).await {
+        Ok(lt) => lt,
+        Err(e) => {
+            // Log detail server-side; the response stays generic (the caller is identity, but the
+            // endpoint is reachable — don't leak validation internals).
+            eprintln!("vesta-console: back-channel logout rejected: {e}");
+            return bcl_error("invalid logout_token");
+        }
+    };
+    // Replay defence (BCL §2.4): a repeated `jti` is rejected.
+    if !s.seen_jtis.check_and_record(&lt.jti) {
+        eprintln!("vesta-console: back-channel logout rejected: jti replay");
+        return bcl_error("logout_token replay");
+    }
+    let ended = s
+        .sessions
+        .logout_matching(lt.sid.as_deref(), lt.sub.as_deref());
+    eprintln!("vesta-console: back-channel logout ok — ended {ended} session(s)");
+    (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+}
+
+/// BCL 1.0 §2.8 error response: 400 + a short `error` member (no caching — added by the
+/// security-headers layer for `/api/*`).
+fn bcl_error(msg: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
 }
 
 fn unauthorized() -> Response {

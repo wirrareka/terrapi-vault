@@ -43,6 +43,16 @@ const MIN_JWKS_REFETCH: Duration = Duration::from_secs(30);
 /// alg outside this set is rejected before any key lookup. Intersected with the OP's advertised
 /// `id_token_signing_alg_values_supported` when discovery provides one.
 const SUPPORTED_ID_TOKEN_ALGS: [Algorithm; 2] = [Algorithm::ES256, Algorithm::RS256];
+/// JOSE `typ` an identity Back-Channel Logout Token carries (BCL 1.0 §2.4). We require it so an
+/// id_token/access-token can't be replayed through the logout endpoint (token-type confusion).
+const LOGOUT_TOKEN_TYP: &str = "logout+jwt";
+/// The REQUIRED `events` member of a Logout Token (BCL 1.0 §2.4).
+const BACKCHANNEL_LOGOUT_EVENT: &str = "http://schemas.openid.net/event/backchannel-logout";
+/// Max accepted age of a Logout Token by its `iat` (delivery + the replay window the caller's
+/// seen-`jti` set must cover). A staler token is rejected here.
+const LOGOUT_TOKEN_MAX_AGE_SECS: u64 = 300;
+/// Allowance for a Logout Token `iat` slightly in the future (clock skew between identity and us).
+const CLOCK_SKEW_LEEWAY_SECS: u64 = 60;
 
 /// JOSE `alg` name for the algs we support (to compare against the OP's advertised string list).
 fn alg_name(alg: Algorithm) -> &'static str {
@@ -91,6 +101,8 @@ pub enum OidcError {
     Jwks(String),
     #[error("unknown signing key (kid)")]
     UnknownKid,
+    #[error("logout token rejected: {0}")]
+    LogoutToken(String),
 }
 
 /// The OP endpoints we use, from OIDC discovery (`/.well-known/openid-configuration`).
@@ -132,6 +144,36 @@ struct IdClaims {
     nonce: Option<String>,
     #[serde(default)]
     acr: Option<String>,
+    /// OIDC session id (Back-Channel Logout 1.0 §2) — stored with the session so a future Logout
+    /// Token's `sid` maps back to it. Present on the *login* id_token; omitted on refresh.
+    #[serde(default)]
+    sid: Option<String>,
+}
+
+/// A validated Back-Channel Logout Token — which session(s) to end. At least one of `sid`/`sub`
+/// is guaranteed present (checked in [`check_logout_claims`]); `jti` is for the caller's replay set.
+#[derive(Debug, Clone)]
+pub struct LogoutToken {
+    pub sid: Option<String>,
+    pub sub: Option<String>,
+    pub jti: String,
+}
+
+/// Back-Channel Logout Token claims (BCL 1.0 §2.4). `iss`/`aud` are validated by jsonwebtoken;
+/// `iat` freshness, `events`, the prohibited `nonce`, and sid/sub presence are checked here.
+#[derive(Debug, Deserialize)]
+struct LogoutClaims {
+    #[serde(default)]
+    sub: Option<String>,
+    #[serde(default)]
+    sid: Option<String>,
+    iat: u64,
+    jti: String,
+    #[serde(default)]
+    events: std::collections::HashMap<String, serde_json::Value>,
+    /// MUST be absent in a Logout Token (BCL 1.0 §2.4) — its presence is a rejection.
+    #[serde(default)]
+    nonce: Option<String>,
 }
 
 /// The client-assertion JWT claims (`private_key_jwt`, RFC 7523 §3 / OIDC core §9).
@@ -227,7 +269,7 @@ impl OidcClient {
         code: &str,
         verifier: &str,
         expected_nonce: &str,
-    ) -> Result<Operator, OidcError> {
+    ) -> Result<(Operator, Option<String>), OidcError> {
         let now = now_unix();
         let jti = random_token();
         let assertion = build_client_assertion(
@@ -266,7 +308,7 @@ impl OidcClient {
         }
         let tr: TokenResponse =
             serde_json::from_str(&body).map_err(|e| OidcError::Token(e.to_string()))?;
-        let (key, alg) = self.key_for_id_token(&tr.id_token).await?;
+        let (key, alg) = self.signing_key_for(&tr.id_token).await?;
         let claims = decode_id_token(
             &tr.id_token,
             &key,
@@ -274,15 +316,41 @@ impl OidcClient {
             &self.cfg.issuer,
             &self.cfg.client_id,
         )?;
-        check_id_claims(&claims, expected_nonce, &self.cfg.acr)
+        let op = check_id_claims(&claims, expected_nonce, &self.cfg.acr)?;
+        // Capture the login id_token's `sid` (if any) for Back-Channel Logout mapping.
+        Ok((op, claims.sid.clone()))
     }
 
-    /// Resolve the id_token's signing key from identity's JWKS (cache + refetch-on-miss, throttled
-    /// like `vesta-broker::jwt`) and the alg to verify it with. The header alg must be in
-    /// [`SUPPORTED_ID_TOKEN_ALGS`] (asymmetric only — rejects `none`/HMAC alg-confusion) and, when
-    /// the OP advertises `id_token_signing_alg_values_supported`, must be one of those — NOT a
-    /// single pinned alg (identity signs ES256; our RSA cert is only for the client assertion).
-    async fn key_for_id_token(&self, token: &str) -> Result<(DecodingKey, Algorithm), OidcError> {
+    /// Verify an OIDC Back-Channel Logout Token (BCL 1.0 §2.4) identity POSTs to our
+    /// `backchannel_logout_uri` and return which session(s) to end. Same ES256 key/JWKS as the
+    /// id_token, so it reuses the JWKS resolver. Defends against token-type confusion (`typ`),
+    /// alg-confusion (asymmetric allow-list), a present `nonce` (prohibited), a missing logout
+    /// event, and a stale/future `iat`. `jti` replay is the caller's (it owns the seen-set).
+    ///
+    /// # Errors
+    /// [`OidcError::LogoutToken`] on any validation failure; [`OidcError::Jwks`]/[`OidcError::UnknownKid`]
+    /// if the signing key can't be resolved.
+    pub async fn verify_logout_token(&self, token: &str) -> Result<LogoutToken, OidcError> {
+        // typ MUST be `logout+jwt` — stops an id_token/access-token being replayed here.
+        let header = decode_header(token).map_err(|e| OidcError::LogoutToken(e.to_string()))?;
+        if header.typ.as_deref() != Some(LOGOUT_TOKEN_TYP) {
+            return Err(OidcError::LogoutToken(format!(
+                "unexpected typ {:?} (want {LOGOUT_TOKEN_TYP})",
+                header.typ
+            )));
+        }
+        let (key, alg) = self.signing_key_for(token).await?;
+        let claims = decode_logout_token(token, &key, alg, &self.cfg.issuer, &self.cfg.client_id)?;
+        check_logout_claims(&claims, now_unix())
+    }
+
+    /// Resolve a token's signing key from identity's JWKS (cache + refetch-on-miss, throttled like
+    /// `vesta-broker::jwt`) and the alg to verify it with. Used for both the id_token and the
+    /// Back-Channel Logout Token (identity signs both with the same ES256 key/JWKS). The header alg
+    /// must be in [`SUPPORTED_ID_TOKEN_ALGS`] (asymmetric only — rejects `none`/HMAC alg-confusion)
+    /// and, when the OP advertises `id_token_signing_alg_values_supported`, must be one of those —
+    /// NOT a single pinned alg (identity signs ES256; our RSA cert is only for the client assertion).
+    async fn signing_key_for(&self, token: &str) -> Result<(DecodingKey, Algorithm), OidcError> {
         let header = decode_header(token).map_err(|e| OidcError::IdToken(e.to_string()))?;
         let alg = accept_id_token_alg(
             &self.endpoints.id_token_signing_alg_values_supported,
@@ -445,6 +513,55 @@ fn check_id_claims(
     Ok(Operator {
         subject: claims.sub.clone(),
         email: claims.email.clone(),
+    })
+}
+
+/// Verify a Logout Token's signature (`alg`) + `iss`/`aud` (jsonwebtoken). Unlike an id_token, a
+/// Logout Token carries **`iat`, not `exp`** (BCL 1.0 §2.4) — so `exp` validation is off and
+/// freshness is enforced on `iat` by [`check_logout_claims`]. Pure given the decoding key + alg.
+fn decode_logout_token(
+    token: &str,
+    key: &DecodingKey,
+    alg: Algorithm,
+    issuer: &str,
+    client_id: &str,
+) -> Result<LogoutClaims, OidcError> {
+    let mut v = Validation::new(alg);
+    v.set_issuer(&[issuer]);
+    v.set_audience(&[client_id]);
+    v.validate_exp = false; // logout tokens have no exp; freshness is on iat
+    v.set_required_spec_claims(&["iss", "aud"]);
+    decode::<LogoutClaims>(token, key, &v)
+        .map(|d| d.claims)
+        .map_err(|e| OidcError::LogoutToken(e.to_string()))
+}
+
+/// Enforce the Logout Token's non-signature rules (BCL 1.0 §2.4) and reduce it to the session
+/// target. Pure: `nonce` prohibited, the backchannel-logout `events` member required, `iat` fresh
+/// (not older than [`LOGOUT_TOKEN_MAX_AGE_SECS`], not more than [`CLOCK_SKEW_LEEWAY_SECS`] ahead),
+/// and at least one of `sid`/`sub` present.
+fn check_logout_claims(claims: &LogoutClaims, now: u64) -> Result<LogoutToken, OidcError> {
+    if claims.nonce.is_some() {
+        return Err(OidcError::LogoutToken("nonce present (prohibited)".into()));
+    }
+    if !claims.events.contains_key(BACKCHANNEL_LOGOUT_EVENT) {
+        return Err(OidcError::LogoutToken(
+            "missing backchannel-logout event".into(),
+        ));
+    }
+    if now.saturating_sub(claims.iat) > LOGOUT_TOKEN_MAX_AGE_SECS {
+        return Err(OidcError::LogoutToken("iat too old".into()));
+    }
+    if claims.iat.saturating_sub(now) > CLOCK_SKEW_LEEWAY_SECS {
+        return Err(OidcError::LogoutToken("iat in the future".into()));
+    }
+    if claims.sid.is_none() && claims.sub.is_none() {
+        return Err(OidcError::LogoutToken("neither sid nor sub".into()));
+    }
+    Ok(LogoutToken {
+        sid: claims.sid.clone(),
+        sub: claims.sub.clone(),
+        jti: claims.jti.clone(),
     })
 }
 
@@ -802,5 +919,152 @@ mod tests {
             accept_id_token_alg(&[], Algorithm::RS256).unwrap(),
             Algorithm::RS256
         );
+    }
+
+    // --- Back-Channel Logout Token ---------------------------------------------------
+
+    /// Sign a Logout Token with **ES256** + header `typ=logout+jwt` (identity's real shape).
+    fn sign_logout_token_es256(claims: &serde_json::Value) -> String {
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some("eu-01KSNB0RQ".into());
+        header.typ = Some("logout+jwt".into());
+        encode(
+            &header,
+            claims,
+            &EncodingKey::from_ec_pem(&ec_keys().0).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn logout_claims(
+        iat: u64,
+        sid: Option<&str>,
+        sub: Option<&str>,
+        nonce: Option<&str>,
+        with_event: bool,
+    ) -> LogoutClaims {
+        let mut events = std::collections::HashMap::new();
+        if with_event {
+            events.insert(BACKCHANNEL_LOGOUT_EVENT.to_string(), serde_json::json!({}));
+        }
+        LogoutClaims {
+            sub: sub.map(String::from),
+            sid: sid.map(String::from),
+            iat,
+            jti: "jti-1".into(),
+            events,
+            nonce: nonce.map(String::from),
+        }
+    }
+
+    #[test]
+    fn logout_claims_happy_path() {
+        let now = now_unix();
+        let lt = check_logout_claims(
+            &logout_claims(now, Some("sid-1"), Some("op-1"), None, true),
+            now,
+        )
+        .unwrap();
+        assert_eq!(lt.sid.as_deref(), Some("sid-1"));
+        assert_eq!(lt.sub.as_deref(), Some("op-1"));
+        assert_eq!(lt.jti, "jti-1");
+    }
+
+    #[test]
+    fn logout_nonce_is_rejected() {
+        let now = now_unix();
+        assert!(matches!(
+            check_logout_claims(&logout_claims(now, Some("s"), None, Some("n"), true), now),
+            Err(OidcError::LogoutToken(_))
+        ));
+    }
+
+    #[test]
+    fn logout_missing_event_is_rejected() {
+        let now = now_unix();
+        assert!(matches!(
+            check_logout_claims(&logout_claims(now, Some("s"), None, None, false), now),
+            Err(OidcError::LogoutToken(_))
+        ));
+    }
+
+    #[test]
+    fn logout_stale_iat_is_rejected() {
+        let now = now_unix();
+        let stale = now - (LOGOUT_TOKEN_MAX_AGE_SECS + 10);
+        assert!(matches!(
+            check_logout_claims(&logout_claims(stale, Some("s"), None, None, true), now),
+            Err(OidcError::LogoutToken(_))
+        ));
+    }
+
+    #[test]
+    fn logout_future_iat_is_rejected() {
+        let now = now_unix();
+        let future = now + CLOCK_SKEW_LEEWAY_SECS + 10;
+        assert!(matches!(
+            check_logout_claims(&logout_claims(future, Some("s"), None, None, true), now),
+            Err(OidcError::LogoutToken(_))
+        ));
+    }
+
+    #[test]
+    fn logout_requires_sid_or_sub() {
+        let now = now_unix();
+        assert!(matches!(
+            check_logout_claims(&logout_claims(now, None, None, None, true), now),
+            Err(OidcError::LogoutToken(_))
+        ));
+    }
+
+    #[test]
+    fn logout_token_es256_decodes_end_to_end() {
+        let now = now_unix();
+        let token = sign_logout_token_es256(&serde_json::json!({
+            "iss": "https://identity.eu.proximi.fi/",
+            "aud": "vesta-console",
+            "sub": "op-es",
+            "sid": "sid-es",
+            "iat": now,
+            "jti": "jti-xyz",
+            "events": { "http://schemas.openid.net/event/backchannel-logout": {} },
+        }));
+        let key = DecodingKey::from_ec_pem(&ec_keys().1).unwrap();
+        let claims = decode_logout_token(
+            &token,
+            &key,
+            Algorithm::ES256,
+            "https://identity.eu.proximi.fi/",
+            "vesta-console",
+        )
+        .unwrap();
+        let lt = check_logout_claims(&claims, now).unwrap();
+        assert_eq!(lt.sid.as_deref(), Some("sid-es"));
+        assert_eq!(lt.jti, "jti-xyz");
+    }
+
+    /// A wrong-audience Logout Token fails at signature/claims decode (before the BCL checks).
+    #[test]
+    fn logout_token_wrong_audience_is_rejected() {
+        let now = now_unix();
+        let token = sign_logout_token_es256(&serde_json::json!({
+            "iss": "https://identity.eu.proximi.fi/",
+            "aud": "some-other-client",
+            "sid": "sid-es",
+            "iat": now,
+            "jti": "jti-xyz",
+            "events": { "http://schemas.openid.net/event/backchannel-logout": {} },
+        }));
+        let key = DecodingKey::from_ec_pem(&ec_keys().1).unwrap();
+        assert!(matches!(
+            decode_logout_token(
+                &token,
+                &key,
+                Algorithm::ES256,
+                "https://identity.eu.proximi.fi/",
+                "vesta-console"
+            ),
+            Err(OidcError::LogoutToken(_))
+        ));
     }
 }

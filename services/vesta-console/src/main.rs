@@ -44,6 +44,7 @@ async fn main() {
         oidc,
         sessions: Arc::new(session::Sessions::default()),
         pending: Arc::new(session::PendingAuth::default()),
+        seen_jtis: Arc::new(session::SeenJtis::default()),
         dev: cfg.allow_insecure_dev,
     };
     let listener = tokio::net::TcpListener::bind(cfg.bind)

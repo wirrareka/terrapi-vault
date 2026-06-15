@@ -31,6 +31,10 @@ pub const COOKIE_NAME: &str = "__Host-vc_session";
 
 struct SessionEntry {
     op: Operator,
+    /// The id_token `sid` captured at login (OIDC Back-Channel Logout 1.0 §2) — `None` for the dev
+    /// stub or a login id_token without `sid`. A Logout Token's `sid` maps back to the session(s)
+    /// to end. `sid` is omitted on refresh-minted id_tokens, so it is read from the *login* token.
+    sid: Option<String>,
     expires: Instant,
 }
 
@@ -47,14 +51,16 @@ pub struct Sessions {
 }
 
 impl Sessions {
-    /// Create a session for `op`; returns the opaque cookie value.
-    pub fn create(&self, op: Operator) -> String {
+    /// Create a session for `op` (carrying the login id_token's `sid`, if any); returns the opaque
+    /// cookie value.
+    pub fn create(&self, op: Operator, sid: Option<String>) -> String {
         let id = random_id();
         let mut map = self.map.lock().expect("sessions lock");
         map.insert(
             id.clone(),
             SessionEntry {
                 op,
+                sid,
                 expires: Instant::now() + SESSION_TTL,
             },
         );
@@ -72,6 +78,21 @@ impl Sessions {
     /// End a session (logout). Idempotent.
     pub fn remove(&self, id: &str) {
         self.map.lock().expect("sessions lock").remove(id);
+    }
+
+    /// Back-Channel Logout: end the session(s) the identity Logout Token targets, and return how
+    /// many were ended. Per BCL 1.0 §2.4: a token carrying `sid` ends the session bound to that
+    /// `sid`; a token with only `sub` (client not registered `..session_required`) ends *all* the
+    /// user's sessions. Idempotent — zero matches is fine (the session may already be gone).
+    pub fn logout_matching(&self, sid: Option<&str>, sub: Option<&str>) -> usize {
+        let mut map = self.map.lock().expect("sessions lock");
+        let before = map.len();
+        match (sid, sub) {
+            (Some(sid), _) => map.retain(|_, e| e.sid.as_deref() != Some(sid)),
+            (None, Some(sub)) => map.retain(|_, e| e.op.subject != sub),
+            (None, None) => {} // validation guarantees at least one is present
+        }
+        before - map.len()
     }
 }
 
@@ -116,6 +137,40 @@ impl PendingAuth {
     }
 }
 
+/// Replay window for Back-Channel Logout `jti`s — kept ≥ the token's accepted `iat` freshness so a
+/// token replayed within its freshness window is caught here, and a staler one is already rejected
+/// on `iat`.
+const JTI_TTL: Duration = Duration::from_secs(300);
+/// Memory bound on the seen-`jti` set. Sized far above any real logout burst; above it we stop
+/// recording (see [`SeenJtis::check_and_record`]).
+const MAX_JTIS: usize = 8192;
+
+/// Seen Back-Channel Logout `jti`s, for replay rejection (BCL 1.0 §2.4). Bounded + lazily
+/// TTL-evicted like [`PendingAuth`].
+#[derive(Default)]
+pub struct SeenJtis {
+    map: Mutex<HashMap<String, Instant>>,
+}
+
+impl SeenJtis {
+    /// Record `jti`; returns `true` if fresh (accept the logout), `false` if already seen (replay →
+    /// reject). At the [`MAX_JTIS`] cap (after sweeping expired) we accept WITHOUT recording: a
+    /// replayed logout is idempotent (it re-ends already-dead sessions), so failing open keeps the
+    /// map bounded under a flood of distinct tokens without ever dropping a real logout.
+    pub fn check_and_record(&self, jti: &str) -> bool {
+        let mut map = self.map.lock().expect("jti lock");
+        let now = Instant::now();
+        map.retain(|_, exp| *exp > now);
+        if map.contains_key(jti) {
+            return false;
+        }
+        if map.len() < MAX_JTIS {
+            map.insert(jti.to_string(), now + JTI_TTL);
+        }
+        true
+    }
+}
+
 /// 32 random bytes, base64url — the session cookie value.
 fn random_id() -> String {
     let mut b = [0u8; 32];
@@ -137,10 +192,47 @@ mod tests {
     #[test]
     fn session_roundtrip_and_logout() {
         let s = Sessions::default();
-        let id = s.create(op());
+        let id = s.create(op(), None);
         assert_eq!(s.get(&id).unwrap().subject, "op-1");
         s.remove(&id);
         assert!(s.get(&id).is_none());
+    }
+
+    #[test]
+    fn backchannel_logout_by_sid_ends_only_that_session() {
+        let s = Sessions::default();
+        let a = s.create(op(), Some("sid-A".into()));
+        let b = s.create(op(), Some("sid-B".into()));
+        // A token carrying sid-A ends only the sid-A session, even though both are the same `sub`.
+        assert_eq!(s.logout_matching(Some("sid-A"), Some("op-1")), 1);
+        assert!(s.get(&a).is_none());
+        assert!(s.get(&b).is_some());
+    }
+
+    #[test]
+    fn backchannel_logout_by_sub_ends_all_user_sessions() {
+        let s = Sessions::default();
+        let a = s.create(op(), Some("sid-A".into()));
+        let b = s.create(op(), Some("sid-B".into()));
+        // No sid in the token (client not session-bound) → end every session for the `sub`.
+        assert_eq!(s.logout_matching(None, Some("op-1")), 2);
+        assert!(s.get(&a).is_none());
+        assert!(s.get(&b).is_none());
+    }
+
+    #[test]
+    fn backchannel_logout_is_idempotent_no_match() {
+        let s = Sessions::default();
+        s.create(op(), Some("sid-A".into()));
+        assert_eq!(s.logout_matching(Some("sid-Z"), None), 0);
+    }
+
+    #[test]
+    fn seen_jtis_accepts_once_then_rejects_replay() {
+        let j = SeenJtis::default();
+        assert!(j.check_and_record("jti-1"), "first sight accepted");
+        assert!(!j.check_and_record("jti-1"), "replay rejected");
+        assert!(j.check_and_record("jti-2"), "a different jti is fine");
     }
 
     #[test]
