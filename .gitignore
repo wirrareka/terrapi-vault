@@ -8,3 +8,6 @@
 *.sqlcipher-wal
 *.sqlcipher-shm
 *.sqlcipher.meta.json
+# Node tooling caches (Node --compile-cache, jiti) emitted by the web build
+node-compile-cache/
+node-jiti/
