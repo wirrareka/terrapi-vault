@@ -155,3 +155,23 @@ auth story for a native flow (likely device-token, not browser OIDC) — design 
    artifact (its own deploy unit / per-group jail), alongside the `vesta-broker` artifact.
 5. **Audit = per-broker local hash-chained store, merged in the console. OpenSearch is NOT
    involved** (keep it simple; no OS dependency in the console path).
+
+## Shipped beyond P1b — Single-Logout + visible sign-out (2026-06-14)
+- **OIDC Back-Channel Logout (BCL 1.0), RP side** — wires identity's fleet Single-Logout so a
+  revoke / admin force-logout / `disable_user` ends the *console* session, not just the IdP session
+  ("revoke once → dropped from the console"). Per `conventions/jwt-claims.md` (the `sid` + Logout
+  Token sections) and `inbox/vault/infra-slo-backchannel-logout-rp-integration.md`.
+  - Login captures the id_token **`sid`** onto the session record.
+  - `POST /api/v1/auth/backchannel-logout` — `application/x-www-form-urlencoded`, single
+    `logout_token`; **server-to-server, no operator cookie** — the signed token is the authn.
+    Validates (BCL §2.4): `typ=logout+jwt`, **ES256 via identity `jwks_uri`** (the id_token resolver,
+    asymmetric allow-list — no `none`/HMAC), `iss`, `aud=client_id`, `iat` freshness (≤300s, ±60s
+    skew), required `backchannel-logout` event, **`nonce` prohibited**, **`jti` replay-rejected**.
+    Valid → ends the session(s) bound to `sid` (else all of a `sub`'s), returns **200** (idempotent);
+    invalid/replayed → **400**. Command-only; never touches a secret.
+  - Session store (still in-memory / stateless): each session now also holds the login `sid`; a
+    bounded TTL `jti` replay cache backs the endpoint. Registration handover (the
+    `backchannel_logout_uri` + `backchannel_logout_session_required=true`) →
+    `inbox/infra/vesta-slo-backchannel-logout-rp-done.md`.
+- **Visible "Sign out" button** — the front-channel logout (`POST /api/v1/auth/logout`) is now a
+  full-width labelled button in the sidebar (was an unlabeled icon operators couldn't find).

@@ -32,6 +32,14 @@ OIDC RP via identity (`acr=mfa` enforced) — **P1b**, wired once identity mints
 final redirect URI. Until then, only `VESTA_CONSOLE_ALLOW_INSECURE_DEV=1` grants a (dev) session.
 No encrypted dataset / unseal needed — the console is stateless.
 
+**Single-Logout (OIDC Back-Channel Logout, RP side):** `POST /api/v1/auth/backchannel-logout` ends
+the console session when identity fans out a revoke / admin force-logout. It is **server-to-server**
+(identity → console, signed Logout Token, no operator cookie), so the **Kalista edge IP-ACL must
+permit identity's POST** to that path. Register on the console's identity client:
+`backchannel_logout_uri` = `https://vesta-console.<region>.proximi.fi/api/v1/auth/backchannel-logout`
+(same origin as `redirect_uri`) and `backchannel_logout_session_required=true`. No console env var.
+
 ## State
 None at rest beyond config secrets (cert key + OIDC secret, mode 0600). Sessions are in-memory
-(re-login on restart is fine for an ops console).
+(re-login on restart is fine for an ops console); each session also holds the login id_token `sid`,
+plus a small in-memory `jti` replay cache for the back-channel logout endpoint.
