@@ -17,7 +17,7 @@ categories = ["cryptography", "database"]
 [dependencies]
 rusqlite = { version = "0.32.1", features = ["bundled-sqlcipher"] }
 argon2 = "0.5.3"
-rand = "0.8.5"
+rand = "0.10.1"
 zeroize = { version = "1.8.1", features = ["zeroize_derive"] }
 secrecy = "0.10.3"
 thiserror = "1.0.69"
