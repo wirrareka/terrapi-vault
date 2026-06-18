@@ -35,7 +35,7 @@ default = ["note-export"]
 note-export = []
 
 [dev-dependencies]
-tempfile = "3.14.0"
+tempfile = "3.27.0"
 
 [profile.dev]
 debug = 0
