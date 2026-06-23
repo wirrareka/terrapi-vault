@@ -52,7 +52,7 @@ jobs:
           fi
           [ -s release-notes.md ] || echo "Release ${VERSION}" > release-notes.md
       - name: Create or update the Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           name: ${{ inputs.tag || github.ref_name }}
@@ -141,7 +141,7 @@ jobs:
           [ "$sz" -gt 2000000 ] || { echo "::error::synced FreeBSD tarball too small (${sz}B)"; exit 1; }
 
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
@@ -183,7 +183,7 @@ jobs:
           tar -czf "${STAGING}.tar.gz" "$STAGING"
           sha256sum "${STAGING}.tar.gz" > "${STAGING}.tar.gz.sha256"
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
@@ -242,7 +242,7 @@ jobs:
           tar -czf "${STAGING}.tar.gz" "$STAGING"
           sha256sum "${STAGING}.tar.gz" > "${STAGING}.tar.gz.sha256"
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
@@ -335,7 +335,7 @@ jobs:
           echo "host tarball size: ${sz} bytes"
           [ "$sz" -gt 2000000 ] || { echo "::error::synced FreeBSD console tarball too small (${sz}B)"; exit 1; }
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
