@@ -8,6 +8,7 @@ use base64::Engine as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use terrapi_vesta::rusqlite::{self, params, Connection, OptionalExtension};
+use vesta_transport::lock::MutexExt;
 use vesta_transport::Hlc;
 
 /// Current unix time in seconds.
@@ -107,10 +108,10 @@ impl Store {
         f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T> {
         if self.readers.is_empty() {
-            return f(&self.writer.lock().expect("writer lock"));
+            return f(&self.writer.lock_recover());
         }
         let idx = self.rr.fetch_add(1, Ordering::Relaxed) % self.readers.len();
-        let conn = self.readers[idx].lock().expect("reader lock");
+        let conn = self.readers[idx].lock_recover();
         f(&conn)
     }
 
@@ -186,7 +187,7 @@ impl Store {
         device_id: &str,
         pubkey: &[u8; 32],
     ) -> Result<bool, AccountError> {
-        let conn = self.writer.lock().expect("writer lock");
+        let conn = self.writer.lock_recover();
         let tx = conn.unchecked_transaction()?;
         if tx
             .prepare("SELECT 1 FROM accounts WHERE vesta_id = ?1")?
@@ -251,7 +252,7 @@ impl Store {
         device_id: &str,
         pubkey: &[u8; 32],
     ) -> rusqlite::Result<DeviceUpsert> {
-        let conn = self.writer.lock().expect("writer lock");
+        let conn = self.writer.lock_recover();
         let existing: Option<Vec<u8>> = conn
             .query_row(
                 "SELECT pubkey FROM devices WHERE vesta_id = ?1 AND device_id = ?2",
@@ -275,7 +276,7 @@ impl Store {
     /// device existed (idempotent). A revoked device can no longer sign requests (its pubkey is
     /// gone) until it re-enrols with the passphrase proof.
     pub fn revoke_device(&self, vesta_id: &str, device_id: &str) -> rusqlite::Result<bool> {
-        let conn = self.writer.lock().expect("writer lock");
+        let conn = self.writer.lock_recover();
         let n = conn.execute(
             "DELETE FROM devices WHERE vesta_id = ?1 AND device_id = ?2",
             params![vesta_id, device_id],
@@ -335,7 +336,7 @@ impl Store {
         vesta_id: &str,
         ops: &[Op],
     ) -> Result<(u64, u64, u64, Vec<StoredOp>), PushError> {
-        let conn = self.writer.lock().expect("writer lock");
+        let conn = self.writer.lock_recover();
         let tx = conn.unchecked_transaction()?;
         let mut seq: i64 = tx.query_row(
             "SELECT COALESCE(MAX(seq), 0) FROM ops WHERE vesta_id = ?1",
@@ -481,7 +482,7 @@ mod tests {
     #[test]
     fn migrates_legacy_vault_id_columns_to_vesta_id() {
         let s = Store::open_memory().unwrap();
-        let c = s.writer.lock().unwrap();
+        let c = s.writer.lock_recover();
         // Simulate a pre-rename server DB: rename the columns back to the legacy `vault_id`.
         c.execute_batch(
             "ALTER TABLE accounts RENAME COLUMN vesta_id TO vault_id;

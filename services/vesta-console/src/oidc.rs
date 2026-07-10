@@ -19,6 +19,7 @@
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use vesta_transport::lock::MutexExt;
 
 use base64::Engine as _;
 use jsonwebtoken::jwk::JwkSet;
@@ -360,7 +361,7 @@ impl OidcClient {
             .kid
             .ok_or_else(|| OidcError::IdToken("missing kid".into()))?;
         {
-            let cache = self.jwks.lock().expect("jwks lock");
+            let cache = self.jwks.lock_recover();
             if let Some(set) = cache.set.as_ref() {
                 if let Some(jwk) = set.find(&kid) {
                     let key =
@@ -375,7 +376,7 @@ impl OidcClient {
             }
         }
         let fetched = self.fetch_jwks().await;
-        let mut cache = self.jwks.lock().expect("jwks lock");
+        let mut cache = self.jwks.lock_recover();
         cache.last_fetch = Some(Instant::now());
         let set = fetched?;
         let key = match set.find(&kid) {

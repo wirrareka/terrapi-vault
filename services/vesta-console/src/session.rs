@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use vesta_transport::lock::MutexExt;
 
 use base64::Engine as _;
 use rand::RngCore;
@@ -55,7 +56,7 @@ impl Sessions {
     /// cookie value.
     pub fn create(&self, op: Operator, sid: Option<String>) -> String {
         let id = random_id();
-        let mut map = self.map.lock().expect("sessions lock");
+        let mut map = self.map.lock_recover();
         map.insert(
             id.clone(),
             SessionEntry {
@@ -69,7 +70,7 @@ impl Sessions {
 
     /// Look up a live (non-expired) session by its cookie value.
     pub fn get(&self, id: &str) -> Option<Operator> {
-        let mut map = self.map.lock().expect("sessions lock");
+        let mut map = self.map.lock_recover();
         let now = Instant::now();
         map.retain(|_, e| e.expires > now);
         map.get(id).map(|e| e.op.clone())
@@ -77,7 +78,7 @@ impl Sessions {
 
     /// End a session (logout). Idempotent.
     pub fn remove(&self, id: &str) {
-        self.map.lock().expect("sessions lock").remove(id);
+        self.map.lock_recover().remove(id);
     }
 
     /// Back-Channel Logout: end the session(s) the identity Logout Token targets, and return how
@@ -85,7 +86,7 @@ impl Sessions {
     /// `sid`; a token with only `sub` (client not registered `..session_required`) ends *all* the
     /// user's sessions. Idempotent — zero matches is fine (the session may already be gone).
     pub fn logout_matching(&self, sid: Option<&str>, sub: Option<&str>) -> usize {
-        let mut map = self.map.lock().expect("sessions lock");
+        let mut map = self.map.lock_recover();
         let before = map.len();
         match (sid, sub) {
             (Some(sid), _) => map.retain(|_, e| e.sid.as_deref() != Some(sid)),
@@ -107,7 +108,7 @@ impl PendingAuth {
     /// swept first, then — if still at the cap — the single oldest entry is evicted before insert,
     /// so an unauthenticated `/auth/login` flood cannot grow the map without limit.
     pub fn put(&self, state: String, verifier: String, nonce: String) {
-        let mut map = self.map.lock().expect("pending lock");
+        let mut map = self.map.lock_recover();
         let now = Instant::now();
         map.retain(|_, e| e.expires > now);
         // At the cap (after sweeping expired): REFUSE the new login rather than evict an existing
@@ -130,7 +131,7 @@ impl PendingAuth {
     /// Consume the pending login for `state` (one-shot — also prevents `state` replay). Returns
     /// `(verifier, nonce)` if present and unexpired.
     pub fn take(&self, state: &str) -> Option<(String, String)> {
-        let mut map = self.map.lock().expect("pending lock");
+        let mut map = self.map.lock_recover();
         let now = Instant::now();
         let e = map.remove(state)?;
         (e.expires > now).then_some((e.verifier, e.nonce))
@@ -158,7 +159,7 @@ impl SeenJtis {
     /// replayed logout is idempotent (it re-ends already-dead sessions), so failing open keeps the
     /// map bounded under a flood of distinct tokens without ever dropping a real logout.
     pub fn check_and_record(&self, jti: &str) -> bool {
-        let mut map = self.map.lock().expect("jti lock");
+        let mut map = self.map.lock_recover();
         let now = Instant::now();
         map.retain(|_, exp| *exp > now);
         if map.contains_key(jti) {
@@ -246,7 +247,7 @@ mod tests {
         for i in 0..(MAX_PENDING + 100) {
             p.put(format!("state-{i}"), "v".into(), "n".into());
         }
-        let map = p.map.lock().unwrap();
+        let map = p.map.lock_recover();
         assert!(map.len() <= MAX_PENDING, "pending map must stay bounded");
         drop(map);
         // Refuse-new at the cap: an early (in-flight) login is preserved, late ones are refused —

@@ -10,6 +10,7 @@ use terrapi_vesta::Vesta;
 use vesta_transport::audit::{AuditEvent, AuditSink};
 use vesta_transport::http::HttpMetrics;
 use vesta_transport::lease::LeaseEngine;
+use vesta_transport::lock::MutexExt;
 
 /// Default TTL for a leased service-admin cred when the request omits `ttl_secs`.
 pub const CREDS_DEFAULT_TTL_SECS: u64 = 900;
@@ -35,8 +36,7 @@ impl Metrics {
     fn incr(&self, action: &str) {
         *self
             .events
-            .lock()
-            .expect("metrics lock")
+            .lock_recover()
             .entry(action.to_owned())
             .or_insert(0) += 1;
     }
@@ -78,7 +78,7 @@ impl Metrics {
             "# HELP {prefix}_audit_events_total B3 audit events emitted, by action."
         );
         let _ = writeln!(out, "# TYPE {prefix}_audit_events_total counter");
-        let events = self.events.lock().expect("metrics lock");
+        let events = self.events.lock_recover();
         let mut actions: Vec<_> = events.iter().collect();
         actions.sort_by(|a, b| a.0.cmp(b.0));
         for (action, n) in actions {
@@ -267,19 +267,14 @@ impl AppState {
     /// Record `session_id` as the active session for `principal_san`.
     pub fn bind_session(&self, principal_san: &str, session_id: &str) {
         self.sessions
-            .lock()
-            .expect("sessions lock")
+            .lock_recover()
             .insert(principal_san.to_owned(), session_id.to_owned());
     }
 
     /// The active session for `principal_san`, if one is open.
     #[must_use]
     pub fn active_session(&self, principal_san: &str) -> Option<String> {
-        self.sessions
-            .lock()
-            .expect("sessions lock")
-            .get(principal_san)
-            .cloned()
+        self.sessions.lock_recover().get(principal_san).cloned()
     }
 
     /// Whether `principal_san` owns `session_id` — i.e. it is that principal's currently-bound
@@ -288,8 +283,7 @@ impl AppState {
     #[must_use]
     pub fn owns_session(&self, principal_san: &str, session_id: &str) -> bool {
         self.sessions
-            .lock()
-            .expect("sessions lock")
+            .lock_recover()
             .get(principal_san)
             .is_some_and(|sid| sid == session_id)
     }
@@ -299,8 +293,7 @@ impl AppState {
     #[must_use]
     pub fn list_sessions(&self) -> Vec<(String, String)> {
         self.sessions
-            .lock()
-            .expect("sessions lock")
+            .lock_recover()
             .iter()
             .map(|(san, sid)| (san.clone(), sid.clone()))
             .collect()
@@ -311,8 +304,7 @@ impl AppState {
     #[must_use]
     pub fn cred_roles(&self) -> std::collections::HashMap<String, String> {
         self.cred_handles
-            .lock()
-            .expect("cred handles lock")
+            .lock_recover()
             .iter()
             .map(|(lease_id, h)| (lease_id.clone(), h.role.clone()))
             .collect()
@@ -322,8 +314,7 @@ impl AppState {
     #[must_use]
     pub fn list_ssh_serials(&self) -> Vec<(String, u64)> {
         self.ssh_serials
-            .lock()
-            .expect("ssh serials lock")
+            .lock_recover()
             .iter()
             .map(|(lease_id, serial)| (lease_id.clone(), *serial))
             .collect()
@@ -331,17 +322,13 @@ impl AppState {
 
     /// Drop any principal bindings pointing at `session_id` (called on session end).
     pub fn unbind_session(&self, session_id: &str) {
-        self.sessions
-            .lock()
-            .expect("sessions lock")
-            .retain(|_, v| v != session_id);
+        self.sessions.lock_recover().retain(|_, v| v != session_id);
     }
 
     /// Remember an issued SSH cert's serial against its lease (for later revocation).
     pub fn record_ssh_serial(&self, lease_id: &str, serial: u64) {
         self.ssh_serials
-            .lock()
-            .expect("ssh serials lock")
+            .lock_recover()
             .insert(lease_id.to_owned(), serial);
     }
 
@@ -349,7 +336,7 @@ impl AppState {
     /// are revoked/expired, so the serials can be recorded in the CA revocation list.
     #[must_use]
     pub fn take_ssh_serials(&self, lease_ids: &[String]) -> Vec<u64> {
-        let mut map = self.ssh_serials.lock().expect("ssh serials lock");
+        let mut map = self.ssh_serials.lock_recover();
         lease_ids.iter().filter_map(|id| map.remove(id)).collect()
     }
 

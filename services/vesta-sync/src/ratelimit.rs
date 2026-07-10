@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
+use vesta_transport::lock::MutexExt;
 
 /// Sustained rate (tokens/sec) and burst depth for the unauthenticated endpoints.
 pub const DEFAULT_CHALLENGE_RATE_PER_SEC: f64 = 5.0;
@@ -55,7 +56,7 @@ impl KeyedRateBucket {
     /// never waits.
     pub fn allow(&self, key: &str) -> bool {
         let now = Instant::now();
-        let mut map = self.inner.lock().expect("ratelimit lock");
+        let mut map = self.inner.lock_recover();
 
         // Keep the map bounded before inserting a brand-new key.
         if !map.contains_key(key) && map.len() >= self.max_keys {

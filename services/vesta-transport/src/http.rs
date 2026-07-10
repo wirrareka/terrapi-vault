@@ -2,6 +2,7 @@
 //! (serde + std only) so this crate stays axum/tokio-neutral — each service keeps its own
 //! thin `err()`/handler glue around these shapes.
 
+use crate::lock::MutexExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -36,8 +37,7 @@ impl HttpMetrics {
     pub fn record_request(&self, route: &str, method: &str, status: u16, dur: Duration) {
         *self
             .requests
-            .lock()
-            .expect("metrics lock")
+            .lock_recover()
             .entry(ReqKey {
                 route: route.to_owned(),
                 method: method.to_owned(),
@@ -45,7 +45,7 @@ impl HttpMetrics {
             })
             .or_insert(0) += 1;
         let ms = u64::try_from(dur.as_millis()).unwrap_or(u64::MAX);
-        let mut lat = self.latency.lock().expect("metrics lock");
+        let mut lat = self.latency.lock_recover();
         let e = lat.entry(route.to_owned()).or_insert((0, 0));
         e.0 += 1;
         e.1 = e.1.saturating_add(ms);
@@ -74,7 +74,7 @@ impl HttpMetrics {
             out,
             "# HELP {prefix}_http_requests_total Served HTTP requests, by route/method/status.\n# TYPE {prefix}_http_requests_total counter"
         );
-        let reqs = self.requests.lock().expect("metrics lock");
+        let reqs = self.requests.lock_recover();
         let mut rows: Vec<_> = reqs.iter().collect();
         rows.sort_by(|a, b| {
             (&a.0.route, &a.0.method, a.0.status).cmp(&(&b.0.route, &b.0.method, b.0.status))
@@ -90,7 +90,7 @@ impl HttpMetrics {
             out,
             "# HELP {prefix}_http_request_duration_ms Per-route request latency (sum/count).\n# TYPE {prefix}_http_request_duration_ms summary"
         );
-        let lat = self.latency.lock().expect("metrics lock");
+        let lat = self.latency.lock_recover();
         let mut lrows: Vec<_> = lat.iter().collect();
         lrows.sort_by(|a, b| a.0.cmp(b.0));
         for (route, (count, sum)) in lrows {

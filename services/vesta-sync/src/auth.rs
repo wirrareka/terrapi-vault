@@ -14,6 +14,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use vesta_transport::lock::MutexExt;
 
 /// Max accepted clock skew between a device and the server, in seconds. A request whose
 /// timestamp is outside `[now - SKEW, now + SKEW]` is rejected (bounds replay windows).
@@ -138,7 +139,7 @@ impl ReplayGuard {
     /// within the window (a replay). Prunes expired entries opportunistically.
     pub fn check_and_record(&self, device_id: &str, nonce: &str, now: i64) -> bool {
         let key = format!("{device_id}\n{nonce}");
-        let mut seen = self.seen.lock().expect("replay lock");
+        let mut seen = self.seen.lock_recover();
         seen.retain(|_, ts| now - *ts <= NONCE_RETENTION_SECS);
         if seen.contains_key(&key) {
             return false;

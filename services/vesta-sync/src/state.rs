@@ -9,6 +9,7 @@ use crate::store::Store;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
+use vesta_transport::lock::MutexExt;
 
 /// Capacity of each per-vault live-tail broadcast buffer. A slow WS subscriber that falls
 /// further behind than this is told to resync (full `pull`) rather than the server buffering
@@ -59,7 +60,7 @@ impl AppState {
     /// Current number of live-tail subscribers across all vaults (for the metrics gauge).
     #[must_use]
     pub fn tail_subscriber_count(&self) -> u64 {
-        let tails = self.tails.lock().expect("tails lock");
+        let tails = self.tails.lock_recover();
         tails
             .values()
             .map(|tx| u64::try_from(tx.receiver_count()).unwrap_or(0))
@@ -69,7 +70,7 @@ impl AppState {
     /// Subscribe to the live tail for `vesta_id` (creating its channel on first use).
     #[must_use]
     pub fn subscribe(&self, vesta_id: &str) -> broadcast::Receiver<String> {
-        let mut tails = self.tails.lock().expect("tails lock");
+        let mut tails = self.tails.lock_recover();
         // Drop channels nobody is listening to any more so the map is bounded by the number of
         // vaults with a live subscriber — not by every vesta_id ever tailed.
         tails.retain(|_, tx| tx.receiver_count() > 0);
@@ -81,7 +82,7 @@ impl AppState {
 
     /// Fan out freshly-stored ops to any live-tail subscribers of `vesta_id`. No-op if none.
     pub fn publish(&self, vesta_id: &str, messages: &[String]) {
-        let tails = self.tails.lock().expect("tails lock");
+        let tails = self.tails.lock_recover();
         if let Some(tx) = tails.get(vesta_id) {
             for m in messages {
                 // `send` errors only when there are no receivers — harmless here.

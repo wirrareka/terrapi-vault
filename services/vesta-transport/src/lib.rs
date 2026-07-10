@@ -13,6 +13,7 @@
 pub mod audit;
 pub mod http;
 pub mod lease;
+pub mod lock;
 
 use serde::{Deserialize, Serialize};
 

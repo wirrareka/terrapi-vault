@@ -23,6 +23,7 @@ use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use vesta_transport::lock::MutexExt;
 
 /// Minimum spacing between JWKS (re)fetches. On a `kid` miss the cache refetches at most this
 /// often — so a flood of tokens bearing random/unknown `kid`s cannot amplify 1:1 into outbound
@@ -171,7 +172,7 @@ impl JwtVerifier {
     async fn key_for(&self, kid: &str) -> Result<DecodingKey, JwtError> {
         // Fast path + refetch throttle. Guard dropped before any await.
         {
-            let cache = self.cache.lock().expect("jwks cache lock");
+            let cache = self.cache.lock_recover();
             if let Some(set) = cache.set.as_ref() {
                 if let Some(jwk) = set.find(kid) {
                     return DecodingKey::from_jwk(jwk).map_err(|e| JwtError::Jwks(e.to_string()));
@@ -186,7 +187,7 @@ impl JwtVerifier {
         }
         // Refetch (identity may have rotated its signing key), then look up once more.
         let fetched = self.fetch_jwks().await;
-        let mut cache = self.cache.lock().expect("jwks cache lock");
+        let mut cache = self.cache.lock_recover();
         // Stamp the attempt even on failure, so a down/slow JWKS endpoint is also rate-limited.
         cache.last_fetch = Some(Instant::now());
         let set = fetched?;

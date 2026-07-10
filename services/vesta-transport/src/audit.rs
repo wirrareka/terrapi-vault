@@ -9,6 +9,7 @@
 //! value, private key, password, or signed certificate. Only metadata (action, ids,
 //! ttl, outcome) is representable, so a secret cannot be emitted by accident.
 
+use crate::lock::MutexExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, Write};
@@ -352,7 +353,7 @@ impl HashChainSink {
     /// was durably written so `try_emit` can fail issuance closed.
     fn append(&self, event: &AuditEvent) -> Result<(), AuditError> {
         let event_bytes = serde_json::to_vec(event).map_err(|_| AuditError::Serialize)?;
-        let mut st = self.state.lock().expect("audit chain lock");
+        let mut st = self.state.lock_recover();
         // Fail-closed: if the tip couldn't be cleanly recovered, never append (would fork the
         // chain at an unknown seq). Issuance try_emit() then 503s; best-effort emit() drops.
         if st.corrupt {

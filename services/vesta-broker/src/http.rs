@@ -22,6 +22,7 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use ssh_key::certificate::CertType;
 use vesta_transport::audit::{Actor, ActorKind, AuditEvent, Outcome, Target};
+use vesta_transport::lock::MutexExt;
 use vesta_transport::ResidencyGroup;
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ErrorBody>)>;
@@ -299,7 +300,7 @@ async fn ssh_revoked(
         ));
     };
     let revoked_serials = {
-        let v = store.lock().expect("store lock");
+        let v = store.lock_recover();
         crate::ssh_ca::list_revoked(&v)
     }
     .map_err(|e| internal("store_error", "ssh revoked-list read", e))?;
@@ -378,7 +379,7 @@ async fn ssh_sign(
     // Reserve the lease first (binds to the session / 409 if it ended), then sign; if
     // signing fails, revoke the orphan so no dangling lease remains.
     let lease_id = {
-        let mut eng = state.leases.lock().expect("lease lock");
+        let mut eng = state.leases.lock_recover();
         eng.issue_lease(now, &session_id, ttl, ttl, false)
     }
     .map_err(|_| {
@@ -404,7 +405,7 @@ async fn ssh_sign(
     ) {
         Ok(s) => s,
         Err(e) => {
-            let mut eng = state.leases.lock().expect("lease lock");
+            let mut eng = state.leases.lock_recover();
             let _ = eng.revoke(&lease_id);
             return Err(match e {
                 crate::ssh_ca::CaError::BadRequest(m) => {
@@ -439,7 +440,7 @@ async fn ssh_sign(
         .is_err()
     {
         {
-            let mut eng = state.leases.lock().expect("lease lock");
+            let mut eng = state.leases.lock_recover();
             let _ = eng.revoke(&lease_id);
         }
         record_revoked_ssh(&state, std::slice::from_ref(&lease_id));
@@ -483,7 +484,7 @@ async fn store_snapshot(
 
     // Online, consistent snapshot — SQLCipher copies under the same key (ciphertext).
     {
-        let v = store.lock().expect("store lock");
+        let v = store.lock_recover();
         v.with_connection(|c| c.execute("VACUUM INTO ?1", [snap_str.as_str()]).map(|_| ()))
     }
     .map_err(|e| internal("snapshot_failed", "snapshot vacuum", e))?;
@@ -593,20 +594,16 @@ async fn creds(
     // Lock order here is leases→cred_handles; the sweeper releases leases before taking
     // cred_handles and teardown never takes leases, so there is no deadlock.
     let lease_id = {
-        let mut eng = state.leases.lock().expect("lease lock");
+        let mut eng = state.leases.lock_recover();
         match eng.issue_lease(now_unix(), &session_id, ttl, issued.max_ttl_secs, true) {
             Ok(lease_id) => {
-                state
-                    .cred_handles
-                    .lock()
-                    .expect("cred handles lock")
-                    .insert(
-                        lease_id.clone(),
-                        crate::creds::CredHandle {
-                            role: role.clone(),
-                            username: issued.username.clone(),
-                        },
-                    );
+                state.cred_handles.lock_recover().insert(
+                    lease_id.clone(),
+                    crate::creds::CredHandle {
+                        role: role.clone(),
+                        username: issued.username.clone(),
+                    },
+                );
                 Some(lease_id)
             }
             Err(_) => None,
@@ -670,7 +667,7 @@ async fn audit_creds_issue_or_teardown(
     }
     let lid = lease_id.to_owned();
     {
-        let mut eng = state.leases.lock().expect("lease lock");
+        let mut eng = state.leases.lock_recover();
         let _ = eng.revoke(&lid);
     }
     tear_down_creds(state, principal, std::slice::from_ref(&lid)).await;
@@ -829,7 +826,7 @@ async fn observe_leases(
     let now = now_unix();
     let roles = state.cred_roles();
     let active = {
-        let eng = state.leases.lock().expect("lease lock");
+        let eng = state.leases.lock_recover();
         eng.active_leases(now)
     };
     let leases = active
@@ -859,7 +856,7 @@ async fn observe_sessions(
         .map(|(san, sid)| (sid, san))
         .collect();
     let active = {
-        let eng = state.leases.lock().expect("lease lock");
+        let eng = state.leases.lock_recover();
         eng.active_sessions(now)
     };
     let sessions = active
@@ -913,7 +910,7 @@ async fn observe_ssh(
         .collect();
     let revoked = match &state.store {
         Some(s) => {
-            let v = s.lock().expect("store lock");
+            let v = s.lock_recover();
             crate::ssh_ca::list_revoked(&v)
                 .map_err(|e| internal("store_error", "ssh revoked", e))?
         }
@@ -932,7 +929,7 @@ async fn observe_kms(
     let group = state.cfg.residency_group.as_str();
     let raw = match &state.store {
         Some(s) => {
-            let v = s.lock().expect("store lock");
+            let v = s.lock_recover();
             crate::kms::list_keys(&v, group).map_err(|e| internal("store_error", "kms list", e))?
         }
         None => Vec::new(),
@@ -1147,7 +1144,7 @@ async fn kms_wrap(
             )
         })?;
     let wrapped = {
-        let v = store.lock().expect("store lock");
+        let v = store.lock_recover();
         crate::kms::wrap(&v, &group, &tenant_id, &key_id, &dek)
     }
     .map_err(map_kms_err)?;
@@ -1193,7 +1190,7 @@ async fn kms_unwrap(
             )
         })?;
     let dek = {
-        let v = store.lock().expect("store lock");
+        let v = store.lock_recover();
         crate::kms::unwrap(&v, &group, &tenant_id, &key_id, &wrapped)
     }
     .map_err(map_kms_err)?;
@@ -1228,7 +1225,7 @@ async fn kms_rotate(
 ) -> ApiResult<KmsRotateResponse> {
     let store = kms_preflight(&state, &principal, &headers, &tenant_id, &key_id).await?;
     let version = {
-        let v = store.lock().expect("store lock");
+        let v = store.lock_recover();
         crate::kms::rotate(&v, &group, &tenant_id, &key_id)
     }
     .map_err(map_kms_err)?;
@@ -1278,7 +1275,7 @@ async fn kms_rewrap(
             )
         })?;
     let wrapped_out = {
-        let v = store.lock().expect("store lock");
+        let v = store.lock_recover();
         crate::kms::rewrap(&v, &group, &tenant_id, &key_id, &wrapped_in)
     }
     .map_err(map_kms_err)?;
@@ -1324,7 +1321,7 @@ pub(crate) fn record_revoked_ssh(state: &AppState, revoked: &[String]) {
     }
     if let Some(store) = state.store.clone() {
         let now = AppState::now_ts();
-        let v = store.lock().expect("store lock");
+        let v = store.lock_recover();
         if let Err(e) = crate::ssh_ca::record_revoked(&v, &serials, &now) {
             eprintln!("vesta-broker: failed to record revoked SSH serials: {e}");
         }
@@ -1376,7 +1373,7 @@ async fn session_open(
     // superseded session and its creds would linger live until TTL/idle expiry.
     if let Some(prev) = state.active_session(&principal.san) {
         let revoked = {
-            let mut eng = state.leases.lock().expect("lease lock");
+            let mut eng = state.leases.lock_recover();
             eng.end_session(&prev).unwrap_or_default()
         };
         state.unbind_session(&prev);
@@ -1397,7 +1394,7 @@ async fn session_open(
         ));
     }
     let id = {
-        let mut eng = state.leases.lock().expect("lease lock");
+        let mut eng = state.leases.lock_recover();
         eng.open_session(now_unix(), ttl, idle)
     };
     state.bind_session(&principal.san, &id);
@@ -1423,7 +1420,7 @@ async fn session_open(
     .is_err()
     {
         {
-            let mut eng = state.leases.lock().expect("lease lock");
+            let mut eng = state.leases.lock_recover();
             let _ = eng.end_session(&id);
         }
         state.unbind_session(&id);
@@ -1457,7 +1454,7 @@ async fn session_end(
         ));
     }
     let revoked = {
-        let mut eng = state.leases.lock().expect("lease lock");
+        let mut eng = state.leases.lock_recover();
         eng.end_session(&id)
             .map_err(|e| err(StatusCode::NOT_FOUND, "no_such_session", &e.to_string()))?
     };
@@ -1495,7 +1492,7 @@ fn require_lease_owner(
 ) -> Result<(), (StatusCode, Json<ErrorBody>)> {
     let parent = {
         let id = lease_id.to_owned(); // LeaseEngine::lease takes &LeaseId (&String)
-        let eng = state.leases.lock().expect("lease lock");
+        let eng = state.leases.lock_recover();
         eng.lease(&id).map(|l| l.parent_session.clone())
     };
     match parent {
@@ -1517,7 +1514,7 @@ async fn lease_renew(
     require_unsealed(&state)?;
     require_lease_owner(&state, &principal, &req.lease_id)?;
     let ttl = {
-        let mut eng = state.leases.lock().expect("lease lock");
+        let mut eng = state.leases.lock_recover();
         eng.renew(now_unix(), &req.lease_id, req.increment_secs)
             .map_err(|e| err(StatusCode::CONFLICT, "renew_failed", &e.to_string()))?
     };
@@ -1537,7 +1534,7 @@ async fn lease_revoke(
     require_lease_owner(&state, &principal, &req.lease_id)?;
     let lease_id = req.lease_id;
     {
-        let mut eng = state.leases.lock().expect("lease lock");
+        let mut eng = state.leases.lock_recover();
         eng.revoke(&lease_id)
             .map_err(|e| err(StatusCode::CONFLICT, "revoke_failed", &e.to_string()))?;
     }
@@ -1587,12 +1584,12 @@ mod tests {
         let state = dev_state(crate::config::Hardening::default());
         // Principal A opens a session (bound to its SAN) and issues a lease under it.
         let sid = {
-            let mut e = state.leases.lock().unwrap();
+            let mut e = state.leases.lock_recover();
             e.open_session(now_unix(), 3600, 1800)
         };
         state.bind_session("san-a", &sid);
         let lease = {
-            let mut e = state.leases.lock().unwrap();
+            let mut e = state.leases.lock_recover();
             e.issue_lease(now_unix(), &sid, 900, 900, true).unwrap()
         };
         // owns_session: A yes, B no.

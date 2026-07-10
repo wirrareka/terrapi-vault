@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::Semaphore;
+use vesta_transport::lock::MutexExt;
 
 /// Runtime hardening state shared across requests: the limits, the global concurrency
 /// permits, and the per-principal token buckets.
@@ -56,7 +57,7 @@ impl HardenState {
     /// first-seen principal starts full (a burst's worth), so normal traffic never waits.
     fn allow(&self, key: &str) -> bool {
         let now = Instant::now();
-        let mut buckets = self.buckets.lock().expect("rate lock");
+        let mut buckets = self.buckets.lock_recover();
         // Before admitting a brand-new principal at capacity, evict idle buckets (those that
         // have refilled to full), so a flood of distinct keys can't grow the map without bound.
         if !buckets.contains_key(key) && buckets.len() >= MAX_BUCKETS {

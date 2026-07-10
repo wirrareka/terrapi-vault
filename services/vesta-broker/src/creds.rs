@@ -19,6 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use vesta_transport::lock::MutexExt;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CredError {
@@ -132,7 +133,7 @@ pub async fn teardown(
 ) -> Vec<TornDown> {
     // Collect + remove the handles under the lock, then await deletes lock-free.
     let owned: Vec<CredHandle> = {
-        let mut guard = handles.lock().expect("cred handles lock");
+        let mut guard = handles.lock_recover();
         lease_ids.iter().filter_map(|id| guard.remove(id)).collect()
     };
     let mut torn = Vec::with_capacity(owned.len());
@@ -171,10 +172,7 @@ impl MockEngine {
     #[cfg(test)]
     #[must_use]
     pub fn has_user(&self, username: &str) -> bool {
-        self.users
-            .lock()
-            .expect("mock users lock")
-            .contains(username)
+        self.users.lock_recover().contains(username)
     }
 }
 
@@ -183,10 +181,7 @@ impl CredEngine for MockEngine {
     async fn issue(&self, tenant: &str, ttl_secs: u64) -> Result<Issued, CredError> {
         let username = format!("v-{}-{tenant}-{}", self.role, crate::state::random_id());
         let password = crate::state::random_id();
-        self.users
-            .lock()
-            .expect("mock users lock")
-            .insert(username.clone());
+        self.users.lock_recover().insert(username.clone());
         Ok(Issued {
             username,
             password,
@@ -195,7 +190,7 @@ impl CredEngine for MockEngine {
     }
 
     async fn revoke(&self, username: &str) -> Result<(), CredError> {
-        self.users.lock().expect("mock users lock").remove(username);
+        self.users.lock_recover().remove(username);
         Ok(())
     }
 }
@@ -219,7 +214,7 @@ mod tests {
             .issue("3f1a9c2e-7b44-4d1e-9a2b-1c0d5e6f7a8b", 900)
             .await
             .unwrap();
-        handles.lock().unwrap().insert(
+        handles.lock_recover().insert(
             "lease-1".to_string(),
             CredHandle {
                 role: "audit-writer".into(),
@@ -231,7 +226,7 @@ mod tests {
         let torn = teardown(&engines, &handles, &["lease-1".to_string()]).await;
         assert_eq!(torn.len(), 1);
         assert!(torn[0].outcome_ok);
-        assert!(handles.lock().unwrap().is_empty());
+        assert!(handles.lock_recover().is_empty());
     }
 
     #[tokio::test]

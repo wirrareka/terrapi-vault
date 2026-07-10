@@ -10,6 +10,7 @@ use crate::creds;
 use crate::state::{now_unix, AppState};
 use std::time::Duration;
 use vesta_transport::audit::{Actor, ActorKind, AuditEvent, Outcome, Target};
+use vesta_transport::lock::MutexExt;
 
 /// Run forever, sweeping every `interval`. Missed ticks (e.g. a slow teardown) are
 /// skipped rather than bursting.
@@ -24,7 +25,7 @@ pub async fn run(state: AppState, interval: Duration) {
 
 async fn sweep_once(state: &AppState) {
     let swept = {
-        let mut eng = state.leases.lock().expect("lease lock");
+        let mut eng = state.leases.lock_recover();
         eng.sweep(now_unix())
     };
     if swept.is_empty() {
