@@ -226,107 +226,124 @@ mod tests {
         (cert.pem(), key.serialize_pem())
     }
 
-    /// The full production auth path over a real socket: rustls server with required
-    /// client-cert verification vs a fleet root CA, SAN lifted from the verified peer cert
-    /// and mapped to a role. A registered SAN reaches cap-gated handlers; a trusted-but-
-    /// unregistered SAN is 403; a client with no cert fails the handshake outright.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn mtls_end_to_end_maps_client_san_to_role() {
-        use crate::auth::{Capability, RolePrincipal};
-        use crate::config::BrokerConfig;
-        use crate::state::AppState;
-        use std::collections::HashMap;
+    struct NullSink;
+    impl vesta_transport::audit::AuditSink for NullSink {
+        fn emit(&self, _event: &vesta_transport::audit::AuditEvent) {}
+    }
 
-        // Both ring (reqwest) and aws-lc-rs are linked here, so rustls can't auto-pick a
-        // process default; install it like main.rs does at boot.
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    /// A running mTLS broker plus everything a test client needs to reach it.
+    struct E2eBroker {
+        addr: std::net::SocketAddr,
+        ca_root: reqwest::Certificate,
+        client_id: (String, String),
+        rogue_id: (String, String),
+        tls: TlsPaths,
+        server: tokio::task::JoinHandle<io::Result<()>>,
+    }
 
-        // Fleet root CA.
-        let mut ca_p = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
-        ca_p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let mut dn = rcgen::DistinguishedName::new();
-        dn.push(rcgen::DnType::CommonName, "test fleet root");
-        ca_p.distinguished_name = dn;
-        ca_p.key_usages = vec![
-            rcgen::KeyUsagePurpose::KeyCertSign,
-            rcgen::KeyUsagePurpose::DigitalSignature,
-        ];
-        let ca_key = rcgen::KeyPair::generate().expect("ca key");
-        let ca_cert = ca_p.self_signed(&ca_key).expect("ca cert");
+    impl E2eBroker {
+        /// Generate a fleet root CA + server/client leaves, and serve() a
+        /// production-shaped state (dev off; one registered SAN with the ssh-ca cap).
+        async fn start() -> Self {
+            use crate::auth::{Capability, RolePrincipal};
+            use crate::config::BrokerConfig;
+            use crate::state::AppState;
+            use std::collections::HashMap;
 
-        let (server_pem, server_key) = leaf(vec!["localhost".into()], true, &ca_cert, &ca_key);
-        let (client_pem, client_key) = leaf(
-            vec!["demon-system.eu.proximi.internal".into()],
-            false,
-            &ca_cert,
-            &ca_key,
-        );
-        let (rogue_pem, rogue_key) = leaf(
-            vec!["rogue.eu.proximi.internal".into()],
-            false,
-            &ca_cert,
-            &ca_key,
-        );
+            // Both ring (reqwest) and aws-lc-rs are linked here, so rustls can't
+            // auto-pick a process default; install it like main.rs does at boot.
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        let dir = std::env::temp_dir();
-        let pid = std::process::id();
-        let write = |name: &str, data: &str| {
-            let p = dir.join(format!("vb-e2e-{pid}-{name}.pem"));
-            std::fs::write(&p, data).expect("write pem");
-            p
-        };
-        let tls = TlsPaths {
-            cert: write("srv-cert", &server_pem),
-            key: write("srv-key", &server_key),
-            client_ca: write("ca", &ca_cert.pem()),
-        };
+            let mut ca_p = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+            ca_p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            let mut dn = rcgen::DistinguishedName::new();
+            dn.push(rcgen::DnType::CommonName, "test fleet root");
+            ca_p.distinguished_name = dn;
+            ca_p.key_usages = vec![
+                rcgen::KeyUsagePurpose::KeyCertSign,
+                rcgen::KeyUsagePurpose::DigitalSignature,
+            ];
+            let ca_key = rcgen::KeyPair::generate().expect("ca key");
+            let ca_cert = ca_p.self_signed(&ca_key).expect("ca cert");
 
-        // Production-shaped state: dev off, one registered SAN with only the ssh-ca cap.
-        let mut roles = HashMap::new();
-        roles.insert(
-            "demon-system.eu.proximi.internal".to_string(),
-            RolePrincipal {
-                role: "demon-system".into(),
-                caps: [Capability::SshCa].into_iter().collect(),
-                ssh_principals: None,
-            },
-        );
-        struct NullSink;
-        impl vesta_transport::audit::AuditSink for NullSink {
-            fn emit(&self, _event: &vesta_transport::audit::AuditEvent) {}
+            let (server_pem, server_key) = leaf(vec!["localhost".into()], true, &ca_cert, &ca_key);
+            let client_id = leaf(
+                vec!["demon-system.eu.proximi.internal".into()],
+                false,
+                &ca_cert,
+                &ca_key,
+            );
+            let rogue_id = leaf(
+                vec!["rogue.eu.proximi.internal".into()],
+                false,
+                &ca_cert,
+                &ca_key,
+            );
+
+            let dir = std::env::temp_dir();
+            let pid = std::process::id();
+            let write = |name: &str, data: &str| {
+                let p = dir.join(format!("vb-e2e-{pid}-{name}.pem"));
+                std::fs::write(&p, data).expect("write pem");
+                p
+            };
+            let tls = TlsPaths {
+                cert: write("srv-cert", &server_pem),
+                key: write("srv-key", &server_key),
+                client_ca: write("ca", &ca_cert.pem()),
+            };
+
+            let mut roles = HashMap::new();
+            roles.insert(
+                "demon-system.eu.proximi.internal".to_string(),
+                RolePrincipal {
+                    role: "demon-system".into(),
+                    caps: [Capability::SshCa].into_iter().collect(),
+                    ssh_principals: None,
+                },
+            );
+            let cfg = BrokerConfig {
+                bind: "127.0.0.1:0".parse().expect("addr"),
+                residency_group: vesta_transport::ResidencyGroup::Eu,
+                node: "test".into(),
+                hardening: crate::config::Hardening::default(),
+                audit_path: dir.join(format!("vb-e2e-{pid}-audit.jsonl")),
+                store_path: dir.join(format!("vb-e2e-{pid}-store.sqlcipher")),
+                snapshot_dir: dir.clone(),
+                roles,
+                allow_insecure_dev: false,
+                tls: None,
+                kms_jwt: None,
+                identity_kms: None,
+            };
+            let state = AppState::new(cfg, None, Arc::new(NullSink));
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let app = crate::http::router(state);
+            let tls_paths = tls.clone();
+            let server = tokio::spawn(async move { serve(listener, app, &tls_paths).await });
+            let ca_root =
+                reqwest::Certificate::from_pem(ca_cert.pem().as_bytes()).expect("ca root");
+            Self {
+                addr,
+                ca_root,
+                client_id,
+                rogue_id,
+                tls,
+                server,
+            }
         }
-        let cfg = BrokerConfig {
-            bind: "127.0.0.1:0".parse().expect("addr"),
-            residency_group: vesta_transport::ResidencyGroup::Eu,
-            node: "test".into(),
-            hardening: crate::config::Hardening::default(),
-            audit_path: dir.join(format!("vb-e2e-{pid}-audit.jsonl")),
-            store_path: dir.join(format!("vb-e2e-{pid}-store.sqlcipher")),
-            snapshot_dir: dir.clone(),
-            roles,
-            allow_insecure_dev: false,
-            tls: None,
-            kms_jwt: None,
-            identity_kms: None,
-        };
-        let state = AppState::new(cfg, None, Arc::new(NullSink));
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let app = crate::http::router(state);
-        let tls_paths = tls.clone();
-        let server = tokio::spawn(async move { serve(listener, app, &tls_paths).await });
-
-        let ca_root = reqwest::Certificate::from_pem(ca_cert.pem().as_bytes()).expect("ca root");
-        let client = |identity: Option<(&str, &str)>| {
+        fn client(&self, identity: Option<&(String, String)>) -> reqwest::Client {
             let mut b = reqwest::Client::builder()
                 .use_rustls_tls()
                 .tls_built_in_root_certs(false)
-                .add_root_certificate(ca_root.clone())
+                .add_root_certificate(self.ca_root.clone())
                 // Connect by hostname so the server cert's `localhost` DNS SAN verifies.
-                .resolve("localhost", addr)
+                .resolve("localhost", self.addr)
                 .timeout(Duration::from_secs(5));
             if let Some((cert, key)) = identity {
                 let mut pem = cert.as_bytes().to_vec();
@@ -335,12 +352,28 @@ mod tests {
                 b = b.identity(reqwest::Identity::from_pem(&pem).expect("identity"));
             }
             b.build().expect("client")
-        };
-        let base = format!("https://localhost:{}", addr.port());
+        }
+
+        fn stop(self) {
+            self.server.abort();
+            for p in [&self.tls.cert, &self.tls.key, &self.tls.client_ca] {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    /// The full production auth path over a real socket: rustls server with required
+    /// client-cert verification vs a fleet root CA, SAN lifted from the verified peer cert
+    /// and mapped to a role. A registered SAN reaches cap-gated handlers; a trusted-but-
+    /// unregistered SAN is 403; a client with no cert fails the handshake outright.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mtls_end_to_end_maps_client_san_to_role() {
+        let broker = E2eBroker::start().await;
+        let base = format!("https://localhost:{}", broker.addr.port());
 
         // Registered SAN: unauthenticated route works, and the ssh-ca cap authorises —
         // 503 `sealed` (not 401/403) proves SAN → role → cap all passed.
-        let c = client(Some((&client_pem, &client_key)));
+        let c = broker.client(Some(&broker.client_id));
         let r = c
             .get(format!("{base}/v1/sys/seal-status"))
             .send()
@@ -361,7 +394,7 @@ mod tests {
         );
 
         // Trusted (fleet-CA-signed) but unregistered SAN → 403, never 401.
-        let c = client(Some((&rogue_pem, &rogue_key)));
+        let c = broker.client(Some(&broker.rogue_id));
         let r = c
             .get(format!("{base}/v1/eu/ssh/ca"))
             .send()
@@ -370,7 +403,7 @@ mod tests {
         assert_eq!(r.status(), 403, "unregistered SAN is forbidden");
 
         // No client cert at all → the handshake itself is refused.
-        let c = client(None);
+        let c = broker.client(None);
         assert!(
             c.get(format!("{base}/v1/sys/seal-status"))
                 .send()
@@ -379,9 +412,6 @@ mod tests {
             "handshake without a client cert must fail"
         );
 
-        server.abort();
-        for p in [&tls.cert, &tls.key, &tls.client_ca] {
-            let _ = std::fs::remove_file(p);
-        }
+        broker.stop();
     }
 }
