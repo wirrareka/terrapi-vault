@@ -408,3 +408,74 @@ async fn tail_websocket_receives_pushed_op() {
     assert_eq!(got.op_id, "op-1");
     assert_eq!(got.seq, 1);
 }
+
+/// `state()` with one config knob turned; for exercising the hardening layers.
+fn state_with(f: impl FnOnce(&mut Config)) -> AppState {
+    let mut cfg = Config {
+        bind: "127.0.0.1:8300".parse().unwrap(),
+        db_path: String::new(),
+        db_key: None,
+        max_body_bytes: 1 << 20,
+        max_pull: 500,
+        max_concurrency: 64,
+        request_timeout: std::time::Duration::from_secs(30),
+        readers: 0,
+    };
+    f(&mut cfg);
+    AppState::new(cfg, Store::open_memory().unwrap())
+}
+
+#[tokio::test]
+async fn request_id_is_echoed_and_generated() {
+    let st = state();
+    // A bounded ASCII caller id is echoed back.
+    let req = Request::builder()
+        .uri("/healthz")
+        .header("x-request-id", "corr-42")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(st.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.headers()["x-request-id"], "corr-42");
+
+    // No caller id → the server mints one.
+    let req = Request::builder()
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(st).oneshot(req).await.unwrap();
+    let minted = resp.headers()["x-request-id"].to_str().unwrap().to_owned();
+    assert!(minted.starts_with("req-"), "generated id, got {minted}");
+}
+
+#[tokio::test]
+async fn at_capacity_returns_503_with_retry_after() {
+    // Zero permits = every request is over the cap.
+    let st = state_with(|c| c.max_concurrency = 0);
+    let req = Request::builder()
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(st).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.headers()["retry-after"], "1");
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["error"], "overloaded");
+}
+
+#[tokio::test]
+async fn oversized_body_is_413() {
+    let st = state_with(|c| c.max_body_bytes = 512);
+    let sk = SigningKey::generate(&mut OsRng);
+    let big = vec![b'x'; 4096];
+    let req = signed(
+        "POST",
+        &format!("/v1/sync/{VID}/account"),
+        &big,
+        &sk,
+        "A",
+        "n-413",
+    );
+    let (status, _) = send(&st, req).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
