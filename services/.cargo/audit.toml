@@ -12,8 +12,4 @@ ignore = [
   # never decrypt, so the side-channel is unreachable even in the test process. Mirrors deny.toml.
   # Revisit if `rsa` ever enters the non-dev graph.
   "RUSTSEC-2023-0071",
-  # RUSTSEC-2025-0134 — rustls-pemfile unmaintained (maintenance warning, not a vulnerability).
-  # Used only to parse the broker cert/key PEM at boot (tls.rs); functional. Migration to
-  # rustls-pki-types' PEM API is tracked; accepted meanwhile.
-  "RUSTSEC-2025-0134",
 ]

@@ -1,7 +1,10 @@
 # cargo-deny — supply-chain gate for the terrapi-vault services workspace.
-# Run: `cargo deny check advisories` (or `cargo audit`). See docs/review/round4/dependencies.md.
+# CI runs `cargo deny check` here and at the repo root (the root lib workspace has its
+# own deny.toml — the two dependency trees are deliberately separate).
+# See docs/review/round4/dependencies.md.
 
 [advisories]
+yanked = "deny"
 # `cargo deny` analyses the BUILD graph INCLUDING dev-dependencies, so it does see `rsa`
 # (RUSTSEC-2023-0071) — `cargo tree -i rsa` resolves to a single edge:
 #   rsa v0.9.10 [dev-dependencies] └── vault-console
@@ -14,10 +17,6 @@
 # unreachable → ignored. Revisit if `rsa` ever enters the non-dev graph.
 ignore = [
   "RUSTSEC-2023-0071",
-  # RUSTSEC-2025-0134 — rustls-pemfile is unmaintained (a maintenance warning, not a vulnerability).
-  # Used only to parse the broker's server cert/key PEM once at boot (tls.rs load_certs/load_key).
-  # Functional and widely used. Tracked for migration to rustls-pki-types' PEM API; accepted meanwhile.
-  "RUSTSEC-2025-0134",
 ]
 
 # License policy: allow the permissive set the dependency tree actually uses (the workspace itself

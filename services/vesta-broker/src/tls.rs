@@ -16,10 +16,11 @@ use axum::Router;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig};
-use std::io::{self, BufReader};
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -134,16 +135,14 @@ fn build_server_config(tls: &TlsPaths) -> Result<ServerConfig, String> {
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
     let data = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    rustls_pemfile::certs(&mut BufReader::new(&data[..]))
+    CertificateDer::pem_slice_iter(&data)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("parse certs {}: {e}", path.display()))
 }
 
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
     let data = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    rustls_pemfile::private_key(&mut BufReader::new(&data[..]))
-        .map_err(|e| format!("parse key {}: {e}", path.display()))?
-        .ok_or_else(|| format!("no private key in {}", path.display()))
+    PrivateKeyDer::from_pem_slice(&data).map_err(|e| format!("parse key {}: {e}", path.display()))
 }
 
 /// The single DNS SAN of a DER-encoded X.509 cert (the daemon identity → role key). Fleet client

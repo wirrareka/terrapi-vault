@@ -54,3 +54,11 @@ stacks). Not worth forcing unification (would constrain transitive deps for no s
   the `RUSTSEC-2025-0134` ignore.
 - Re-check the `rsa` ignore if the SSH-CA ever gains an RSA algorithm (it would then enter the
   build graph and `cargo deny` would flag it).
+
+## Status update (2026-07-10)
+Both recommendations above landed: `cargo deny check` now runs in CI for both workspaces
+(`.github/workflows/ci.yml` `cargo-deny` job; the root lib gained its own `deny.toml`), and
+`tls.rs` was migrated off `rustls-pemfile` to `rustls-pki-types`' PEM API — the dependency and
+the `RUSTSEC-2025-0134` ignore (deny.toml + audit.toml) are gone. Note `rsa` has since entered
+the build graph as a *dev*-dependency of vesta-console (OIDC test keypairs), so `cargo deny`
+now sees it; the RUSTSEC-2023-0071 ignore rationale is updated in `services/deny.toml`.

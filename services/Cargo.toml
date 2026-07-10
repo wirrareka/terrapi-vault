@@ -43,7 +43,6 @@ time = { version = "0.3.36", features = ["formatting", "macros"] }
 # hyper-util so the verified SAN reaches the Principal extractor.
 rustls = "0.23"
 tokio-rustls = "0.26"
-rustls-pemfile = "2"
 x509-parser = "0.16"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }

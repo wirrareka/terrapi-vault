@@ -23,7 +23,6 @@ axum.workspace = true
 time.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
-rustls-pemfile.workspace = true
 x509-parser.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
