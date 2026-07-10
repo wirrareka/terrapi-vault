@@ -365,3 +365,107 @@ impl AppState {
         self.audit.try_emit(event)
     }
 }
+
+#[cfg(test)]
+impl AppState {
+    /// A sealed dev `AppState` fixed to the `eu` group, for unit tests across the crate.
+    /// `allow_insecure_dev` registers the `audit-writer` `MockEngine`, so cred-lease
+    /// teardown has a real (mock) backend to delete from.
+    pub(crate) fn test_dev(audit: Arc<dyn AuditSink>) -> Self {
+        let cfg = BrokerConfig {
+            bind: "127.0.0.1:8200".parse().expect("addr"),
+            residency_group: vesta_transport::ResidencyGroup::Eu,
+            node: "test".into(),
+            hardening: crate::config::Hardening::default(),
+            audit_path: std::env::temp_dir().join("vault-test-audit.jsonl"),
+            store_path: std::env::temp_dir().join("vault-test-store.sqlcipher"),
+            snapshot_dir: std::env::temp_dir(),
+            roles: HashMap::new(),
+            allow_insecure_dev: true,
+            tls: None,
+            kms_jwt: None,
+            identity_kms: None,
+        };
+        Self::new(cfg, None, audit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NullSink;
+    impl AuditSink for NullSink {
+        fn emit(&self, _event: &AuditEvent) {}
+    }
+
+    fn state() -> AppState {
+        AppState::test_dev(Arc::new(NullSink))
+    }
+
+    /// The ownership gate: a principal owns only its currently-bound session; a rebind
+    /// replaces the old binding (one active session per principal); another principal
+    /// can never own it by guessing the id.
+    #[test]
+    fn session_binding_owns_and_rebinds() {
+        let s = state();
+        s.bind_session("san-a", "sid-1");
+        assert!(s.owns_session("san-a", "sid-1"));
+        assert!(!s.owns_session("san-b", "sid-1"));
+        assert!(!s.owns_session("san-a", "sid-2"));
+
+        // A new session for the same principal replaces the binding.
+        s.bind_session("san-a", "sid-2");
+        assert!(!s.owns_session("san-a", "sid-1"));
+        assert!(s.owns_session("san-a", "sid-2"));
+    }
+
+    /// Unbinding by session id drops every principal binding pointing at it and
+    /// leaves other principals' sessions alone.
+    #[test]
+    fn unbind_session_removes_only_that_session() {
+        let s = state();
+        s.bind_session("san-a", "sid-1");
+        s.bind_session("san-b", "sid-2");
+        s.unbind_session("sid-1");
+        assert!(!s.owns_session("san-a", "sid-1"));
+        assert!(s.owns_session("san-b", "sid-2"));
+        assert_eq!(s.list_sessions(), vec![("san-b".into(), "sid-2".into())]);
+    }
+
+    /// take_ssh_serials removes exactly the requested leases' serials (for the CA
+    /// revocation list) and leaves the rest recorded.
+    #[test]
+    fn ssh_serials_are_taken_once_and_selectively() {
+        let s = state();
+        s.record_ssh_serial("lease-1", 11);
+        s.record_ssh_serial("lease-2", 22);
+
+        let taken = s.take_ssh_serials(&["lease-1".into(), "no-such".into()]);
+        assert_eq!(taken, vec![11]);
+        // lease-1 is gone (a second take is empty); lease-2 still recorded.
+        assert!(s.take_ssh_serials(&["lease-1".into()]).is_empty());
+        assert_eq!(s.list_ssh_serials(), vec![("lease-2".into(), 22)]);
+    }
+
+    /// The observe snapshot of cred leases exposes lease→role only — never the backend
+    /// username (it is the handle to the backend secret).
+    #[test]
+    fn cred_roles_never_exposes_usernames() {
+        let s = state();
+        s.cred_handles.lock_recover().insert(
+            "lease-1".into(),
+            crate::creds::CredHandle {
+                role: "audit-writer".into(),
+                username: "v-secret-handle".into(),
+            },
+        );
+        let roles = s.cred_roles();
+        assert_eq!(
+            roles.get("lease-1").map(String::as_str),
+            Some("audit-writer")
+        );
+        let dumped = format!("{roles:?}");
+        assert!(!dumped.contains("v-secret-handle"));
+    }
+}

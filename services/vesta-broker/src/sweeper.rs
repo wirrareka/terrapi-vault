@@ -94,3 +94,157 @@ fn emit(state: &AppState, action: &str, kind: &str, id: Option<String>, outcome:
         None,
     ));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::creds::CredHandle;
+    use crate::state::now_unix;
+    use std::sync::{Arc, Mutex};
+    use vesta_transport::audit::AuditSink;
+
+    /// Records (action, target id, success) per emitted event.
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<(String, Option<String>, bool)>>);
+
+    impl AuditSink for RecordingSink {
+        fn emit(&self, event: &AuditEvent) {
+            self.0.lock_recover().push((
+                event.action.clone(),
+                event.target.id.clone(),
+                matches!(event.outcome, Outcome::Success),
+            ));
+        }
+    }
+
+    impl RecordingSink {
+        fn actions(&self) -> Vec<(String, Option<String>, bool)> {
+            self.0.lock_recover().clone()
+        }
+    }
+
+    fn test_state(audit: Arc<RecordingSink>) -> AppState {
+        AppState::test_dev(audit)
+    }
+
+    #[tokio::test]
+    async fn nothing_expired_emits_no_events() {
+        let sink = Arc::new(RecordingSink::default());
+        let state = test_state(sink.clone());
+        let now = now_unix();
+        let sid = state.leases.lock_recover().open_session(now, 900, 900);
+        state.bind_session("san-a", &sid);
+        state
+            .leases
+            .lock_recover()
+            .issue_lease(now, &sid, 900, 900, true)
+            .expect("issue");
+
+        sweep_once(&state).await;
+
+        assert!(sink.actions().is_empty());
+        assert!(state.owns_session("san-a", &sid), "live session survives");
+    }
+
+    #[tokio::test]
+    async fn expired_session_cascades_leases_creds_and_audit() {
+        let sink = Arc::new(RecordingSink::default());
+        let state = test_state(sink.clone());
+        // Session opened in the past with a short TTL → already expired at sweep time.
+        let then = now_unix() - 100;
+        let (sid, lease) = {
+            let mut eng = state.leases.lock_recover();
+            let sid = eng.open_session(then, 10, 10);
+            let lease = eng.issue_lease(then, &sid, 900, 900, true).expect("issue");
+            (sid, lease)
+        };
+        state.bind_session("san-a", &sid);
+        // The lease owns a backend cred in the dev MockEngine's role.
+        state.cred_handles.lock_recover().insert(
+            lease.clone(),
+            CredHandle {
+                role: "audit-writer".into(),
+                username: "v-audit-writer-test".into(),
+            },
+        );
+
+        sweep_once(&state).await;
+
+        // Principal unbound, cred handle consumed.
+        assert!(!state.owns_session("san-a", &sid));
+        assert!(state.cred_handles.lock_recover().is_empty());
+
+        let actions = sink.actions();
+        assert!(
+            actions.contains(&("session.expire".into(), Some(sid), true)),
+            "session.expire emitted: {actions:?}"
+        );
+        assert!(
+            actions.contains(&(
+                "creds.revoke".into(),
+                Some("role=audit-writer".into()),
+                true
+            )),
+            "creds.revoke emitted: {actions:?}"
+        );
+        assert!(
+            actions.contains(&("lease.expire".into(), Some(lease), true)),
+            "lease.expire emitted: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_lease_under_live_session_keeps_the_session() {
+        let sink = Arc::new(RecordingSink::default());
+        let state = test_state(sink.clone());
+        // Live session; the lease's own TTL is already behind us.
+        let now = now_unix();
+        let (sid, lease) = {
+            let mut eng = state.leases.lock_recover();
+            let sid = eng.open_session(now - 50, 900, 900);
+            let lease = eng
+                .issue_lease(now - 50, &sid, 10, 10, true)
+                .expect("issue");
+            (sid, lease)
+        };
+        state.bind_session("san-a", &sid);
+
+        sweep_once(&state).await;
+
+        assert!(state.owns_session("san-a", &sid), "session must survive");
+        let actions = sink.actions();
+        assert!(actions.contains(&("lease.expire".into(), Some(lease), true)));
+        assert!(
+            !actions.iter().any(|(a, _, _)| a == "session.expire"),
+            "no session.expire: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn teardown_without_engine_audits_a_failure() {
+        let sink = Arc::new(RecordingSink::default());
+        let state = test_state(sink.clone());
+        let then = now_unix() - 100;
+        let lease = {
+            let mut eng = state.leases.lock_recover();
+            let sid = eng.open_session(then, 10, 10);
+            eng.issue_lease(then, &sid, 900, 900, true).expect("issue")
+        };
+        // Handle for a role no engine serves — the backend user can't be deleted.
+        state.cred_handles.lock_recover().insert(
+            lease,
+            CredHandle {
+                role: "no-such-engine".into(),
+                username: "orphan".into(),
+            },
+        );
+
+        sweep_once(&state).await;
+
+        assert!(sink.actions().contains(&(
+            "creds.revoke".into(),
+            Some("role=no-such-engine".into()),
+            false
+        )));
+    }
+}
