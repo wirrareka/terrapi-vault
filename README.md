@@ -54,23 +54,23 @@ terrapi-vesta = "0.1"
 ```
 
 ```rust
-use terrapi_vault::{Vesta, KdfParams};
+use terrapi_vesta::{Vesta, KdfParams};
 
-# fn main() -> terrapi_vault::Result<()> {
-// First run — create the vault.
+# fn main() -> terrapi_vesta::Result<()> {
+// First run — create the vesta.
 let vesta = Vesta::create("notes.memento", "correct horse battery staple",
                           KdfParams::default())?;
-vault.with_connection(|conn| {
+vesta.with_connection(|conn| {
     conn.execute_batch("CREATE TABLE note(id INTEGER PRIMARY KEY, body TEXT)")
 })?;
-vault.lock();
+vesta.lock();
 
 // Later run — unlock.
 let vesta = Vesta::open("notes.memento", "correct horse battery staple")?;
 
 // Rotate the passphrase.
 let mut vesta = vesta;
-vault.rotate_key("correct horse battery staple", "new passphrase")?;
+vesta.rotate_key("correct horse battery staple", "new passphrase")?;
 # Ok(())
 # }
 ```
@@ -82,15 +82,15 @@ setup through the guarded accessors — the encrypted connection is never
 exposed unguarded:
 
 ```rust,no_run
-# use terrapi_vault::Vesta;
-# fn f(vesta: &Vesta) -> terrapi_vault::Result<()> {
-vault.with_connection(|conn| {
+# use terrapi_vesta::Vesta;
+# fn f(vesta: &Vesta) -> terrapi_vesta::Result<()> {
+vesta.with_connection(|conn| {
     conn.execute_batch("CREATE VIRTUAL TABLE note_fts USING fts5(title, body)")
 })?;
 # Ok(()) }
 ```
 
-`terrapi_vault::rusqlite` re-exports the exact `rusqlite` build this crate
+`terrapi_vesta::rusqlite` re-exports the exact `rusqlite` build this crate
 links, so downstream code shares one SQLCipher.
 
 ## KDF parameters

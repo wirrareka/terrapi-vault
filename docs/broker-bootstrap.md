@@ -15,7 +15,7 @@ The broker stores its CA keys + lease state in an at-rest encrypted store (the
 `terrapi-vesta` SQLCipher library). Its master key is derived at start:
 
 - **v1 — manual unseal (implemented, `seal.rs`):** unsealing = opening the broker's
-  at-rest store (`terrapi_vault::Vesta`, SQLCipher at `VESTA_STORE_PATH`) with the
+  at-rest store (`terrapi_vesta::Vesta`, SQLCipher at `VESTA_STORE_PATH`) with the
   operator passphrase (`VESTA_UNSEAL_PASSPHRASE`). The store's SQLCipher key is derived
   with the lib's Argon2id; a wrong passphrase surfaces as the lib's `WrongPassphrase`.
   Until opened, the broker is **sealed** and every mutating op returns `503` (poll
