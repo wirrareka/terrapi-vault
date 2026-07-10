@@ -62,7 +62,7 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # KMS-cap JWT verification (Option J, secrets-broker.md §KMS root-of-trust): verify
 # identity-minted short-TTL ES256 workload creds against the issuer's JWKS. See vesta-broker/src/jwt.rs.
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
