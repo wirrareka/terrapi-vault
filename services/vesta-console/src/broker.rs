@@ -70,23 +70,7 @@ impl BrokerHub {
         let mut out = Vec::with_capacity(self.brokers.len());
         for b in &self.brokers {
             let seal = self.get(&b.addr, "/v1/sys/seal-status").await.ok();
-            let reachable = seal.is_some();
-            let sealed = seal
-                .as_ref()
-                .and_then(|v| v.get("sealed")?.as_bool())
-                .unwrap_or(false);
-            let version = seal
-                .as_ref()
-                .and_then(|v| v.get("version")?.as_str())
-                .map(str::to_string);
-            out.push(json!({
-                "id": b.id,
-                "addr": b.addr,
-                "group": self.group,
-                "reachable": reachable,
-                "sealed": reachable && sealed,
-                "version": version,
-            }));
+            out.push(broker_row(b, &self.group, seal.as_ref()));
         }
         out
     }
@@ -95,52 +79,95 @@ impl BrokerHub {
     /// its broker id and merge; carry `scalars` (numeric, e.g. `now`/`next_seq`) as the max seen.
     /// An unreachable/erroring broker is skipped (its data is simply absent).
     pub async fn observe(&self, path: &str, arrays: &[&str], scalars: &[&str]) -> Value {
-        let mut merged: HashMap<&str, Vec<Value>> = HashMap::new();
-        let mut maxes: HashMap<&str, u64> = HashMap::new();
+        let mut fetched = Vec::with_capacity(self.brokers.len());
         for b in &self.brokers {
-            let Ok(v) = self.get(&b.addr, path).await else {
-                continue;
-            };
-            merge_into(&v, arrays, &b.id, &mut merged);
-            for s in scalars {
-                if let Some(n) = v.get(*s).and_then(Value::as_u64) {
-                    let e = maxes.entry(*s).or_insert(0);
-                    *e = (*e).max(n);
-                }
+            if let Ok(v) = self.get(&b.addr, path).await {
+                fetched.push((b.id.clone(), v));
             }
         }
-        let mut obj = Map::new();
-        for s in scalars {
-            obj.insert(
-                (*s).to_string(),
-                Value::from(maxes.get(*s).copied().unwrap_or(0)),
-            );
-        }
-        for key in arrays {
-            obj.insert(
-                (*key).to_string(),
-                Value::Array(merged.remove(*key).unwrap_or_default()),
-            );
-        }
-        Value::Object(obj)
+        assemble_observe(&fetched, arrays, scalars)
     }
 
     /// Object-store status is a per-broker scalar (`{configured}`); assemble an array of
     /// `{broker, configured}` (the SPA's `ObjectStoreResponse`).
     pub async fn object_store(&self) -> Value {
         let path = format!("/v1/{}/observe/object-store", self.group);
-        let mut arr = Vec::with_capacity(self.brokers.len());
+        let mut fetched = Vec::with_capacity(self.brokers.len());
         for b in &self.brokers {
             if let Ok(v) = self.get(&b.addr, &path).await {
-                let configured = v
-                    .get("configured")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                arr.push(json!({ "broker": b.id, "configured": configured }));
+                fetched.push((b.id.clone(), v));
             }
         }
-        json!({ "brokers": arr })
+        assemble_object_store(&fetched)
     }
+}
+
+/// One row of the `/api/v1/brokers` view. `seal` is the broker's `/v1/sys/seal-status`
+/// body, or `None` when it was unreachable — an unreachable broker reports
+/// `reachable:false, sealed:false` (unknown is not presented as sealed).
+fn broker_row(b: &BrokerEndpoint, group: &str, seal: Option<&Value>) -> Value {
+    let reachable = seal.is_some();
+    let sealed = seal
+        .and_then(|v| v.get("sealed")?.as_bool())
+        .unwrap_or(false);
+    let version = seal
+        .and_then(|v| v.get("version")?.as_str())
+        .map(str::to_string);
+    json!({
+        "id": b.id,
+        "addr": b.addr,
+        "group": group,
+        "reachable": reachable,
+        "sealed": reachable && sealed,
+        "version": version,
+    })
+}
+
+/// Merge per-broker observe bodies: every `arrays` item tagged with its broker id and
+/// concatenated (requested keys always present, `[]` when absent everywhere); every
+/// `scalars` key carried as the max seen (`0` when absent everywhere).
+fn assemble_observe(fetched: &[(String, Value)], arrays: &[&str], scalars: &[&str]) -> Value {
+    let mut merged: HashMap<&str, Vec<Value>> = HashMap::new();
+    let mut maxes: HashMap<&str, u64> = HashMap::new();
+    for (id, v) in fetched {
+        merge_into(v, arrays, id, &mut merged);
+        for s in scalars {
+            if let Some(n) = v.get(*s).and_then(Value::as_u64) {
+                let e = maxes.entry(*s).or_insert(0);
+                *e = (*e).max(n);
+            }
+        }
+    }
+    let mut obj = Map::new();
+    for s in scalars {
+        obj.insert(
+            (*s).to_string(),
+            Value::from(maxes.get(*s).copied().unwrap_or(0)),
+        );
+    }
+    for key in arrays {
+        obj.insert(
+            (*key).to_string(),
+            Value::Array(merged.remove(*key).unwrap_or_default()),
+        );
+    }
+    Value::Object(obj)
+}
+
+/// The SPA's `ObjectStoreResponse`: one `{broker, configured}` row per reachable broker
+/// (a non-bool/missing `configured` reads as `false`).
+fn assemble_object_store(fetched: &[(String, Value)]) -> Value {
+    let arr: Vec<Value> = fetched
+        .iter()
+        .map(|(id, v)| {
+            let configured = v
+                .get("configured")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            json!({ "broker": id, "configured": configured })
+        })
+        .collect();
+    json!({ "brokers": arr })
 }
 
 /// Tag every item of each `arrays` key in `v` with `broker` and append into `merged`.
@@ -216,5 +243,93 @@ mod tests {
         let mut merged: HashMap<&str, Vec<Value>> = HashMap::new();
         merge_into(&v, &["leases"], "b", &mut merged);
         assert!(merged.get("leases").is_none_or(Vec::is_empty));
+    }
+
+    fn ep(id: &str) -> BrokerEndpoint {
+        BrokerEndpoint {
+            id: id.into(),
+            addr: format!("{id}.internal:8200"),
+        }
+    }
+
+    #[test]
+    fn broker_row_reports_reachability_and_seal() {
+        // Unreachable → reachable:false and sealed:false (unknown must not read as sealed).
+        let row = broker_row(&ep("eu-1"), "eu", None);
+        assert_eq!(row["reachable"], false);
+        assert_eq!(row["sealed"], false);
+        assert_eq!(row["version"], Value::Null);
+        assert_eq!(row["group"], "eu");
+
+        // Reachable + sealed, with a version.
+        let seal = json!({ "sealed": true, "version": "0.1.13" });
+        let row = broker_row(&ep("eu-1"), "eu", Some(&seal));
+        assert_eq!(row["reachable"], true);
+        assert_eq!(row["sealed"], true);
+        assert_eq!(row["version"], "0.1.13");
+
+        // A malformed body (non-bool sealed, missing version) degrades to unsealed/no-version.
+        let seal = json!({ "sealed": "yes" });
+        let row = broker_row(&ep("eu-1"), "eu", Some(&seal));
+        assert_eq!(row["reachable"], true);
+        assert_eq!(row["sealed"], false);
+        assert_eq!(row["version"], Value::Null);
+    }
+
+    #[test]
+    fn assemble_observe_merges_arrays_and_takes_scalar_max() {
+        let fetched = vec![
+            (
+                "eu-1".to_string(),
+                json!({ "leases": [{ "lease_id": "a" }], "now": 100 }),
+            ),
+            (
+                "eu-2".to_string(),
+                json!({ "leases": [{ "lease_id": "b" }, { "lease_id": "c" }], "now": 250 }),
+            ),
+        ];
+        let out = assemble_observe(&fetched, &["leases"], &["now"]);
+        assert_eq!(out["now"], 250, "scalar carried as the max seen");
+        let leases = out["leases"].as_array().expect("leases array");
+        assert_eq!(leases.len(), 3);
+        assert_eq!(leases[0]["broker"], "eu-1");
+        assert_eq!(leases[1]["broker"], "eu-2");
+        assert_eq!(leases[2]["lease_id"], "c");
+    }
+
+    #[test]
+    fn assemble_observe_with_no_reachable_brokers_keeps_the_shape() {
+        // The SPA relies on requested keys always being present.
+        let out = assemble_observe(&[], &["leases", "sessions"], &["now"]);
+        assert_eq!(out["now"], 0);
+        assert_eq!(out["leases"], json!([]));
+        assert_eq!(out["sessions"], json!([]));
+    }
+
+    #[test]
+    fn assemble_observe_skips_malformed_scalars_and_missing_arrays() {
+        let fetched = vec![
+            ("eu-1".to_string(), json!({ "now": "not-a-number" })),
+            ("eu-2".to_string(), json!({ "sessions": [{}], "now": 7 })),
+        ];
+        let out = assemble_observe(&fetched, &["sessions"], &["now"]);
+        assert_eq!(out["now"], 7);
+        assert_eq!(out["sessions"].as_array().map(Vec::len), Some(1));
+        assert_eq!(out["sessions"][0]["broker"], "eu-2");
+    }
+
+    #[test]
+    fn assemble_object_store_rows_default_to_unconfigured() {
+        let fetched = vec![
+            ("eu-1".to_string(), json!({ "configured": true })),
+            ("eu-2".to_string(), json!({ "configured": "nope" })),
+            ("eu-3".to_string(), json!({})),
+        ];
+        let out = assemble_object_store(&fetched);
+        let rows = out["brokers"].as_array().expect("rows");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], json!({ "broker": "eu-1", "configured": true }));
+        assert_eq!(rows[1]["configured"], false);
+        assert_eq!(rows[2]["configured"], false);
     }
 }
