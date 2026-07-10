@@ -1,0 +1,23 @@
+# Local dev dependencies (NOT production — prod is FreeBSD rc.d, see deploy/).
+# Today that is just a throwaway single-node OpenSearch for the two gated
+# integration tests (cred engine + audit shipper); see docs/dev/opensearch-it.md.
+#
+#   docker compose -f compose.dev.yaml up -d     (or: make os-up)
+#   docker compose -f compose.dev.yaml down -v   (or: make os-down)
+
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.13.0
+    container_name: vesta-os-it
+    environment:
+      discovery.type: single-node
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: "Vault-IT-Passw0rd!"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    healthcheck:
+      # Demo security config = self-signed TLS + basic auth on 9200.
+      test: ["CMD-SHELL", "curl -sk -u 'admin:Vault-IT-Passw0rd!' https://localhost:9200/_cluster/health | grep -q '\"status\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 24

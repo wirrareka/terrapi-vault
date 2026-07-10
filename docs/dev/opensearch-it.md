@@ -7,6 +7,17 @@ normal `cargo test` (and CI without a cluster) stays green.
 
 ## Spin up a throwaway OpenSearch (Docker)
 
+The easy path — compose file with a health-check, plus a make target that runs both
+gated tests with the env preset:
+
+```sh
+make os-up      # docker compose -f compose.dev.yaml up -d --wait
+make it-os      # runs the opensearch:: and audit_ship:: integration tests
+make os-down
+```
+
+Or by hand:
+
 ```sh
 docker run -d --name vault-os-it -p 9200:9200 \
   -e discovery.type=single-node \
