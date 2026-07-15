@@ -3,7 +3,14 @@
 
 import { MOCK, mockGet } from "@/lib/mock";
 
-const BASE = import.meta.env.VITE_API_BASE ?? "/api/v1";
+// API base derives from the Vite base path so calls land under the app's mount
+// prefix behind the Beast/Kalista gateway (`import.meta.env.BASE_URL` is
+// `/apps/vesta/` there → `/apps/vesta/api/v1`) and stay host-relative for the
+// standalone vault-console binary (`BASE_URL` is `/` → `/api/v1`). Kalista
+// strips the `/apps/vesta` prefix before proxying, so the backend keeps its
+// native `/api/v1` paths. VITE_API_BASE still overrides for custom setups.
+// BASE_URL always ends in a slash, so `${BASE_URL}api/v1` composes cleanly.
+const BASE = import.meta.env.VITE_API_BASE ?? `${import.meta.env.BASE_URL}api/v1`;
 
 export class ApiError extends Error {
   constructor(

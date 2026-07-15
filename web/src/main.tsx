@@ -35,7 +35,14 @@ const router = createBrowserRouter([
       { path: "*", element: <NotFound /> },
     ],
   },
-]);
+], {
+  // Router basename derives from the Vite base path so deep links resolve under
+  // the app's mount prefix behind the Beast/Kalista gateway
+  // (`import.meta.env.BASE_URL` is `/apps/vesta/` there) and stay at the root
+  // for the standalone console (`/`). BASE_URL carries a trailing slash; the
+  // router wants the basename without one, so strip it (keeping "/").
+  basename: import.meta.env.BASE_URL.replace(/\/$/, "") || "/",
+});
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

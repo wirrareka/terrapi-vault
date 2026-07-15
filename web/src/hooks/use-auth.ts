@@ -15,7 +15,9 @@ export function useMe() {
 /**
  * Log out: POST (not a GET link) so it can't be CSRF-triggered, then reload at `/`. The backend
  * clears the session cookie and returns JSON. We navigate regardless of the result so a stale
- * session never leaves the operator stuck on the console.
+ * session never leaves the operator stuck on the console. Navigate to the app root via the Vite
+ * base path so this lands on the console (not the gateway root) when served under a prefix; at the
+ * default base `BASE_URL` is "/", so behavior is unchanged for standalone deployments.
  */
 export async function logout(): Promise<void> {
   try {
@@ -23,5 +25,5 @@ export async function logout(): Promise<void> {
   } catch {
     // ignore — clear the client view either way
   }
-  window.location.assign("/");
+  window.location.assign(import.meta.env.BASE_URL);
 }

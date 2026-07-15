@@ -7,6 +7,12 @@ import path from "node:path";
 // proxies `/api` to a locally-running console backend (default :8203). Override via
 // VITE_API_PROXY.
 export default defineConfig({
+  // Served under a path prefix behind the Beast/Kalista gateway
+  // (`VITE_BASE=/apps/vesta/`); defaults to "/" for the standalone
+  // vault-console binary so existing behavior is unchanged. Router basename and
+  // the API client base derive from `import.meta.env.BASE_URL` — never hardcode
+  // the prefix. See beast/docs/contracts/03-ui-shell.md.
+  base: process.env.VITE_BASE ?? "/",
   plugins: [react()],
   resolve: {
     alias: { "@": path.resolve(__dirname, "src") },
