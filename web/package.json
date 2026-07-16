@@ -6,7 +6,10 @@
   "packageManager": "pnpm@10.6.5",
   "pnpm": {
     "comment": "pnpm 10+ blocks dependency build scripts unless approved; esbuild/@swc/core need theirs to place their native binaries, so vite build fails without this. pnpm 11 makes the ignored-build a hard error (CI). List them here so any pnpm version builds cleanly.",
-    "onlyBuiltDependencies": ["@swc/core", "esbuild"]
+    "onlyBuiltDependencies": [
+      "@swc/core",
+      "esbuild"
+    ]
   },
   "description": "Operator web console for terrapi-vesta (read-only observability, one per residency group). Mirrors the Kalista web standard.",
   "engines": {
@@ -24,29 +27,31 @@
   },
   "dependencies": {
     "@tanstack/react-query": "^5.59.0",
+    "@terrapi/ui": "file:../../terrapi-ui-web",
     "clsx": "^2.1.1",
     "date-fns": "^4.1.0",
     "lucide-react": "^0.460.0",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
     "react-router-dom": "^6.28.0",
     "tailwind-merge": "^2.5.4",
     "zustand": "^5.0.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.15.0",
+    "@module-federation/vite": "^1.18.1",
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.0.1",
     "@types/node": "^24.0.0",
-    "@types/react": "^18.3.12",
-    "@types/react-dom": "^18.3.1",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react-swc": "^3.9.0",
     "autoprefixer": "^10.4.20",
-    "jsdom": "^25.0.1",
     "eslint": "^9.15.0",
     "eslint-plugin-react-hooks": "^5.0.0",
     "eslint-plugin-react-refresh": "^0.4.14",
     "globals": "^15.12.0",
+    "jsdom": "^25.0.1",
     "openapi-typescript": "^7.4.3",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.15",
