@@ -40,6 +40,9 @@ pub struct LossSuccessorAbort {
     pub successor_certificate: Id,
     pub successor_token_digest: Id,
     /// Durable fencing of the replacement member/generation being retired.
+    /// Opaque to the journal: only
+    /// [`LossPolicy::successor_abort_authorized`] can check that it really
+    /// fences the replacement, and it must do so against live node evidence.
     pub fencing_ref: Id,
 }
 
@@ -144,8 +147,13 @@ pub enum SourceKind {
     LossSuccessor,
 }
 
-/// Evidence that a previous loss attempt was aborted and is being replaced
-/// (S10). Its shape is validated here; `decide_loss` does not accept it yet.
+/// Evidence that a previous loss attempt was aborted and is being replaced.
+///
+/// `abort_certificate` and `abort_token_digest` name a record in a *different
+/// file* — the previous successor journal — which this journal cannot open.
+/// They are therefore bound by nothing here except
+/// [`LossPolicy::superseded_successor_aborted`], which must check them live.
+/// Treat them as a claim until that hook has spoken.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Supersedes {
@@ -186,6 +194,12 @@ pub struct LossRequest {
     pub source_kind: Option<SourceKind>,
     /// `Request::digest` of an in-flight certified transition this loss
     /// abandons. Never padding: only meaningful for `Completed`/`Decided`.
+    ///
+    /// When the journal holds an open decided head, that head binds this
+    /// field exactly. Otherwise — a request that was only ever *prepared* —
+    /// the journal has never seen it, and the field is bound solely by
+    /// [`LossPolicy::maintenance_rollback_authorized`] against live survivor
+    /// evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abandoned_request: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -436,6 +450,27 @@ pub trait LossPolicy {
         Err("maintenance rollback evidence missing".into())
     }
 
+    /// Authorize a loss that finishes an in-flight certified maintenance
+    /// transition *forward* (`source_kind == Decided`). The default is
+    /// deliberately deny, and it is deny separately from
+    /// [`LossPolicy::survivor_prepared`] on purpose: this branch promotes a
+    /// transition that was never completed into the pair's provenance, so it
+    /// must not ride on a hook every ordinary loss already implements.
+    ///
+    /// An implementation **must** prove, live, that the survivor durably
+    /// **applied** exactly the decided transition named by
+    /// `abandoned_request` and holds its certificate. A survivor that is only
+    /// prepared or decided must roll back instead; accepting it here would
+    /// certify data that was never written.
+    fn maintenance_finish_forward_authorized(
+        &self,
+        _scope: &JournalScope,
+        _loss: &LossRequest,
+        _abandoned_request: &Id,
+    ) -> crate::Result<()> {
+        Err("maintenance finish-forward evidence missing".into())
+    }
+
     /// Live-read durable installation evidence for this exact participant.
     /// The default is intentionally deny: a decision handle is not evidence
     /// that either node installed the replacement membership.
@@ -518,11 +553,54 @@ struct SuccessorAbortRecord {
     certificate_id: Id,
 }
 
+/// Every member, generation and membership this lineage has already burnt:
+/// lost members, superseded or aborted replacements, and every membership the
+/// pair has left behind, including the original one.
+///
+/// Carried forward from journal to journal so that a recovery three losses
+/// deep still refuses to bring back the member lost by the first one.
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Retired {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    members: Vec<Id>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    generations: Vec<Id>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    memberships: Vec<Id>,
+}
+
+impl Retired {
+    fn is_empty(&self) -> bool {
+        self.members.is_empty() && self.generations.is_empty() && self.memberships.is_empty()
+    }
+    fn push(&mut self, member: Id, generation: Id, membership: Id) {
+        if !self.members.contains(&member) {
+            self.members.push(member);
+        }
+        if !self.generations.contains(&generation) {
+            self.generations.push(generation);
+        }
+        if !self.memberships.contains(&membership) {
+            self.memberships.push(membership);
+        }
+    }
+    fn contains(&self, member: Id, generation: Id, membership: Id) -> bool {
+        self.members.contains(&member)
+            || self.generations.contains(&generation)
+            || self.memberships.contains(&membership)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct SuccessorParent {
     source_scope: JournalScope,
     loss: LossRecord,
+    /// Absent — and therefore byte-identical to a format-1 parent record —
+    /// when this lineage has retired nothing beyond its own parent loss.
+    #[serde(default, skip_serializing_if = "Retired::is_empty")]
+    retired: Retired,
 }
 
 #[derive(Clone)]
@@ -664,6 +742,35 @@ struct LossSuccessorClaims {
     exp: u64,
     request: LossSuccessorRequest,
     request_digest: Id,
+}
+
+/// Issuance-time verification of a loss successor token; the only successor
+/// API that checks `now`. Returns the certificate id, which is the same value
+/// [`CommittedLossSuccessorTransition::certificate_id`] exposes.
+pub fn verify_successor_issuance(
+    token: &str,
+    trust: &Trust<'_>,
+    expected: &LossSuccessorRequest,
+    now: u64,
+) -> Result<Id, &'static str> {
+    verify_loss_successor(token, trust, expected, Some(now))
+}
+
+/// Durable-proof verification of a loss successor token.
+///
+/// A recovered pair that loses a *second* participant closes its founding
+/// successor journal: every fetch there answers "superseded by participant
+/// loss". The replacement installed by the second loss therefore cannot ask
+/// that journal for the founding successor, yet it must authenticate it to
+/// derive its own role from the canonical participant order. This is how: the
+/// operator supplies the request and token, and the signed loss pins them
+/// through `source_certificate` and `source_token_digest`.
+pub fn verify_successor_historical(
+    token: &str,
+    trust: &Trust<'_>,
+    expected: &LossSuccessorRequest,
+) -> Result<Id, &'static str> {
+    verify_loss_successor(token, trust, expected, None)
 }
 
 fn verify_loss_successor(
@@ -821,6 +928,30 @@ fn verify_successor_abort(
     Ok(c.certificate_id)
 }
 
+/// Issuance-time verification of a participant loss token; the only loss API
+/// that checks `now`. Returns the certificate id, the same value
+/// [`CommittedLoss::certificate_id`] exposes.
+pub fn verify_loss_issuance(
+    token: &str,
+    trust: &Trust<'_>,
+    expected: &LossRequest,
+    now: u64,
+) -> Result<Id, &'static str> {
+    verify(token, trust, expected, Some(now))
+}
+
+/// Durable-proof verification of a participant loss token, for a node that
+/// holds the request and token but cannot reach the journal that recorded
+/// them. Expiration is not re-applied after valid issuance; the caller must
+/// separately establish that this loss is still the effective one.
+pub fn verify_loss_historical(
+    token: &str,
+    trust: &Trust<'_>,
+    expected: &LossRequest,
+) -> Result<Id, &'static str> {
+    verify(token, trust, expected, None)
+}
+
 fn verify(
     token: &str,
     trust: &Trust<'_>,
@@ -919,6 +1050,7 @@ impl Journal {
         )?;
         let expected_parent = SuccessorParent {
             source_scope: source.scope.clone(),
+            retired: source.retired_identities(trust)?,
             loss: LossRecord {
                 request: loss.request,
                 token: loss.token,
@@ -989,6 +1121,18 @@ impl Journal {
             ensure_successor_live(&tx, trust)?;
             ensure_successor_not_aborted(&tx, trust)?;
             let parent = read_parent(&tx, trust, &self.scope)?.ok_or("loss parent missing")?;
+            // Whether an identity may be used at all is decided before
+            // whether it matches the loss: a retired member is refused as a
+            // retired member, never as a binding mismatch.
+            let replacement = request.replacement()?;
+            ensure(
+                !parent.retired.contains(
+                    replacement.member,
+                    replacement.generation,
+                    request.membership,
+                ),
+                "replacement transition reuses a retired identity",
+            )?;
             let loss = &parent.loss.request;
             validate_successor_request(&self.scope, loss, &request)?;
             let parent_digest: Id = Sha256::digest(parent.loss.token.as_bytes()).into();
@@ -997,6 +1141,8 @@ impl Journal {
                     && request.parent_loss_token_digest == parent_digest,
                 "replacement parent binding mismatch",
             )?;
+            // Exact retry: skips the fresh `now` check only; both live
+            // hooks below still run before the stored decision is returned.
             if let Some(old) = read_successor(&tx, trust)? {
                 ensure(
                     old.request == request && old.token == token,
@@ -1070,6 +1216,7 @@ impl Journal {
     ) -> crate::Result<()> {
         self.connection(|c| {
             let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
+            self.ensure_journal_format(&tx)?;
             ensure_successor_live(&tx, trust)?;
             ensure_successor_not_aborted(&tx, trust)?;
             let parent = read_parent(&tx, trust, &self.scope)?.ok_or("loss parent missing")?;
@@ -1114,6 +1261,7 @@ impl Journal {
         ensure(id != [0; 32], "zero replacement completion")?;
         self.connection(|c| {
             let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
+            self.ensure_journal_format(&tx)?;
             ensure_successor_live(&tx, trust)?;
             ensure_successor_not_aborted(&tx, trust)?;
             let parent = read_parent(&tx, trust, &self.scope)?.ok_or("loss parent missing")?;
@@ -1146,6 +1294,7 @@ impl Journal {
             "replacement acknowledgements incomplete",
         )?;
         self.connection(|c| {
+            self.ensure_journal_format(c)?;
             ensure_successor_live(c, trust)?;
             ensure_successor_not_aborted(c, trust)?;
             let r = read_successor(c, trust)?.ok_or("replacement transition missing")?;
@@ -1187,6 +1336,7 @@ impl Journal {
         ensure(token.len() <= MAX_TOKEN, "token limit")?;
         self.connection(|c| {
             let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
+            self.ensure_journal_format(&tx)?;
             ensure_successor_live(&tx, trust)?;
             let parent = read_parent(&tx, trust, &self.scope)?.ok_or("loss parent missing")?;
             ensure(
@@ -1205,6 +1355,12 @@ impl Journal {
             // Exact retry first: a recorded abort is immutable and terminal,
             // so every later check would reject the very request that has to
             // converge after a crash.
+            //
+            // It skips the fresh `now` check and
+            // `successor_abort_authorized`: the replacement it would ask
+            // about is already fenced and being un-installed, and the resume
+            // happens with the original, by then expired, token.
+            // `continuity_and_fencing` runs on both sides of the branch.
             if let Some(existing) = read_successor_abort(&tx, trust)? {
                 ensure(
                     existing.abort == abort && existing.token == token,
@@ -1261,6 +1417,7 @@ impl Journal {
         successor.validate()?;
         self.connection(|c| {
             let tx = c.unchecked_transaction()?;
+            self.ensure_journal_format(&tx)?;
             let parent = read_parent(&tx, trust, &self.scope)?.ok_or("loss parent missing")?;
             let record = read_successor_abort(&tx, trust)?.ok_or("loss successor abort missing")?;
             let decided = read_successor(&tx, trust)?.ok_or("replacement transition missing")?;
@@ -1302,13 +1459,27 @@ impl Journal {
             // A rollback abandons work the journal may not be able to see:
             // only the survivor knows about a request that was merely
             // prepared. The hook runs after every journal-side check.
-            if request.kind() == SourceKind::Completed {
-                if let Some(abandoned) = request.abandoned_request.as_ref() {
+            match (request.kind(), request.abandoned_request.as_ref()) {
+                (SourceKind::Completed, Some(abandoned)) => {
                     policy.maintenance_rollback_authorized(&self.scope, &request, abandoned)?;
                 }
+                (SourceKind::Decided, Some(abandoned)) => {
+                    policy.maintenance_finish_forward_authorized(
+                        &self.scope,
+                        &request,
+                        abandoned,
+                    )?;
+                }
+                _ => {}
             }
             let chain = read_loss_history(&tx, trust)?;
             let previous = chain.last();
+            // Exact retry. It deliberately skips the fresh `now` check and
+            // `survivor_prepared`/`maintenance_*_authorized`: a recorded loss
+            // is immutable and is resumed with the same, by then possibly
+            // expired, token, and the survivor it would ask about has already
+            // acted on this decision. `continuity_and_fencing` still runs, so
+            // a revoked or unfenced authority state still refuses.
             if let Some(old) = previous.filter(|o| o.request == request) {
                 ensure(old.token == token, "immutable loss decision conflict")?;
                 policy.continuity_and_fencing(&self.scope, &request)?;
@@ -1319,7 +1490,10 @@ impl Journal {
                 (None, Some(_)) => return Err("immutable loss decision conflict".into()),
                 (Some(_), None) => return Err("superseded loss decision missing".into()),
                 (Some(s), Some(prev)) => {
-                    supersedes_previous(s, prev, &request, &chain)?;
+                    let retired = read_parent(&tx, trust, &self.scope)?
+                        .map(|p| p.retired)
+                        .unwrap_or_default();
+                    supersedes_previous(s, prev, &request, &chain, &retired)?;
                     policy.superseded_successor_aborted(&self.scope, &prev.request, s)?;
                     prev.request.revision
                 }
@@ -1471,6 +1645,13 @@ impl Journal {
             !head.acknowledgements[lost_index],
             "lost participant already acknowledged; complete the transition instead",
         )?;
+        // Branch A requires this acknowledgement to be false, branch B
+        // requires it true, so one journal state can never satisfy both and
+        // the authority can never be offered a choice.
+        ensure(
+            head.acknowledgements[1 - lost_index],
+            "finish forward requires the survivor acknowledgement",
+        )?;
         let survivor = &head.request.participants[1 - lost_index];
         ensure(
             request.install == self.scope.install
@@ -1553,10 +1734,14 @@ impl Journal {
                 && request.replacement_member != successor.request.participants[1].member,
             "loss participant/revision mismatch",
         )?;
-        // A retired identity may never come back: the member, generation and
-        // membership burnt by the first loss stay burnt.
+        // A retired identity may never come back — not one loss deep, and not
+        // three: the set travels with the lineage.
         ensure(
-            request.replacement_member != parent.loss.request.lost_member
+            !parent.retired.contains(
+                request.replacement_member,
+                request.replacement_generation,
+                request.replacement_membership,
+            ) && request.replacement_member != parent.loss.request.lost_member
                 && request.replacement_generation != parent.loss.request.lost_generation
                 && request.replacement_membership != parent.loss.request.membership,
             "loss replacement reuses a retired identity",
@@ -1566,6 +1751,36 @@ impl Journal {
         Ok(history.last_revision.max(successor.request.revision))
     }
 
+    /// Everything this journal's lineage has burnt, ready to be handed to the
+    /// successor journal it is about to found: whatever it inherited, plus
+    /// its own lost member/generation/membership, plus the replacement of
+    /// every loss its chain has superseded.
+    fn retired_identities(&self, trust: &Trust<'_>) -> crate::Result<Retired> {
+        self.connection(|c| {
+            let tx = c.unchecked_transaction()?;
+            let mut retired = read_parent(&tx, trust, &self.scope)?
+                .map(|p| p.retired)
+                .unwrap_or_default();
+            let history = read_loss_history(&tx, trust)?;
+            let superseded = history.len().saturating_sub(1);
+            for (i, record) in history.iter().enumerate() {
+                let r = &record.request;
+                if i == 0 {
+                    // Identical across the whole chain by construction.
+                    retired.push(r.lost_member, r.lost_generation, r.membership);
+                }
+                if i < superseded {
+                    retired.push(
+                        r.replacement_member,
+                        r.replacement_generation,
+                        r.replacement_membership,
+                    );
+                }
+            }
+            Ok(retired)
+        })
+    }
+
     pub fn fetch_loss(
         &self,
         trust: &Trust<'_>,
@@ -1573,6 +1788,7 @@ impl Journal {
     ) -> crate::Result<CommittedLoss> {
         self.connection(|c| {
             let tx = c.unchecked_transaction()?;
+            self.ensure_journal_format(&tx)?;
             let record = read_record(&tx, trust)?.ok_or("loss decision missing")?;
             policy.continuity_and_fencing(&self.scope, &record.request)?;
             committed_loss(record, trust)
@@ -1637,6 +1853,7 @@ fn supersedes_previous(
     prev: &LossRecord,
     request: &LossRequest,
     chain: &[LossRecord],
+    retired: &Retired,
 ) -> crate::Result<()> {
     let p = &prev.request;
     ensure(
@@ -1667,7 +1884,11 @@ fn supersedes_previous(
     // A retired replacement identity may never come back, in any generation
     // of the chain: that is the whole anti-replay property of supersession.
     ensure(
-        chain.iter().all(|r| {
+        !retired.contains(
+            request.replacement_member,
+            request.replacement_generation,
+            request.replacement_membership,
+        ) && chain.iter().all(|r| {
             request.replacement_member != r.request.replacement_member
                 && request.replacement_generation != r.request.replacement_generation
                 && request.replacement_membership != r.request.replacement_membership
@@ -1879,14 +2100,6 @@ fn read_parent(
     Ok(record)
 }
 
-fn table_exists(c: &Connection, name: &str) -> crate::Result<bool> {
-    Ok(c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
-        [name],
-        |r| r.get(0),
-    )?)
-}
-
 fn decode_loss_row(json: &str, digest: &[u8], trust: &Trust<'_>) -> crate::Result<LossRecord> {
     ensure(
         json.len() <= 256 * 1024 && digest == Sha256::digest(json.as_bytes()).as_slice(),
@@ -1906,8 +2119,13 @@ fn decode_loss_row(json: &str, digest: &[u8], trust: &Trust<'_>) -> crate::Resul
 /// A journal that never supersedes never creates the chain table and is
 /// therefore byte-for-byte a format-1 journal.
 fn read_loss_history(c: &Connection, trust: &Trust<'_>) -> crate::Result<Vec<LossRecord>> {
+    // The chain is append-only, so truncating it would silently resurrect a
+    // superseded replacement. Its length and tail revision are therefore
+    // recorded in a singleton written in the same transaction as every row.
+    let head = read_chain_head(c)?;
     let mut history = Vec::new();
     if !table_exists(c, "transition_loss")? {
+        ensure(head.is_none(), "loss chain truncated")?;
         return Ok(history);
     }
     let raw: Option<(String, Vec<u8>)> = c
@@ -1927,6 +2145,7 @@ fn read_loss_history(c: &Connection, trust: &Trust<'_>) -> crate::Result<Vec<Los
     )?;
     history.push(first);
     if !table_exists(c, "transition_loss_chain")? {
+        ensure(head.is_none(), "loss chain truncated")?;
         return Ok(history);
     }
     let rows: i64 = c.query_row("SELECT count(*) FROM main.transition_loss_chain", [], |r| {
@@ -1936,6 +2155,12 @@ fn read_loss_history(c: &Connection, trust: &Trust<'_>) -> crate::Result<Vec<Los
         usize::try_from(rows).is_ok_and(|n| n <= MAX_CHAIN_ROWS),
         "loss chain row limit",
     )?;
+    ensure_row_sizes(
+        c,
+        "SELECT count(*) FROM main.transition_loss_chain WHERE length(record)>?1",
+        "loss record limit",
+    )?;
+    ensure(rows == 0 || head.is_some(), "loss chain head missing")?;
     let mut stmt = c.prepare(
         "SELECT revision,record,digest FROM main.transition_loss_chain ORDER BY revision",
     )?;
@@ -1970,7 +2195,29 @@ fn read_loss_history(c: &Connection, trust: &Trust<'_>) -> crate::Result<Vec<Los
         )?;
         history.push(record);
     }
+    match head {
+        None => ensure(history.len() == 1, "loss chain head missing")?,
+        Some((revision, rows)) => ensure(
+            usize::try_from(rows).is_ok_and(|n| n + 1 == history.len())
+                && history
+                    .last()
+                    .is_some_and(|r| r.request.revision == revision),
+            "loss chain truncated",
+        )?,
+    }
     Ok(history)
+}
+
+fn read_chain_head(c: &Connection) -> crate::Result<Option<(u64, u64)>> {
+    if !table_exists(c, "transition_loss_head")? {
+        return Ok(None);
+    }
+    Ok(c.query_row(
+        "SELECT revision,rows FROM main.transition_loss_head WHERE id=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()?)
 }
 
 /// The *effective* loss: the last superseding row if there is one, else the
@@ -1986,7 +2233,8 @@ pub(super) fn loss_record_exists(c: &Connection, trust: &Trust<'_>) -> crate::Re
 fn save_chain_record(c: &Connection, r: &LossRecord) -> crate::Result<()> {
     let json = serde_json::to_string(r)?;
     ensure(json.len() <= 256 * 1024, "loss record limit")?;
-    c.execute_batch("CREATE TABLE IF NOT EXISTS main.transition_loss_chain(revision INTEGER PRIMARY KEY,record TEXT NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=32));")?;
+    c.execute_batch("CREATE TABLE IF NOT EXISTS main.transition_loss_chain(revision INTEGER PRIMARY KEY,record TEXT NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=32)); CREATE TABLE IF NOT EXISTS main.transition_loss_head(id INTEGER PRIMARY KEY CHECK(id=1),revision INTEGER NOT NULL,rows INTEGER NOT NULL);")?;
+    mark_journal_format_two(c)?;
     ensure(
         c.execute(
             "INSERT INTO main.transition_loss_chain VALUES(?1,?2,?3)",
@@ -1997,6 +2245,16 @@ fn save_chain_record(c: &Connection, r: &LossRecord) -> crate::Result<()> {
             ],
         )? == 1,
         "loss chain write failed",
+    )?;
+    let rows: i64 = c.query_row("SELECT count(*) FROM main.transition_loss_chain", [], |r| {
+        r.get(0)
+    })?;
+    ensure(
+        c.execute(
+            "INSERT OR REPLACE INTO main.transition_loss_head VALUES(1,?1,?2)",
+            params![r.request.revision, rows],
+        )? == 1,
+        "loss chain head write failed",
     )
 }
 
@@ -2007,6 +2265,11 @@ fn read_successor_abort(
     if !table_exists(c, "transition_loss_successor_abort")? {
         return Ok(None);
     }
+    ensure_row_sizes(
+        c,
+        "SELECT count(*) FROM main.transition_loss_successor_abort WHERE length(record)>?1",
+        "loss successor abort integrity",
+    )?;
     let raw: Option<(String, Vec<u8>)> = c
         .query_row(
             "SELECT record,digest FROM main.transition_loss_successor_abort WHERE id=1",
@@ -2034,6 +2297,7 @@ fn save_successor_abort(c: &Connection, r: &SuccessorAbortRecord) -> crate::Resu
     let json = serde_json::to_string(r)?;
     ensure(json.len() <= 256 * 1024, "loss successor abort limit")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS main.transition_loss_successor_abort(id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=32));")?;
+    mark_journal_format_two(c)?;
     ensure(
         c.execute(
             "INSERT INTO main.transition_loss_successor_abort VALUES(1,?1,?2)",

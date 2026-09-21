@@ -287,8 +287,34 @@ fn abort_table_exists(path: &Path) -> bool {
     .unwrap()
 }
 
-/// Forge an abort row directly, bypassing every `Journal::abort` guard.
+/// Burn the one-way format-2 marker into the stored scope row, the way every
+/// genuine writer of a format-2 table does in the same transaction.
+fn mark_format_two(path: &Path) {
+    let raw = terrapi_vesta::Vesta::open(path, "pass").unwrap();
+    raw.with_connection(|c| {
+        let stored: String =
+            c.query_row("SELECT record FROM transition_scope WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        let mut value: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("journal_format".into(), json!(2));
+        c.execute(
+            "UPDATE transition_scope SET record=?1 WHERE id=1",
+            [value.to_string()],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// Forge an abort row directly, bypassing every `Journal::abort` guard — but
+/// still leaving the journal marked, so the deeper checks are the ones under
+/// test rather than the format marker.
 fn plant_abort_row(path: &Path, revision: u64, record: &str) {
+    mark_format_two(path);
     let raw = terrapi_vesta::Vesta::open(path, "pass").unwrap();
     raw.with_connection(|c| {
         c.execute_batch("CREATE TABLE IF NOT EXISTS main.transition_abort(revision INTEGER PRIMARY KEY,record TEXT NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=32));")?;
@@ -1369,6 +1395,7 @@ fn a_tampered_oversized_or_overfull_abort_table_fails_the_journal_closed() {
     let j = Journal::create(&h.path(), "pass", h.scope.clone()).unwrap();
     h.complete(&j, &h.first, 30, &p);
     drop(j);
+    mark_format_two(&h.path());
     let raw = terrapi_vesta::Vesta::open(h.path(), "pass").unwrap();
     raw.with_connection(|c| {
         c.execute_batch("CREATE TABLE IF NOT EXISTS main.transition_abort(revision INTEGER PRIMARY KEY,record TEXT NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=32)); BEGIN;")?;
