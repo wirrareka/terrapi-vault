@@ -1,16 +1,38 @@
 //! Fail-closed page export from a permanently fenced certified survivor.
 use super::*;
 use sha2::{Digest, Sha256};
-use std::{fs::OpenOptions, marker::PhantomData, path::Path};
+use std::{
+    fs::OpenOptions,
+    marker::PhantomData,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+};
+
+#[cfg(test)]
+mod tests;
+
+/// Everything `validate` derives from signed evidence. The survivor role is a
+/// result, never a parameter: it exists only inside this module and is rebuilt
+/// from the durable certificate on every validation.
+pub(super) struct Evidence {
+    role: Role,
+    manifest: snapshot::Manifest,
+}
 
 /// Restricted capability: it owns the normal node lock, opens SQLite read-only,
 /// and exposes only the exact loss-bound frozen publication.
 pub(crate) struct LossSurvivorHandle<A: ReplicatedSchema> {
     db: Vesta,
     identity: Identity<SchemaId>,
+    /// Derived by [`validate`] from the signed loss decision and the certificate.
+    role: Role,
     contract: schema_contract::Contract,
     manifest: snapshot::Manifest,
     request: crate::recovery::transition::LossRequest,
+    /// Canonical path and (device, inode) of the file that passed validation.
+    /// Retained so a later durable step can prove it is the same file.
+    path: PathBuf,
+    file: (u64, u64),
     _adapter: PhantomData<A>,
     _lock: std::fs::File,
 }
@@ -42,9 +64,11 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
         let contract = schema_contract::describe(&scratch, &adapter)?;
         let initial = hash(&adapter.view(&scratch)?)?;
         let db = Vesta::open_read_only_with_passphrase(&path, passphrase)?;
+        let metadata = std::fs::metadata(&path)?;
+        let file = (metadata.dev(), metadata.ino());
         let loss = journal.fetch_loss(&trust.as_trust(), policy)?;
         let request = loss.request().clone();
-        let manifest = db.with_connection(|c| {
+        let evidence = db.with_connection(|c| {
             c.pragma_update(None, "query_only", true)?;
             Ok(validate::<A>(
                 c, &adapter, &identity, &contract, &initial, trust, &request,
@@ -53,9 +77,12 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
         Ok(Self {
             db,
             identity,
+            role: evidence.role,
             contract,
-            manifest,
+            manifest: evidence.manifest,
             request,
+            path,
+            file,
             _adapter: PhantomData,
             _lock: lock,
         })
@@ -80,7 +107,7 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
     ) -> Result<snapshot::Page> {
         self.revalidate(journal, trust, policy)?;
         ensure(position < self.manifest.pages, "loss page out of range")?;
-        Ok(self.db.with_connection(|c| {
+        self.db.with_connection(|c| {
             Ok((|| -> Result<snapshot::Page> {
                 let json: String = c.query_row(
                     "SELECT page FROM node_publication_pages WHERE position=?1",
@@ -94,7 +121,7 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
                 )?;
                 Ok(page)
             })())
-        })??)
+        })?
     }
 
     fn revalidate(
@@ -106,12 +133,19 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
         let loss = journal.fetch_loss(&trust.as_trust(), policy)?;
         ensure(loss.request() == &self.request, "loss decision changed")?;
         self.db.with_connection(|c| {
-            Ok(Node::<A>::verify_publication_in(
-                c,
-                &self.manifest,
-                &self.identity,
-                &self.contract,
-            ))
+            Ok((|| -> Result<()> {
+                // The owner row still has to carry exactly the role that the
+                // signed evidence derived when this handle was opened.
+                let identities: Vec<String> = c
+                    .prepare("SELECT value FROM node_identity")?
+                    .query_map([], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                ensure(
+                    identities == [serde_json::to_string(&(&self.identity, self.role))?],
+                    "loss survivor owner mismatch",
+                )?;
+                Node::<A>::verify_publication_in(c, &self.manifest, &self.identity, &self.contract)
+            })())
         })??;
         Ok(())
     }
@@ -120,6 +154,12 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
 /// Idempotently transfer the exact loss-bound publication into an empty
 /// replacement. The replacement stays a normal non-primary bootstrap node;
 /// this function neither installs membership nor grants admission.
+///
+/// The restored state is bound to the signed `survivor_cut`, not to the older
+/// `source_cut`: the publication that `validate` accepted is the survivor's
+/// current one, so a tail committed after the certified cut is transferred and
+/// never silently dropped. The signed `replacement_generation` is retained
+/// through the restore because the successor membership is signed against it.
 pub(crate) fn bootstrap_replacement<A: ReplicatedSchema>(
     survivor: &LossSurvivorHandle<A>,
     replacement: &mut Node<A>,
@@ -142,11 +182,17 @@ pub(crate) fn bootstrap_replacement<A: ReplicatedSchema>(
         let page = survivor.page(next, journal, trust, policy)?;
         next = replacement.receive_snapshot(&page)?;
     }
-    let checkpoint = replacement.finish_snapshot(&manifest)?;
+    let checkpoint = replacement
+        .finish_snapshot_retaining_generation(&manifest, survivor.request.replacement_generation)?;
     ensure(
-        checkpoint.sequence == survivor.request.source_cut.sequence
-            && id(&checkpoint)? == survivor.request.source_cut.digest,
+        checkpoint == manifest.checkpoint
+            && checkpoint.sequence == survivor.request.survivor_cut.sequence
+            && id(&checkpoint)? == survivor.request.survivor_cut.digest,
         "loss replacement cut mismatch",
+    )?;
+    ensure(
+        replacement.connection(checkpoint::generation)? == survivor.request.replacement_generation,
+        "loss replacement generation not retained",
     )?;
     // One final live fencing check after the durable restore, so a successful
     // return cannot race authority revocation at the last page boundary.
@@ -218,15 +264,14 @@ pub(super) fn validate<A: ReplicatedSchema>(
     initial: &str,
     trust: &crate::recovery::transition::TrustStore,
     loss: &crate::recovery::transition::LossRequest,
-) -> Result<snapshot::Manifest> {
+) -> Result<Evidence> {
     let identities: Vec<String> = c
         .prepare("SELECT value FROM node_identity")?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    ensure(
-        identities == [serde_json::to_string(&(identity, Role::Secondary))?],
-        "loss survivor owner mismatch",
-    )?;
+    // The owner row is compared once the role has been derived from signed
+    // evidence below; a single row is still required up front.
+    ensure(identities.len() == 1, "loss survivor owner mismatch")?;
     let runtime: Vec<(u32, String)> = c
         .prepare("SELECT format,initial_digest FROM node_runtime")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -258,7 +303,37 @@ pub(super) fn validate<A: ReplicatedSchema>(
         &trust.as_trust(),
         &certificate.request,
     )?;
-    let local = certificate.request.participants[1].clone();
+    // I1. The survivor index — and therefore the local role — is derived only
+    // from the signed loss decision and this historically verified certificate.
+    // Exactly one participant may match the survivor member *and* generation,
+    // the other one must be exactly the fenced member/generation, and the owner
+    // row must already carry the role that the index implies. Anything else
+    // fails closed; no caller can supply or influence the role.
+    let mut matches = certificate
+        .request
+        .participants
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| {
+            p.member == loss.survivor.member && p.generation == loss.survivor.generation
+        });
+    let index = matches.next().ok_or("loss survivor not certified")?.0;
+    ensure(matches.next().is_none(), "loss survivor ambiguous")?;
+    let lost = &certificate.request.participants[1 - index];
+    ensure(
+        lost.member == loss.lost_member && lost.generation == loss.lost_generation,
+        "loss lost participant mismatch",
+    )?;
+    let role = if index == 0 {
+        Role::Primary
+    } else {
+        Role::Secondary
+    };
+    ensure(
+        identities[0] == serde_json::to_string(&(identity, role))?,
+        "loss survivor owner mismatch",
+    )?;
+    let local = certificate.request.participants[index].clone();
     let base = checkpoint::base_for::<SchemaId>(c)?.ok_or("loss survivor base missing")?;
     let current = checkpoint::current_for(c, adapter, identity, initial, true)?.0;
     let manifest_json: String = c.query_row(
@@ -285,7 +360,7 @@ pub(super) fn validate<A: ReplicatedSchema>(
         "loss survivor evidence mismatch",
     )?;
     Node::<A>::verify_publication_in(c, &manifest, identity, contract)?;
-    Ok(manifest)
+    Ok(Evidence { role, manifest })
 }
 
 fn id<T: Serialize>(value: &T) -> Result<[u8; 32]> {

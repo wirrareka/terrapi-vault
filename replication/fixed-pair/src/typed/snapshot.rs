@@ -586,6 +586,25 @@ impl<A: ReplicatedSchema> Node<A> {
         })
     }
     pub fn finish_snapshot(&mut self, manifest: &Manifest) -> Result<Prefix> {
+        self.finish_snapshot_installing(manifest, None)
+    }
+    /// Restore that installs an externally chosen admission generation instead
+    /// of a fresh random one. Reserved for the participant-loss bootstrap, whose
+    /// successor membership is signed against exactly this generation; a random
+    /// one would make that signed installation contract unsatisfiable. Never
+    /// `pub`: no application caller may choose an admission generation.
+    pub(super) fn finish_snapshot_retaining_generation(
+        &mut self,
+        manifest: &Manifest,
+        generation: [u8; 32],
+    ) -> Result<Prefix> {
+        self.finish_snapshot_installing(manifest, Some(generation))
+    }
+    fn finish_snapshot_installing(
+        &mut self,
+        manifest: &Manifest,
+        retain: Option<[u8; 32]>,
+    ) -> Result<Prefix> {
         self.validate_manifest(manifest)?;
         self.connection(|c| {
             self.verify_owner(c)?;
@@ -671,9 +690,13 @@ impl<A: ReplicatedSchema> Node<A> {
                 "INSERT INTO replication_base VALUES(1,?1)",
                 [serde_json::to_string(&manifest.checkpoint)?],
             )?;
+            let generation = match retain {
+                Some(generation) => generation,
+                None => checkpoint::fresh_generation()?,
+            };
             tx.execute(
                 "UPDATE replication_generation SET value=?1 WHERE id=1",
-                [checkpoint::fresh_generation()?.as_slice()],
+                [generation.as_slice()],
             )?;
             tx.execute("DELETE FROM replication_readiness", [])?;
             ensure(
