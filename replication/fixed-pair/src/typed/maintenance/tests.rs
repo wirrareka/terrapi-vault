@@ -241,6 +241,60 @@ pub(super) mod support {
         })
     }
 
+    /// Sign a maintenance abort for `request`, in the same claim shape the
+    /// recovery crate's own abort tests use.
+    pub(crate) fn abort_of(
+        request: &transition::Request,
+        id: u8,
+        decided: bool,
+        revision: u64,
+    ) -> Result<transition::MaintenanceAbort> {
+        Ok(transition::MaintenanceAbort {
+            format: 2,
+            id: [id; 32],
+            authority_id: request.authority_id,
+            revision,
+            install: request.install.clone(),
+            region: request.region.clone(),
+            scope: request.scope,
+            schema: request.schema,
+            membership: request.membership,
+            aborted_request: request.digest()?,
+            aborted_request_id: request.id,
+            aborted_revision: request.revision,
+            decided,
+            source_anchor: request.source_anchor.clone(),
+        })
+    }
+
+    pub(crate) fn sign_abort(
+        key: &EcdsaKeyPair,
+        abort: &transition::MaintenanceAbort,
+        window: (u64, u64),
+    ) -> Result<String> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
+        use ring::rand::SystemRandom;
+        let header = B64.encode(serde_json::to_vec(&serde_json::json!({
+            "alg": "ES256", "kid": "fixture", "typ": transition::ABORT_TOKEN_TYPE
+        }))?);
+        let certificate_id = [77u8; 32];
+        let claims = B64.encode(serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "iss": "issuer",
+            "aud": "audience",
+            "action": "abort_compact_pair",
+            "certificate_id": certificate_id,
+            "iat": window.0, "nbf": window.0, "exp": window.1,
+            "request": abort,
+            "request_digest": abort.digest()?,
+        }))?);
+        let input = format!("{header}.{claims}");
+        let signature = key
+            .sign(&SystemRandom::new(), input.as_bytes())
+            .map_err(|_| "abort token signing")?;
+        Ok(format!("{input}.{}", B64.encode(signature.as_ref())))
+    }
+
     /// Journal scope for the signed request above.
     pub(crate) fn journal_scope(request: &transition::Request) -> transition::JournalScope {
         transition::JournalScope {

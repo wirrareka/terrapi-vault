@@ -17,6 +17,19 @@ struct Marker {
     plan_digest: [u8; 32],
 }
 
+/// Local record of a signed maintenance abort. Its presence is the durable,
+/// one-way proof that this node will never roll the transition forward.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AbortLocal {
+    abort_id: [u8; 32],
+    abort_token_digest: [u8; 32],
+    aborted_revision: u64,
+    decided: bool,
+}
+
+/// Format 1 rows serialise byte-identically: `abort` is skipped when absent, so
+/// a node that never aborts writes exactly the bytes it wrote before.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Prepared {
@@ -27,6 +40,8 @@ struct Prepared {
     token: String,
     decision: Option<[u8; 32]>,
     completion: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    abort: Option<AbortLocal>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -166,25 +181,6 @@ fn require_appliable(c: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Exercises the two branches of [`require_appliable`] directly, so the
-/// defence-in-depth check is covered even though earlier structural verifiers
-/// refuse the same shapes first in practice.
-#[cfg(test)]
-fn require_appliable_for_test(c: &Connection, certified: bool, version: u32) -> Result<()> {
-    require_unpinned(c)?;
-    if certified {
-        ensure(
-            version == 3,
-            "certified maintenance requires certified maintenance format",
-        )
-    } else {
-        ensure(
-            version == 1,
-            "certified maintenance requires a node without legacy compaction",
-        )
-    }
-}
-
 pub(crate) fn prepare_pair<A: ReplicatedSchema>(
     p: &mut Node<A>,
     s: &mut Node<A>,
@@ -209,6 +205,7 @@ pub(crate) fn prepare_pair<A: ReplicatedSchema>(
         token: token.into(),
         decision: None,
         completion: None,
+        abort: None,
     };
     let expected_json = serde_json::to_string(&prepared)?;
     ensure(
@@ -431,6 +428,26 @@ impl<A: ReplicatedSchema> PendingMaintenanceHandle<A> {
         &self.inspection
     }
 
+    /// Re-read and re-validate the durable progress row. Used as live
+    /// participant evidence, so it never trusts the cached copy.
+    fn live_progress(&self, trust: &crate::recovery::transition::TrustStore) -> Result<Prepared> {
+        self.db.with_connection(|c| {
+            Ok(validate_pending(
+                c,
+                &self.adapter,
+                &self.contract,
+                &self.initial,
+                &self.identity,
+                self.role,
+                &self.prepared.request,
+                trust,
+                self.certified_authority.as_deref(),
+                None,
+            )
+            .map(|(_, prepared)| prepared))
+        })?
+    }
+
     fn replace_progress(
         &mut self,
         trust: &crate::recovery::transition::TrustStore,
@@ -597,13 +614,13 @@ pub(crate) fn decide_prepared<A: ReplicatedSchema>(
             &prepared.request.participants[1],
         ],
     };
-    Ok(journal.decide(
+    journal.decide(
         prepared.request.clone(),
         &prepared.token,
         now,
         &trust.as_trust(),
         &guarded,
-    )?)
+    )
 }
 
 pub(crate) fn record_decided<A: ReplicatedSchema>(
@@ -1057,6 +1074,312 @@ pub(crate) fn finalize_pair<A: ReplicatedSchema>(
     finalize_node(primary, journal, trust, policy)
 }
 
+// ---------------------------------------------------------------------------
+// C1: maintenance abort. `prepare_pair` is a one-way door only as far as the
+// ordinary lifecycle is concerned; a signed abort is the way back out.
+// ---------------------------------------------------------------------------
+
+/// Durably mark this node as aborting. One-way: from here no lifecycle call can
+/// ever reach apply, acknowledge or complete, which is exactly the evidence the
+/// authority needs before it records the abort (race R2).
+pub(crate) fn begin_abort<A: ReplicatedSchema>(
+    handle: &mut PendingMaintenanceHandle<A>,
+    abort: &crate::recovery::transition::MaintenanceAbort,
+    token: &str,
+    now: u64,
+    trust: &crate::recovery::transition::TrustStore,
+) -> Result<()> {
+    let request = handle.prepared.request.clone();
+    // The token is verified freshly, then again against the durable record, the
+    // same double-check the decision path uses.
+    let certificate =
+        crate::recovery::transition::verify_abort_issuance(token, &trust.as_trust(), abort, now)?;
+    ensure(
+        abort.aborted_request == digest(&request)?
+            && abort.aborted_request_id == request.id
+            && abort.aborted_revision == request.revision
+            && abort.authority_id == request.authority_id
+            && abort.install == request.install
+            && abort.region == request.region
+            && abort.scope == request.scope
+            && abort.schema == request.schema
+            && abort.membership == request.membership
+            && abort.source_anchor == request.source_anchor,
+        "pending abort binding mismatch",
+    )?;
+    let local = AbortLocal {
+        abort_id: abort.id,
+        abort_token_digest: digest_of_token(token),
+        aborted_revision: abort.aborted_revision,
+        decided: abort.decided,
+    };
+    let _ = certificate;
+    if handle.prepared.phase == "aborting" {
+        // Exact retry only; a different abort is a conflict, never a repair.
+        return ensure(
+            handle.prepared.abort.as_ref() == Some(&local),
+            "pending abort conflict",
+        );
+    }
+    ensure(
+        matches!(handle.prepared.phase.as_str(), "prepared" | "decided")
+            && abort.decided == (handle.prepared.phase == "decided")
+            && handle.prepared.completion.is_none(),
+        "invalid pending abort transition",
+    )?;
+    let mut next = handle.prepared.clone();
+    next.format = 2;
+    next.phase = "aborting".into();
+    next.abort = Some(local);
+    handle.replace_progress(trust, next, || Ok(()))
+}
+
+fn digest_of_token(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+/// Live participant evidence for [`crate::recovery::transition::Policy::abort_applicable`]:
+/// both nodes must already be durably aborting on exactly this abort, with the
+/// pending runtime still in place. The external policy's own decision runs
+/// first, so the authority's live-head check still gates.
+struct AbortingPolicy<'a, A: ReplicatedSchema, P> {
+    external: &'a P,
+    primary: &'a PendingMaintenanceHandle<A>,
+    secondary: &'a PendingMaintenanceHandle<A>,
+    trust: &'a crate::recovery::transition::TrustStore,
+}
+
+impl<A: ReplicatedSchema, P: crate::recovery::transition::Policy>
+    crate::recovery::transition::Policy for AbortingPolicy<'_, A, P>
+{
+    fn continuity(
+        &self,
+        scope: &crate::recovery::transition::JournalScope,
+        request: &crate::recovery::transition::Request,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        self.external.continuity(scope, request)
+    }
+    fn prepared(
+        &self,
+        scope: &crate::recovery::transition::JournalScope,
+        request: &crate::recovery::transition::Request,
+        member: &crate::recovery::transition::Participant,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        self.external.prepared(scope, request, member)
+    }
+    fn applied(
+        &self,
+        scope: &crate::recovery::transition::JournalScope,
+        decision: &crate::recovery::transition::CommittedTransition,
+        member: &crate::recovery::transition::Participant,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        self.external.applied(scope, decision, member)
+    }
+    fn historical_completion(
+        &self,
+        scope: &crate::recovery::transition::JournalScope,
+        historical: &crate::recovery::transition::Request,
+        head: &crate::recovery::transition::Request,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        self.external.historical_completion(scope, historical, head)
+    }
+    fn abort_applicable(
+        &self,
+        scope: &crate::recovery::transition::JournalScope,
+        abort: &crate::recovery::transition::MaintenanceAbort,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        self.external.abort_applicable(scope, abort)?;
+        for handle in [self.primary, self.secondary] {
+            let progress = handle.live_progress(self.trust)?;
+            let local = progress
+                .abort
+                .as_ref()
+                .ok_or("pending node is not aborting")?;
+            ensure(
+                progress.phase == "aborting"
+                    && progress.format == 2
+                    && digest(&progress.request)? == abort.aborted_request
+                    && progress.request.id == abort.aborted_request_id
+                    && progress.request.revision == abort.aborted_revision
+                    && local.abort_id == abort.id
+                    && local.decided == abort.decided
+                    && local.aborted_revision == abort.aborted_revision,
+                "pending node is not aborting",
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Record the abort at the authority, but only once both nodes are durably
+/// aborting. Exact retry converges on the journal's own retry branch.
+pub(crate) fn abort_authority<A: ReplicatedSchema>(
+    primary: &PendingMaintenanceHandle<A>,
+    secondary: &PendingMaintenanceHandle<A>,
+    journal: &crate::recovery::transition::Journal,
+    abort: &crate::recovery::transition::MaintenanceAbort,
+    token: &str,
+    now: u64,
+    trust: &crate::recovery::transition::TrustStore,
+    policy: &impl crate::recovery::transition::Policy,
+) -> Result<()> {
+    ensure(
+        primary.role == Role::Primary
+            && secondary.role == Role::Secondary
+            && primary.identity == secondary.identity
+            && primary.prepared.request == secondary.prepared.request,
+        "pending abort pair mismatch",
+    )?;
+    let evidence = AbortingPolicy {
+        external: policy,
+        primary,
+        secondary,
+        trust,
+    };
+    journal.abort(abort.clone(), token, now, &trust.as_trust(), &evidence)?;
+    Ok(())
+}
+
+/// Roll this node back to the ordinary state it had before PREPARE. Restartable
+/// and per node, like `finalize_node`.
+pub(crate) fn finish_abort<A: ReplicatedSchema>(
+    handle: &mut PendingMaintenanceHandle<A>,
+    journal: &crate::recovery::transition::Journal,
+    trust: &crate::recovery::transition::TrustStore,
+    policy: &impl crate::recovery::transition::Policy,
+) -> Result<()> {
+    if handle.finalized {
+        journal.fetch_abort(&handle.prepared.request, &trust.as_trust(), policy)?;
+        return Ok(());
+    }
+    let local = handle
+        .prepared
+        .abort
+        .clone()
+        .ok_or("pending node is not aborting")?;
+    ensure(
+        handle.prepared.phase == "aborting",
+        "pending node is not aborting",
+    )?;
+    handle.db.with_connection(|c| {
+        let run = || -> Result<()> {
+            let tx =
+                rusqlite::Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
+            validate_pending(
+                &tx,
+                &handle.adapter,
+                &handle.contract,
+                &handle.initial,
+                &handle.identity,
+                handle.role,
+                &handle.prepared.request,
+                trust,
+                handle.certified_authority.as_deref(),
+                Some(&handle.prepared),
+            )?;
+            let committed =
+                journal.fetch_abort(&handle.prepared.request, &trust.as_trust(), policy)?;
+            ensure(
+                committed.abort().id == local.abort_id
+                    && committed.token_digest() == local.abort_token_digest
+                    && committed.aborted_revision() == local.aborted_revision
+                    && committed.abort().decided == local.decided
+                    && committed.aborted_request() == digest(&handle.prepared.request)?,
+                "pending abort proof mismatch",
+            )?;
+            let marker_json = singleton_text(
+                &tx,
+                "node_pending_certified_maintenance",
+                "record",
+                64 * 1024,
+            )?;
+            let marker: Marker = serde_json::from_str(&marker_json)?;
+            // Exactly the PREPARE transaction undone: the pending tables and
+            // the runtime marker, nothing else. Readiness is deliberately not
+            // restored; the secondary re-confirms its checkpoint.
+            tx.execute_batch(
+                "DROP TABLE main.node_pending_certified_progress;
+                 DROP TABLE main.node_pending_certified_maintenance;",
+            )?;
+            ensure(
+                tx.execute(
+                    "UPDATE node_runtime SET format=?1 WHERE id=1 AND format=5",
+                    [marker.previous_runtime],
+                )? == 1,
+                "pending abort runtime restoration failed",
+            )?;
+            let runtime: u32 =
+                tx.query_row("SELECT format FROM node_runtime WHERE id=1", [], |r| {
+                    r.get(0)
+                })?;
+            ensure(
+                matches!(runtime, 3 | 4)
+                    && runtime == marker.previous_runtime
+                    && !pending_present(&tx)?
+                    && !tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' \
+                         AND name='node_pending_certified_progress')",
+                        [],
+                        |r| r.get::<_, bool>(0),
+                    )?,
+                "pending abort post-state mismatch",
+            )?;
+            // The restored node must pass the ordinary owner-level validation
+            // again, inside the same transaction that rolled it back.
+            verify_restored(&tx, handle, trust)?;
+            tx.commit()?;
+            Ok(())
+        };
+        run().map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))
+    })?;
+    handle.finalized = true;
+    Ok(())
+}
+
+/// The owner-level checks an ordinary `Node::open` performs, re-run on the
+/// rolled-back state before the abort transaction commits.
+fn verify_restored<A: ReplicatedSchema>(
+    c: &Connection,
+    handle: &PendingMaintenanceHandle<A>,
+    trust: &crate::recovery::transition::TrustStore,
+) -> Result<()> {
+    let owner: Vec<String> = c
+        .prepare("SELECT value FROM node_identity")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    ensure(
+        owner == [serde_json::to_string(&(&handle.identity, handle.role))?],
+        "pending abort owner mismatch",
+    )?;
+    let runtime: Vec<(u32, String)> = c
+        .prepare("SELECT format,initial_digest FROM node_runtime")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    ensure(
+        runtime.len() == 1 && runtime[0].1 == handle.initial,
+        "pending abort runtime mismatch",
+    )?;
+    let derived = history_format(c, runtime[0].0)?;
+    recovery::verify_history(c, derived)?;
+    super::verify_certified(c, Some(trust))?;
+    capacity::verify_schema(c)?;
+    capacity::verify_accounting(c)?;
+    schema_contract::verify(c, &handle.adapter, &handle.contract)?;
+    sql_snapshot::verify_binding(c, &handle.adapter, &snapshot::scope(&handle.identity))
+}
+
+/// Secondary first, mirroring `finalize_pair`.
+pub(crate) fn abort_pair<A: ReplicatedSchema>(
+    primary: &mut PendingMaintenanceHandle<A>,
+    secondary: &mut PendingMaintenanceHandle<A>,
+    journal: &crate::recovery::transition::Journal,
+    trust: &crate::recovery::transition::TrustStore,
+    policy: &impl crate::recovery::transition::Policy,
+) -> Result<()> {
+    finish_abort(secondary, journal, trust, policy)?;
+    finish_abort(primary, journal, trust, policy)
+}
+
 fn validate_pending<A: ReplicatedSchema>(
     c: &Connection,
     adapter: &A,
@@ -1127,13 +1450,30 @@ fn validate_pending<A: ReplicatedSchema>(
         "pending progress integrity",
     )?;
     ensure(
-        progress.format == 1
+        matches!(progress.format, 1 | 2)
             && matches!(
                 progress.phase.as_str(),
-                "prepared" | "decided" | "applied" | "complete"
+                "prepared" | "decided" | "applied" | "complete" | "aborting"
             )
             && &progress.request == expected,
         "unsupported pending phase",
+    )?;
+    // Format 1 is exactly what it always was: no abort, never aborting.
+    ensure(
+        progress.format != 1 || (progress.abort.is_none() && progress.phase != "aborting"),
+        "unsupported pending phase",
+    )?;
+    // An aborting node is one-way: it carries a signed abort, has no completion
+    // and its decision state must match what the abort was issued against.
+    ensure(
+        progress.phase != "aborting"
+            || (progress.format == 2
+                && progress.completion.is_none()
+                && progress
+                    .abort
+                    .as_ref()
+                    .is_some_and(|a| progress.decision.is_some() == a.decided)),
+        "pending abort state mismatch",
     )?;
     schema_contract::verify(c, adapter, contract)?;
     sql_snapshot::verify_binding(c, adapter, &snapshot::scope(identity))?;
@@ -1272,6 +1612,15 @@ fn validate_pending<A: ReplicatedSchema>(
         } else if progress.phase == "complete" {
             progress.decision == Some(verified.token_digest())
                 && progress.completion.is_some_and(|id| id != [0; 32])
+        } else if progress.phase == "aborting" {
+            // An abort may cancel a transition that was never decided, so the
+            // decision is present exactly when the abort says it was.
+            progress.completion.is_none()
+                && progress.decision
+                    == progress
+                        .abort
+                        .as_ref()
+                        .and_then(|a| a.decided.then_some(verified.token_digest()))
         } else {
             progress.decision == Some(verified.token_digest()) && progress.completion.is_none()
         },
@@ -1336,7 +1685,7 @@ fn validate_pending<A: ReplicatedSchema>(
         }
     }
     ensure(
-        certified_history || matches!(progress.phase.as_str(), "prepared" | "decided"),
+        certified_history || matches!(progress.phase.as_str(), "prepared" | "decided" | "aborting"),
         "pending certified segment mismatch",
     )?;
     let seal_json = singleton_text(c, "recovery_seal", "plan", 32 * 1024)?;
@@ -1440,6 +1789,17 @@ mod tests {
             _: &crate::recovery::transition::Participant,
         ) -> terrapi_vesta_recovery::Result<()> {
             Ok(())
+        }
+
+        fn abort_applicable(
+            &self,
+            _: &crate::recovery::transition::JournalScope,
+            _: &crate::recovery::transition::MaintenanceAbort,
+        ) -> terrapi_vesta_recovery::Result<()> {
+            if self.revoke_on_check.replace(false) {
+                self.current.set(false);
+            }
+            ensure(self.current.get(), "stale pending authority")
         }
     }
 
@@ -2666,19 +3026,109 @@ mod tests {
             }
             assert!(fixture.pair.p.checkpoint().is_ok());
         }
-        // The check itself refuses both shapes directly.
-        let fixture = lifecycle("appliable-direct")?;
-        fixture.pair.s.connection(|c| {
-            refused(
-                require_appliable_for_test(c, true, 1),
-                "requires certified maintenance format",
-            );
-            refused(
-                require_appliable_for_test(c, false, 2),
-                "requires a node without legacy compaction",
-            );
-            Ok(())
-        })?;
+        // The real check, driven on a scratch database that carries exactly the
+        // durable shapes it is meant to refuse.
+        let scratch = Connection::open_in_memory()?;
+        scratch.execute_batch(
+            "CREATE TABLE node_maintenance_format(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL);
+             INSERT INTO node_maintenance_format VALUES(1,1);
+             CREATE TABLE node_publication_pins(pin TEXT PRIMARY KEY NOT NULL,digest TEXT NOT NULL);",
+        )?;
+        // A clean version-1 node is appliable.
+        require_appliable(&scratch)?;
+        // A pin is refused.
+        scratch.execute("INSERT INTO node_publication_pins VALUES('t','d')", [])?;
+        refused(
+            require_appliable(&scratch),
+            "snapshot publication is pinned",
+        );
+        scratch.execute("DELETE FROM node_publication_pins", [])?;
+        require_appliable(&scratch)?;
+        // Legacy compaction tables without certificates are refused.
+        scratch.execute_batch(
+            "CREATE TABLE node_compaction_root(id INTEGER PRIMARY KEY CHECK(id=1),base TEXT NOT NULL)",
+        )?;
+        refused(
+            require_appliable(&scratch),
+            "requires a node without legacy compaction",
+        );
+        scratch.execute_batch("DROP TABLE node_compaction_root")?;
+        scratch.execute_batch(
+            "CREATE TABLE node_compaction_history(sequence INTEGER PRIMARY KEY,plan TEXT NOT NULL,digest TEXT NOT NULL)",
+        )?;
+        refused(
+            require_appliable(&scratch),
+            "requires a node without legacy compaction",
+        );
+        scratch.execute_batch("DROP TABLE node_compaction_history")?;
+        // Maintenance version 2 (legacy compaction) is refused.
+        scratch.execute(
+            "UPDATE node_maintenance_format SET version=2 WHERE id=1",
+            [],
+        )?;
+        refused(
+            require_appliable(&scratch),
+            "requires a node without legacy compaction",
+        );
+        // Certificates present require the certified format.
+        scratch.execute_batch(
+            "CREATE TABLE node_compaction_certificates(sequence INTEGER PRIMARY KEY,record TEXT NOT NULL)",
+        )?;
+        refused(
+            require_appliable(&scratch),
+            "requires certified maintenance format",
+        );
+        scratch.execute(
+            "UPDATE node_maintenance_format SET version=3 WHERE id=1",
+            [],
+        )?;
+        require_appliable(&scratch)?;
+        Ok(())
+    }
+
+    /// Format-1 progress rows are byte-identical to what the pre-abort code
+    /// wrote: `abort` is skipped entirely when absent.
+    #[test]
+    fn format_one_progress_rows_are_byte_identical() -> Result<()> {
+        let pair = support::certified_pair("golden", [68; 32], "golden")?;
+        let prepared = Prepared {
+            format: 1,
+            phase: "prepared".into(),
+            plan: pair.plan.clone(),
+            request: pair.request.clone(),
+            token: pair.token.clone(),
+            decision: None,
+            completion: None,
+            abort: None,
+        };
+        let json = serde_json::to_string(&prepared)?;
+        assert!(
+            !json.contains("abort"),
+            "format 1 row mentions abort: {json}"
+        );
+        // The stored shape is exactly the seven historical fields.
+        let value: serde_json::Value = serde_json::from_str(&json)?;
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .ok_or("progress is not an object")?
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "completion",
+                "decision",
+                "format",
+                "phase",
+                "plan",
+                "request",
+                "token"
+            ]
+        );
+        // And it still round-trips through the format-2 struct.
+        assert_eq!(serde_json::from_str::<Prepared>(&json)?, prepared);
         Ok(())
     }
 
@@ -2966,6 +3416,581 @@ mod tests {
             "node has no pending certified maintenance",
         );
         drop(dir);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // S7: maintenance abort (C1) end to end.
+    // -----------------------------------------------------------------------
+
+    /// Everything an abort scenario needs, with both handles already open.
+    struct Aborting {
+        dir: tempfile::TempDir,
+        identity: Identity<SchemaId>,
+        request: crate::recovery::transition::Request,
+        trust: crate::recovery::transition::TrustStore,
+        key: ring::signature::EcdsaKeyPair,
+        journal: crate::recovery::transition::Journal,
+        authority: Authority,
+        primary_path: std::path::PathBuf,
+        secondary_path: std::path::PathBuf,
+        never: (crate::recovery::transition::MaintenanceAbort, String),
+        decided: (crate::recovery::transition::MaintenanceAbort, String),
+    }
+
+    impl Aborting {
+        fn open(&self, role: Role) -> Result<PendingMaintenanceHandle<StockSchema>> {
+            PendingMaintenanceHandle::open_existing(
+                match role {
+                    Role::Primary => &self.primary_path,
+                    Role::Secondary => &self.secondary_path,
+                },
+                role,
+                self.identity.clone(),
+                "fixture",
+                StockSchema,
+                &self.request,
+                &self.trust,
+            )
+        }
+        fn handles(
+            &self,
+        ) -> Result<(
+            PendingMaintenanceHandle<StockSchema>,
+            PendingMaintenanceHandle<StockSchema>,
+        )> {
+            Ok((self.open(Role::Primary)?, self.open(Role::Secondary)?))
+        }
+        fn abort(&self, decided: bool) -> crate::recovery::transition::MaintenanceAbort {
+            if decided {
+                self.decided.0.clone()
+            } else {
+                self.never.0.clone()
+            }
+        }
+        fn token(&self, decided: bool) -> String {
+            if decided {
+                self.decided.1.clone()
+            } else {
+                self.never.1.clone()
+            }
+        }
+        /// Is this node still pending? Once the abort finished it is an
+        /// ordinary node again and the sequence has converged.
+        fn pending(&self, role: Role) -> Result<bool> {
+            let path = match role {
+                Role::Primary => &self.primary_path,
+                Role::Secondary => &self.secondary_path,
+            };
+            let db = Vesta::open_read_only_with_passphrase(path, "fixture")?;
+            Ok(db.with_connection(|c| {
+                c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='node_pending_certified_maintenance')",
+                    [],
+                    |r| r.get(0),
+                )
+            })?)
+        }
+        /// Run the whole sequence from the top; every earlier step converges.
+        /// A node that is no longer pending has already converged.
+        fn run(&self, decided: bool) -> Result<()> {
+            if !self.pending(Role::Primary)? && !self.pending(Role::Secondary)? {
+                self.journal
+                    .fetch_abort(&self.request, &self.trust.as_trust(), &self.authority)?;
+                return Ok(());
+            }
+            let abort = self.abort(decided);
+            let token = self.token(decided);
+            let (mut h, mut hs) = self.handles()?;
+            if decided && h.prepared.phase == "prepared" {
+                decide_prepared(&h, &hs, &self.journal, 15, &self.trust, &self.authority)?;
+                record_decided(&mut h, &self.journal, &self.trust, &self.authority)?;
+                record_decided(&mut hs, &self.journal, &self.trust, &self.authority)?;
+            }
+            begin_abort(&mut h, &abort, &token, 15, &self.trust)?;
+            begin_abort(&mut hs, &abort, &token, 15, &self.trust)?;
+            abort_authority(
+                &h,
+                &hs,
+                &self.journal,
+                &abort,
+                &token,
+                15,
+                &self.trust,
+                &self.authority,
+            )?;
+            abort_pair(&mut h, &mut hs, &self.journal, &self.trust, &self.authority)?;
+            Ok(())
+        }
+    }
+
+    fn aborting(seed: &str) -> Result<Aborting> {
+        let pair = support::certified_pair(seed, [61; 32], "abort")?;
+        let journal = crate::recovery::transition::Journal::create(
+            &pair.dir.path().join("abort-journal"),
+            "journal-fixture",
+            support::journal_scope(&pair.request),
+        )?;
+        let support::CertifiedPair {
+            dir,
+            mut p,
+            mut s,
+            plan,
+            request,
+            token,
+            trust,
+            key,
+        } = pair;
+        prepare_pair(&mut p, &mut s, &plan, &request, &token, 15, &trust)?;
+        let identity = p.identity().clone();
+        let primary_path = dir.path().join("candidate1");
+        let secondary_path = dir.path().join("survivor");
+        drop(p);
+        drop(s);
+        let request_for_aborts = request.clone();
+        let revision = request.revision;
+        let never = {
+            let abort = support::abort_of(&request_for_aborts, 60, false, revision)?;
+            let token = support::sign_abort(&key, &abort, (10, 20))?;
+            (abort, token)
+        };
+        let decided = {
+            let abort = support::abort_of(&request_for_aborts, 60, true, revision)?;
+            let token = support::sign_abort(&key, &abort, (10, 20))?;
+            (abort, token)
+        };
+        Ok(Aborting {
+            dir,
+            identity,
+            request,
+            trust,
+            key,
+            journal,
+            authority: Authority {
+                current: Cell::new(true),
+                revoke_on_check: Cell::new(false),
+            },
+            primary_path,
+            secondary_path,
+            never,
+            decided,
+        })
+    }
+
+    /// The pair is ordinary again: it opens, writes, and the secondary
+    /// re-confirms its checkpoint (readiness is deliberately not restored).
+    fn assert_pair_usable(f: &Aborting) -> Result<(u64, Node<StockSchema>, Node<StockSchema>)> {
+        refused(
+            peek_pending(&f.primary_path, &f.identity, "fixture"),
+            "node has no pending certified maintenance",
+        );
+        refused(
+            peek_pending(&f.secondary_path, &f.identity, "fixture"),
+            "node has no pending certified maintenance",
+        );
+        let mut p = Node::open(
+            &f.primary_path,
+            Role::Primary,
+            f.identity.clone(),
+            "fixture",
+            StockSchema,
+        )?;
+        let mut s = Node::open(
+            &f.secondary_path,
+            Role::Secondary,
+            f.identity.clone(),
+            "fixture",
+            StockSchema,
+        )?;
+        let before = p.checkpoint()?.sequence;
+        let mut batch = stock_entry().batch;
+        batch.operation_id = format!("after-abort-{before}");
+        let result = commit(&mut p, &mut s, batch)?;
+        assert_eq!(result.sequence, before + 1);
+        assert_eq!(p.checkpoint()?, s.checkpoint()?);
+        Ok((before + 1, p, s))
+    }
+
+    /// (+) The scenario this mechanism exists for: the token expires while the
+    /// pair is PREPARED, so the transition can never be decided.
+    #[test]
+    fn expired_token_prepared_pair_aborts_and_becomes_ordinary_again() -> Result<()> {
+        let f = aborting("abort-never-decided")?;
+        // The token is only valid in [10, 20); the decision now fails for ever.
+        let (h, hs) = f.handles()?;
+        refused(
+            decide_prepared(&h, &hs, &f.journal, 999, &f.trust, &f.authority),
+            "time window",
+        );
+        drop(h);
+        drop(hs);
+
+        f.run(false)?;
+        // Exact retry of the whole sequence converges.
+        f.run(false)?;
+        let (sequence, p, s) = assert_pair_usable(&f)?;
+        assert!(sequence > 0);
+        drop(p);
+        drop(s);
+        drop(f);
+        Ok(())
+    }
+
+    /// (+) Same for a transition that was decided but never applied.
+    #[test]
+    fn decided_but_unapplied_pair_aborts_and_becomes_ordinary_again() -> Result<()> {
+        let f = aborting("abort-decided")?;
+        f.run(true)?;
+        f.run(true)?;
+        let (_, p, s) = assert_pair_usable(&f)?;
+        drop(p);
+        drop(s);
+        drop(f);
+        Ok(())
+    }
+
+    /// (+) After the abort the pair can run a completely fresh certified cycle
+    /// at the next revision, and the aborted one can never be re-decided.
+    #[test]
+    fn aborted_pair_completes_a_fresh_certified_cycle() -> Result<()> {
+        let f = aborting("abort-then-fresh")?;
+        f.run(false)?;
+        let (_, mut p, mut s) = assert_pair_usable(&f)?;
+
+        // The aborted revision is consumed; a new request takes the next one.
+        let old = p
+            .plan_compaction()?
+            .publication
+            .ok_or("publication missing")?;
+        let old_s = s
+            .plan_compaction()?
+            .publication
+            .ok_or("publication missing")?;
+        p.rotate_snapshot(&old)?;
+        s.rotate_snapshot(&old_s)?;
+        let plan = compaction::PairPlan {
+            id: [62; 32],
+            primary: p.plan_compaction()?,
+            secondary: s.plan_compaction()?,
+        };
+        plan.validate_certified()?;
+        let mut fresh = f.request.clone();
+        fresh.id = [63; 32];
+        fresh.revision = f.request.revision + 1;
+        fresh.participants = [
+            crate::recovery::transition::Participant {
+                generation: p.connection(checkpoint::generation)?,
+                old_base: plan
+                    .primary
+                    .head
+                    .base
+                    .as_ref()
+                    .map(support::cut)
+                    .transpose()?,
+                target: support::cut(&plan.primary.checkpoint)?,
+                plan: support::digest_of(&plan)?,
+                publication: support::digest_of(
+                    plan.primary.publication.as_ref().ok_or("publication")?,
+                )?,
+                ..f.request.participants[0].clone()
+            },
+            crate::recovery::transition::Participant {
+                generation: s.connection(checkpoint::generation)?,
+                old_base: plan
+                    .secondary
+                    .head
+                    .base
+                    .as_ref()
+                    .map(support::cut)
+                    .transpose()?,
+                target: support::cut(&plan.secondary.checkpoint)?,
+                plan: support::digest_of(&plan)?,
+                publication: support::digest_of(
+                    plan.secondary.publication.as_ref().ok_or("publication")?,
+                )?,
+                ..f.request.participants[1].clone()
+            },
+        ];
+        let token = super::super::certified::tests::sign(&f.key, &fresh)?;
+        prepare_pair(&mut p, &mut s, &plan, &fresh, &token, 15, &f.trust)?;
+        drop(p);
+        drop(s);
+        let mut h = PendingMaintenanceHandle::open_existing(
+            &f.primary_path,
+            Role::Primary,
+            f.identity.clone(),
+            "fixture",
+            StockSchema,
+            &fresh,
+            &f.trust,
+        )?;
+        let mut hs = PendingMaintenanceHandle::open_existing(
+            &f.secondary_path,
+            Role::Secondary,
+            f.identity.clone(),
+            "fixture",
+            StockSchema,
+            &fresh,
+            &f.trust,
+        )?;
+        decide_prepared(&h, &hs, &f.journal, 15, &f.trust, &f.authority)?;
+        record_decided(&mut h, &f.journal, &f.trust, &f.authority)?;
+        record_decided(&mut hs, &f.journal, &f.trust, &f.authority)?;
+        apply_decided(&mut h, &f.journal, &f.trust, &f.authority)?;
+        apply_decided(&mut hs, &f.journal, &f.trust, &f.authority)?;
+        acknowledge_applied(&h, &f.journal, &f.trust, &f.authority)?;
+        acknowledge_applied(&hs, &f.journal, &f.trust, &f.authority)?;
+        complete_authority(&h, &hs, &f.journal, &f.trust, &f.authority)?;
+        record_complete(&mut h, &f.journal, &f.trust, &f.authority)?;
+        record_complete(&mut hs, &f.journal, &f.trust, &f.authority)?;
+        finalize_pair(&mut h, &mut hs, &f.journal, &f.trust, &f.authority)?;
+        drop(h);
+        drop(hs);
+        // The previously aborted request can never be decided again.
+        drop(f);
+        Ok(())
+    }
+
+    /// (−) Everything the one-way door must refuse.
+    #[test]
+    fn abort_is_one_way_and_binds_to_its_request() -> Result<()> {
+        let f = aborting("abort-negatives")?;
+        let abort = f.abort(false);
+        let token = f.token(false);
+
+        // An abort for another request or revision is refused.
+        let mut foreign = f.request.clone();
+        foreign.id = [64; 32];
+        let other = support::abort_of(&foreign, 65, false, foreign.revision)?;
+        let other_token = support::sign_abort(&f.key, &other, (10, 20))?;
+        let (mut h, mut hs) = f.handles()?;
+        refused(
+            begin_abort(&mut h, &other, &other_token, 15, &f.trust),
+            "pending abort binding mismatch",
+        );
+        // An expired or foreign token never starts an abort.
+        refused(
+            begin_abort(&mut h, &abort, &token, 999, &f.trust),
+            "time window",
+        );
+        let attacker = super::super::certified::tests::signer()?.0;
+        let forged = support::sign_abort(&attacker, &abort, (10, 20))?;
+        refused(
+            begin_abort(&mut h, &abort, &forged, 15, &f.trust),
+            "signature",
+        );
+        // `decided: true` while the node is only prepared is refused.
+        let wrong_phase = support::abort_of(&f.request, 66, true, f.request.revision)?;
+        let wrong_phase_token = support::sign_abort(&f.key, &wrong_phase, (10, 20))?;
+        refused(
+            begin_abort(&mut h, &wrong_phase, &wrong_phase_token, 15, &f.trust),
+            "invalid pending abort transition",
+        );
+
+        // One node aborting is not evidence: the journal records nothing.
+        begin_abort(&mut h, &abort, &token, 15, &f.trust)?;
+        refused(
+            abort_authority(
+                &h,
+                &hs,
+                &f.journal,
+                &abort,
+                &token,
+                15,
+                &f.trust,
+                &f.authority,
+            ),
+            "pending node is not aborting",
+        );
+        refused(
+            f.journal
+                .fetch_abort(&f.request, &f.trust.as_trust(), &f.authority),
+            "maintenance abort missing",
+        );
+        // `finish_abort` before the journal abort is refused.
+        refused(
+            finish_abort(&mut h, &f.journal, &f.trust, &f.authority),
+            "maintenance abort missing",
+        );
+
+        // From `aborting` no lifecycle call may roll forward.
+        refused(
+            record_decided(&mut h, &f.journal, &f.trust, &f.authority),
+            "invalid pending decision transition",
+        );
+        refused(
+            apply_decided(&mut h, &f.journal, &f.trust, &f.authority),
+            "invalid pending apply transition",
+        );
+        refused(
+            acknowledge_applied(&h, &f.journal, &f.trust, &f.authority),
+            "pending node is not applied",
+        );
+        refused(
+            record_complete(&mut h, &f.journal, &f.trust, &f.authority),
+            "transition missing",
+        );
+        refused(
+            finalize_node(&mut h, &f.journal, &f.trust, &f.authority),
+            "pending node is not complete",
+        );
+        // A different abort on an already aborting node is a conflict, and an
+        // abort for another request is still a binding mismatch.
+        refused(
+            begin_abort(&mut h, &wrong_phase, &wrong_phase_token, 15, &f.trust),
+            "pending abort conflict",
+        );
+        refused(
+            begin_abort(&mut h, &other, &other_token, 15, &f.trust),
+            "pending abort binding mismatch",
+        );
+        let same_request_other_id = support::abort_of(&f.request, 67, false, f.request.revision)?;
+        let same_request_other_token =
+            support::sign_abort(&f.key, &same_request_other_id, (10, 20))?;
+        refused(
+            begin_abort(
+                &mut h,
+                &same_request_other_id,
+                &same_request_other_token,
+                15,
+                &f.trust,
+            ),
+            "pending abort conflict",
+        );
+        // Exact retry on an aborting node is a no-op.
+        begin_abort(&mut h, &abort, &token, 15, &f.trust)?;
+
+        // With both aborting the authority records it, and only then does
+        // `finish_abort` succeed.
+        begin_abort(&mut hs, &abort, &token, 15, &f.trust)?;
+        abort_authority(
+            &h,
+            &hs,
+            &f.journal,
+            &abort,
+            &token,
+            15,
+            &f.trust,
+            &f.authority,
+        )?;
+        abort_pair(&mut h, &mut hs, &f.journal, &f.trust, &f.authority)?;
+        drop(h);
+        drop(hs);
+        assert_pair_usable(&f)?;
+        Ok(())
+    }
+
+    /// (−) An applied node can never be aborted.
+    #[test]
+    fn abort_is_refused_after_apply() -> Result<()> {
+        let f = aborting("abort-after-apply")?;
+        let (mut h, mut hs) = f.handles()?;
+        decide_prepared(&h, &hs, &f.journal, 15, &f.trust, &f.authority)?;
+        record_decided(&mut h, &f.journal, &f.trust, &f.authority)?;
+        record_decided(&mut hs, &f.journal, &f.trust, &f.authority)?;
+        apply_decided(&mut h, &f.journal, &f.trust, &f.authority)?;
+        let abort = f.abort(true);
+        let token = f.token(true);
+        refused(
+            begin_abort(&mut h, &abort, &token, 15, &f.trust),
+            "invalid pending abort transition",
+        );
+        // The still-decided peer may begin, but the authority refuses because
+        // the applied node is not aborting.
+        begin_abort(&mut hs, &abort, &token, 15, &f.trust)?;
+        refused(
+            abort_authority(
+                &h,
+                &hs,
+                &f.journal,
+                &abort,
+                &token,
+                15,
+                &f.trust,
+                &f.authority,
+            ),
+            "pending node is not aborting",
+        );
+        Ok(())
+    }
+
+    /// (−) The default policy denies every abort.
+    #[test]
+    fn default_policy_refuses_to_record_an_abort() -> Result<()> {
+        struct Bare;
+        impl crate::recovery::transition::Policy for Bare {
+            fn continuity(
+                &self,
+                _: &crate::recovery::transition::JournalScope,
+                _: &crate::recovery::transition::Request,
+            ) -> terrapi_vesta_recovery::Result<()> {
+                Ok(())
+            }
+            fn prepared(
+                &self,
+                _: &crate::recovery::transition::JournalScope,
+                _: &crate::recovery::transition::Request,
+                _: &crate::recovery::transition::Participant,
+            ) -> terrapi_vesta_recovery::Result<()> {
+                Ok(())
+            }
+            fn applied(
+                &self,
+                _: &crate::recovery::transition::JournalScope,
+                _: &crate::recovery::transition::CommittedTransition,
+                _: &crate::recovery::transition::Participant,
+            ) -> terrapi_vesta_recovery::Result<()> {
+                Ok(())
+            }
+        }
+        let f = aborting("abort-default-deny")?;
+        let abort = f.abort(false);
+        let token = f.token(false);
+        let (mut h, mut hs) = f.handles()?;
+        begin_abort(&mut h, &abort, &token, 15, &f.trust)?;
+        begin_abort(&mut hs, &abort, &token, 15, &f.trust)?;
+        refused(
+            abort_authority(&h, &hs, &f.journal, &abort, &token, 15, &f.trust, &Bare),
+            "maintenance abort evidence missing",
+        );
+        Ok(())
+    }
+
+    /// (crash) Drop everything at each boundary, reopen from disk and replay
+    /// the whole sequence from the top.
+    #[test]
+    fn abort_survives_a_crash_at_every_boundary() -> Result<()> {
+        let f = aborting("abort-crash")?;
+        let abort = f.abort(false);
+        let token = f.token(false);
+
+        // After the first begin_abort only.
+        {
+            let mut h = f.open(Role::Primary)?;
+            begin_abort(&mut h, &abort, &token, 15, &f.trust)?;
+        }
+        assert_eq!(
+            peek_pending(&f.primary_path, &f.identity, "fixture")?.phase,
+            "aborting"
+        );
+        assert_eq!(
+            peek_pending(&f.secondary_path, &f.identity, "fixture")?.phase,
+            "prepared"
+        );
+        f.run(false)?;
+
+        // After both begin_abort, before the journal abort: the previous run
+        // already recorded it, so re-running is the converging retry path.
+        f.run(false)?;
+        assert_eq!(
+            f.journal
+                .fetch_abort(&f.request, &f.trust.as_trust(), &f.authority)?
+                .abort()
+                .id,
+            abort.id
+        );
+        // Both nodes are ordinary again and stay that way across the replays.
+        assert_pair_usable(&f)?;
         Ok(())
     }
 }
