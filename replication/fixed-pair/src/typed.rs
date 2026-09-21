@@ -244,6 +244,17 @@ impl<A: ReplicatedSchema> Node<A> {
         sql_snapshot::verify_binding(c, &self.adapter, &snapshot::scope(&self.identity))
     }
     fn admission(&self, c: &Connection) -> Result<()> {
+        // A durably installed participant-loss successor membership closes
+        // ordinary admission on both nodes. This gate only ever closes: it
+        // grants nothing, and the completed-authority check replaces it later.
+        ensure(
+            !c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='recovery_loss_active')",
+                [],
+                |r| r.get::<_, bool>(0),
+            )?,
+            "participant-loss recovery not complete; data admission closed",
+        )?;
         self.verify_owner(c)?;
         self.verify_current_certified(c)?;
         maintenance::compaction::require_idle(c)?;
