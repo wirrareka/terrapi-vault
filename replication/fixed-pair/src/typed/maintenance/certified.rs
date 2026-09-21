@@ -280,6 +280,24 @@ pub(in crate::typed) fn verify_metadata(
         count > 0 && count <= MAX_ROWS,
         "certificate history row limit",
     )?;
+    let (history_rows, history_bytes): (u64, u64) = c.query_row(
+        "SELECT count(*),coalesce(max(length(CAST(plan AS BLOB))),0) FROM node_compaction_history",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    ensure(
+        history_rows <= MAX_ROWS && history_bytes <= 128 * 1024,
+        "compaction history row limit",
+    )?;
+    let (root_rows, root_bytes): (u64, u64) = c.query_row(
+        "SELECT count(*),coalesce(max(length(CAST(base AS BLOB))),0) FROM node_compaction_root",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    ensure(
+        root_rows == 1 && root_bytes <= 256 * 1024,
+        "compaction root limit",
+    )?;
     let root: String = c.query_row(
         "SELECT base FROM node_compaction_root WHERE id=1",
         [],

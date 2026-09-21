@@ -5,7 +5,6 @@ use crate::recovery::transition;
 use sha2::{Digest, Sha256};
 #[cfg(any(test, feature = "experimental-recovery"))]
 use std::{
-    fs::OpenOptions,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
@@ -130,11 +129,7 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
             .canonicalize()?
             .join(path.file_name().ok_or("missing filename")?);
         ensure(path.is_file() && !path.is_symlink(), "loss survivor absent")?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path.with_extension("node-lock"))?;
-        lock.try_lock()?;
+        let lock = crate::typed::open_node_lock(&path)?;
         let scratch = Connection::open_in_memory()?;
         schema::initialize(&scratch, &adapter)?;
         let contract = schema_contract::describe(&scratch, &adapter)?;
@@ -1436,14 +1431,30 @@ impl<A: ReplicatedSchema, P: transition::LossPolicy> transition::LossPolicy
 /// Local bridge from two durable installs to a completed successor membership:
 /// acknowledge the survivor, then the replacement, then complete. Every step is
 /// idempotent and converges on retry; a different completion id is refused.
+/// The completion id is derived, never chosen: a function of the exact
+/// successor request, the exact issued token and the acknowledgements that
+/// authorised it. A retry always recomputes the same value.
+#[cfg(any(test, feature = "experimental-recovery"))]
+pub(crate) fn completion_id(
+    request: &transition::LossSuccessorRequest,
+    token_digest: [u8; 32],
+    acknowledgements: [bool; 2],
+) -> Result<[u8; 32]> {
+    id(&(
+        "terrapi-loss-successor-completion",
+        request.id,
+        token_digest,
+        acknowledgements,
+    ))
+}
+
+#[cfg(any(test, feature = "experimental-recovery"))]
 pub fn complete_successor<A: ReplicatedSchema, P: transition::LossPolicy>(
     survivor: &LossSurvivorHandle<A>,
     replacement: &Node<A>,
     successor: &transition::LossSuccessorRequest,
-    completion: [u8; 32],
     authorities: &Authorities<'_, P>,
 ) -> Result<()> {
-    ensure(completion != [0; 32], "zero participant-loss completion")?;
     // Both nodes must have been configured with the same trust store.
     ensure(
         replacement.transition_trust.as_ref() == Some(&survivor.trust),
@@ -1474,6 +1485,11 @@ pub fn complete_successor<A: ReplicatedSchema, P: transition::LossPolicy>(
     ensure(
         decision.acknowledgements() == [true; 2],
         "participant-loss acknowledgements incomplete",
+    )?;
+    let completion = completion_id(
+        decision.request(),
+        decision.token_digest(),
+        decision.acknowledgements(),
     )?;
     journal.complete_loss_successor(
         &decision,

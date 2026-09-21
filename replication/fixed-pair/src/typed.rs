@@ -60,6 +60,43 @@ pub trait CertifiedAuthority: Send + Sync {
     }
 }
 
+/// Take the node lock beside `path`. The file name is unchanged for
+/// compatibility; only its nature is checked. A symlink, directory, FIFO or
+/// device in that position is refused before and after the open, so the lock
+/// can never be redirected at something else.
+fn node_lock_path(path: &Path) -> std::path::PathBuf {
+    path.with_extension("node-lock")
+}
+
+fn lock_regular_file(lock: &Path, create: bool) -> Result<File> {
+    if let Ok(existing) = std::fs::symlink_metadata(lock) {
+        ensure(existing.is_file(), "node lock is not a regular file")?;
+    }
+    let file = OpenOptions::new()
+        .create(create)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock)?;
+    ensure(
+        file.metadata()?.is_file() && std::fs::symlink_metadata(lock)?.is_file(),
+        "node lock is not a regular file",
+    )?;
+    file.try_lock()?;
+    Ok(file)
+}
+
+/// Create the lock if it is missing. Used by the ordinary node open, which also
+/// creates the database.
+pub(crate) fn create_node_lock(path: &Path) -> Result<File> {
+    lock_regular_file(&node_lock_path(path), true)
+}
+
+/// Take an existing lock only. Used by every restricted handle.
+pub(crate) fn open_node_lock(path: &Path) -> Result<File> {
+    lock_regular_file(&node_lock_path(path), false)
+}
+
 pub struct Node<A: ReplicatedSchema> {
     db: Vesta,
     adapter: A,
@@ -147,13 +184,7 @@ impl<A: ReplicatedSchema> Node<A> {
             .canonicalize()?
             .join(path.file_name().ok_or("missing filename")?);
         ensure(!path.is_symlink(), "symlink database unsupported")?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path.with_extension("node-lock"))?;
-        lock.try_lock()?;
+        let lock = create_node_lock(&path)?;
         let existing = path.exists();
         let db = if existing {
             Vesta::open(&path, passphrase)?

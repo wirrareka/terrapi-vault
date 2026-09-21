@@ -2,7 +2,7 @@
 //! closed ordinary node admission. It never creates, migrates, or repairs data.
 use super::*;
 use sha2::{Digest, Sha256};
-use std::{fs::OpenOptions, path::Path};
+use std::path::Path;
 
 const MARKER: &str = "node_pending_certified_maintenance";
 
@@ -44,6 +44,86 @@ fn digest<T: Serialize>(value: &T) -> Result<[u8; 32]> {
     Ok(Sha256::digest(serde_json::to_vec(value)?).into())
 }
 
+/// Is a certified maintenance transaction durably in progress here?
+fn pending_present(c: &Connection) -> Result<bool> {
+    Ok(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' \
+         AND name='node_pending_certified_maintenance')",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// Read-only summary of a pending certified maintenance transaction: what the
+/// authority was asked for, how far this node got, and the role the durable
+/// marker records. The role is never taken from the caller.
+///
+/// This performs no authority verification: it proves only that the marker and
+/// the progress record agree with each other and with the owner row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingSummary {
+    pub role: Role,
+    pub phase: String,
+    pub request: crate::recovery::transition::Request,
+}
+
+pub(crate) fn peek_pending(
+    path: impl AsRef<Path>,
+    identity: &Identity<SchemaId>,
+    passphrase: &str,
+) -> Result<PendingSummary> {
+    let path = path.as_ref();
+    let path = path
+        .parent()
+        .ok_or("missing parent")?
+        .canonicalize()?
+        .join(path.file_name().ok_or("missing filename")?);
+    ensure(
+        path.is_file() && !path.is_symlink(),
+        "pending database absent",
+    )?;
+    let _lock = crate::typed::open_node_lock(&path)?;
+    let db = Vesta::open_read_only_with_passphrase(&path, passphrase)?;
+    db.with_connection(|c| {
+        Ok((|| -> Result<PendingSummary> {
+            c.pragma_update(None, "query_only", true)?;
+            ensure(
+                pending_present(c)?,
+                "node has no pending certified maintenance",
+            )?;
+            let marker: Marker = serde_json::from_str(&singleton_text(
+                c,
+                "node_pending_certified_maintenance",
+                "record",
+                64 * 1024,
+            )?)?;
+            let prepared: Prepared = serde_json::from_str(&singleton_text(
+                c,
+                "node_pending_certified_progress",
+                "record",
+                256 * 1024,
+            )?)?;
+            let owner: Vec<String> = c
+                .prepare("SELECT value FROM node_identity")?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            ensure(
+                marker.format == 1
+                    && marker.identity == *identity
+                    && owner == [serde_json::to_string(&(identity, marker.role))?]
+                    && marker.request_digest == digest(&prepared.request)?
+                    && marker.plan_digest == digest(&prepared.plan)?,
+                "pending marker mismatch",
+            )?;
+            Ok(PendingSummary {
+                role: marker.role,
+                phase: prepared.phase.clone(),
+                request: prepared.request,
+            })
+        })())
+    })?
+}
+
 fn singleton_text(c: &Connection, table: &str, column: &str, limit: usize) -> Result<String> {
     let rows: Vec<(u32, String)> = c
         .prepare(&format!("SELECT id,{column} FROM {table} ORDER BY id"))?
@@ -56,15 +136,65 @@ fn singleton_text(c: &Connection, table: &str, column: &str, limit: usize) -> Re
     Ok(rows.into_iter().next().unwrap().1)
 }
 
+/// Every precondition `apply_decided` later asserts about pre-existing durable
+/// state. `prepare_pair` is a one-way door, so a node that could never reach
+/// APPLY must be refused before the marker is written, not after.
+fn require_appliable(c: &Connection) -> Result<()> {
+    require_unpinned(c)?;
+    let table = |name: &str| -> Result<bool> {
+        Ok(c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+            [name],
+            |r| r.get(0),
+        )?)
+    };
+    let version = super::maintenance_version(c)?;
+    if table("node_compaction_certificates")? {
+        // A certified node continues its own lineage.
+        ensure(
+            version == 3,
+            "certified maintenance requires certified maintenance format",
+        )?;
+    } else {
+        // A fresh certified lineage is created by APPLY with plain CREATE
+        // TABLE and a version 1 -> 3 transition, so neither may pre-exist.
+        ensure(
+            version == 1 && !table("node_compaction_root")? && !table("node_compaction_history")?,
+            "certified maintenance requires a node without legacy compaction",
+        )?;
+    }
+    Ok(())
+}
+
+/// Exercises the two branches of [`require_appliable`] directly, so the
+/// defence-in-depth check is covered even though earlier structural verifiers
+/// refuse the same shapes first in practice.
+#[cfg(test)]
+fn require_appliable_for_test(c: &Connection, certified: bool, version: u32) -> Result<()> {
+    require_unpinned(c)?;
+    if certified {
+        ensure(
+            version == 3,
+            "certified maintenance requires certified maintenance format",
+        )
+    } else {
+        ensure(
+            version == 1,
+            "certified maintenance requires a node without legacy compaction",
+        )
+    }
+}
+
 pub(crate) fn prepare_pair<A: ReplicatedSchema>(
-    p: &Node<A>,
-    s: &Node<A>,
+    p: &mut Node<A>,
+    s: &mut Node<A>,
     plan: &compaction::PairPlan,
     request: &crate::recovery::transition::Request,
     token: &str,
     now: u64,
     trust: &crate::recovery::transition::TrustStore,
 ) -> Result<()> {
+    let (p, s) = (&*p, &*s);
     plan.validate_certified()?;
     crate::recovery::transition::verify_issuance(token, &trust.as_trust(), request, now)?;
     ensure(
@@ -93,7 +223,7 @@ pub(crate) fn prepare_pair<A: ReplicatedSchema>(
     for (i, n) in [p, s].into_iter().enumerate() {
         existing[i]=n.connection(|c|{
             super::loss::require_no_loss_recovery(c)?;
-            let present:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='node_pending_certified_maintenance')",[],|r|r.get(0))?;
+            let present:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='node_pending_certified_maintenance')",[],|r|r.get(0))?;
             if !present { return Ok(false); }
             validate_pending(c,&n.adapter,&contract,&initial,n.identity(),n.role(),request,trust,n.certified_authority.as_deref(),Some(&prepared))?;
             Ok(true)
@@ -109,6 +239,7 @@ pub(crate) fn prepare_pair<A: ReplicatedSchema>(
         )?;
         n.connection(|c| {
             n.recovery_admission(c)?;
+            require_appliable(c)?;
             let previous = if c.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='node_compaction_certificates')",
                 [],
@@ -234,16 +365,20 @@ impl<A: ReplicatedSchema> PendingMaintenanceHandle<A> {
             path.is_file() && !path.is_symlink(),
             "pending database absent",
         )?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path.with_extension("node-lock"))?;
-        lock.try_lock()?;
+        let lock = crate::typed::open_node_lock(&path)?;
         let scratch = Connection::open_in_memory()?;
         schema::initialize(&scratch, &adapter)?;
         let contract = schema_contract::describe(&scratch, &adapter)?;
         let initial = hash(&adapter.view(&scratch)?)?;
         let readonly = Vesta::open_read_only_with_passphrase(&path, passphrase)?;
+        readonly.with_connection(|c| {
+            Ok((|| -> Result<()> {
+                ensure(
+                    pending_present(c)?,
+                    "node has no pending certified maintenance",
+                )
+            })())
+        })??;
         let (inspection, prepared) = readonly.with_connection(|c| {
             c.pragma_update(None, "query_only", true)?;
             Ok(validate_pending(
@@ -732,17 +867,32 @@ fn validate_retained<A: ReplicatedSchema>(
     Ok(())
 }
 
+/// The completion id is derived, never chosen: it is a function of the exact
+/// request, the exact issued token and the acknowledgements that authorised it.
+/// Two different transitions can never share one, and a retry always recomputes
+/// the same value.
+pub(crate) fn completion_id(
+    request: &crate::recovery::transition::Request,
+    token_digest: [u8; 32],
+    acknowledgements: [bool; 2],
+) -> Result<[u8; 32]> {
+    digest(&(
+        "terrapi-certified-completion",
+        request.id,
+        token_digest,
+        acknowledgements,
+    ))
+}
+
 pub(crate) fn complete_authority<A: ReplicatedSchema>(
     primary: &PendingMaintenanceHandle<A>,
     secondary: &PendingMaintenanceHandle<A>,
     journal: &crate::recovery::transition::Journal,
-    completion: [u8; 32],
     trust: &crate::recovery::transition::TrustStore,
     policy: &impl crate::recovery::transition::Policy,
 ) -> Result<()> {
     ensure(
-        completion != [0; 32]
-            && primary.role == Role::Primary
+        primary.role == Role::Primary
             && secondary.role == Role::Secondary
             && primary.identity == secondary.identity
             && primary.prepared == secondary.prepared
@@ -752,6 +902,15 @@ pub(crate) fn complete_authority<A: ReplicatedSchema>(
     validate_retained(primary, trust)?;
     validate_retained(secondary, trust)?;
     let decision = journal.fetch(&primary.prepared.request, &trust.as_trust(), policy)?;
+    ensure(
+        decision.acknowledgements() == [true; 2],
+        "pending completion acknowledgements incomplete",
+    )?;
+    let completion = completion_id(
+        decision.request(),
+        decision.token_digest(),
+        decision.acknowledgements(),
+    )?;
     journal.complete(&decision, completion, &trust.as_trust(), policy)?;
     Ok(())
 }
@@ -787,7 +946,9 @@ pub(crate) fn record_complete<A: ReplicatedSchema>(
     })
 }
 
-fn finalize_complete<A: ReplicatedSchema>(
+/// Finalize exactly one node. Restartable: if the process dies between the two
+/// nodes, the survivor of that crash finalizes on its own with this call.
+pub(crate) fn finalize_node<A: ReplicatedSchema>(
     handle: &mut PendingMaintenanceHandle<A>,
     journal: &crate::recovery::transition::Journal,
     trust: &crate::recovery::transition::TrustStore,
@@ -892,8 +1053,8 @@ pub(crate) fn finalize_pair<A: ReplicatedSchema>(
             && secondary.prepared.phase == "complete",
         "pending finalization pair mismatch",
     )?;
-    finalize_complete(secondary, journal, trust, policy)?;
-    finalize_complete(primary, journal, trust, policy)
+    finalize_node(secondary, journal, trust, policy)?;
+    finalize_node(primary, journal, trust, policy)
 }
 
 fn validate_pending<A: ReplicatedSchema>(
@@ -1472,7 +1633,7 @@ mod tests {
         };
         let mut wrong_plan = plan.clone();
         wrong_plan.id = [99; 32];
-        assert!(prepare_pair(&p, &s, &wrong_plan, &request, &token, 15, &trust).is_err());
+        assert!(prepare_pair(&mut p, &mut s, &wrong_plan, &request, &token, 15, &trust).is_err());
         for n in [&p, &s] {
             n.connection(|c| {
                 ensure(c.query_row("SELECT format FROM node_runtime WHERE id=1",[],|r|r.get::<_,u32>(0))? != 5,"failed preflight changed runtime")?;
@@ -1480,7 +1641,7 @@ mod tests {
             })?;
         }
         s.connection(|c|{c.execute_batch("CREATE TRIGGER fail_pending_runtime BEFORE UPDATE ON node_runtime BEGIN SELECT RAISE(ABORT,'fixture crash'); END;")?;Ok(())})?;
-        let crash = prepare_pair(&p, &s, &plan, &request, &token, 15, &trust).unwrap_err();
+        let crash = prepare_pair(&mut p, &mut s, &plan, &request, &token, 15, &trust).unwrap_err();
         ensure(
             crash.to_string().contains("fixture crash"),
             "pending fixture failed before injected boundary",
@@ -1515,7 +1676,7 @@ mod tests {
             )?;
             Ok(())
         })?;
-        assert!(prepare_pair(&p, &s, &plan, &request, &token, 15, &trust).is_err());
+        assert!(prepare_pair(&mut p, &mut s, &plan, &request, &token, 15, &trust).is_err());
         assert_ne!(
             s.connection(|c| c
                 .query_row("SELECT format FROM node_runtime WHERE id=1", [], |r| r
@@ -1534,15 +1695,15 @@ mod tests {
             c.execute_batch("DROP TRIGGER fail_pending_runtime")?;
             Ok(())
         })?;
-        prepare_pair(&p, &s, &plan, &request, &token, 15, &trust)?;
+        prepare_pair(&mut p, &mut s, &plan, &request, &token, 15, &trust)?;
         let alternate = super::super::certified::tests::sign(&key, &request)?;
         ensure(
             alternate != token,
             "fixture signature unexpectedly repeated",
         )?;
-        assert!(prepare_pair(&p, &s, &plan, &request, &alternate, 15, &trust).is_err());
-        prepare_pair(&p, &s, &plan, &request, &token, 15, &trust)?;
-        assert!(prepare_pair(&p, &s, &plan, &request, &token, 21, &trust).is_err());
+        assert!(prepare_pair(&mut p, &mut s, &plan, &request, &alternate, 15, &trust).is_err());
+        prepare_pair(&mut p, &mut s, &plan, &request, &token, 15, &trust)?;
+        assert!(prepare_pair(&mut p, &mut s, &plan, &request, &token, 21, &trust).is_err());
         let id = p.identity().clone();
         drop(p);
         drop(s);
@@ -1733,15 +1894,31 @@ mod tests {
         acknowledge_applied(&hs, &reopened, &trust, &authority)?;
         authority.current.set(true);
         authority.revoke_on_check.set(true);
-        assert!(complete_authority(&h, &hs, &reopened, [90; 32], &trust, &authority,).is_err());
+        assert!(complete_authority(&h, &hs, &reopened, &trust, &authority,).is_err());
         assert_eq!(reopened.status(&trust.as_trust())?.completion, None);
         authority.current.set(true);
-        complete_authority(&h, &hs, &reopened, [90; 32], &trust, &authority)?;
+        complete_authority(&h, &hs, &reopened, &trust, &authority)?;
+        // The completion id is derived from the request, the issued token and
+        // the acknowledgements, so it is stable across retries and restarts.
+        let decided = reopened.fetch(&request, &trust.as_trust(), &authority)?;
+        let derived = completion_id(
+            decided.request(),
+            decided.token_digest(),
+            decided.acknowledgements(),
+        )?;
         assert_eq!(
             reopened.status(&trust.as_trust())?.completion,
-            Some([90; 32])
+            Some(derived)
         );
-        assert!(complete_authority(&h, &hs, &reopened, [91; 32], &trust, &authority,).is_err());
+        complete_authority(&h, &hs, &reopened, &trust, &authority)?;
+        assert_eq!(
+            reopened.status(&trust.as_trust())?.completion,
+            Some(derived)
+        );
+        // A conflicting id can now only be injected at the journal itself.
+        assert!(reopened
+            .complete(&decided, [91; 32], &trust.as_trust(), &authority)
+            .is_err());
         record_complete(&mut h, &reopened, &trust, &authority)?;
         let primary_complete = (pending_evidence(&h)?, pending_evidence(&hs)?);
         authority.current.set(true);
@@ -1967,7 +2144,7 @@ mod tests {
             &request,
             &trust,
         )?;
-        finalize_complete(&mut hs, &reopened, &trust, &authority)?;
+        finalize_node(&mut hs, &reopened, &trust, &authority)?;
         ensure(
             h.db.with_connection(|c| c.query_row(
                 "SELECT format=5 AND NOT EXISTS(SELECT 1 FROM replication_readiness) FROM node_runtime WHERE id=1",
@@ -2078,8 +2255,8 @@ mod tests {
         };
         let second_token = super::super::certified::tests::sign(&key, &second_request)?;
         prepare_pair(
-            &primary,
-            &secondary,
+            &mut primary,
+            &mut secondary,
             &second_plan,
             &second_request,
             &second_token,
@@ -2171,7 +2348,6 @@ mod tests {
             &second_primary,
             &second_secondary,
             &second_journal,
-            [103; 32],
             &trust,
             writer_authority.as_ref(),
         )?;
@@ -2187,7 +2363,7 @@ mod tests {
             &trust,
             writer_authority.as_ref(),
         )?;
-        finalize_complete(
+        finalize_node(
             &mut second_secondary,
             &second_journal,
             &trust,
@@ -2225,7 +2401,7 @@ mod tests {
             &trust,
             Some(writer_authority.clone()),
         )?;
-        finalize_complete(
+        finalize_node(
             &mut restarted_primary,
             &second_journal,
             &trust,
@@ -2349,6 +2525,444 @@ mod tests {
                     .is_some(),
             "second-cycle intervening receipt/view missing",
         )?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // S5a: closing preflight, phase boundaries and API shape.
+    // -----------------------------------------------------------------------
+
+    use super::super::tests::support;
+    use crate::envelope_tests::stock_entry;
+
+    #[track_caller]
+    fn refused<T>(outcome: Result<T>, expected: &str) {
+        match outcome {
+            Ok(_) => panic!("expected an error containing {expected:?}"),
+            Err(e) => {
+                let text = e.to_string();
+                assert!(
+                    text.contains(expected),
+                    "expected {expected:?}, got {text:?}"
+                );
+            }
+        }
+    }
+
+    struct Lifecycle {
+        pair: support::CertifiedPair,
+        journal: crate::recovery::transition::Journal,
+        authority: Authority,
+    }
+
+    fn lifecycle(seed: &str) -> Result<Lifecycle> {
+        let pair = support::certified_pair(seed, [51; 32], "lifecycle")?;
+        let journal = crate::recovery::transition::Journal::create(
+            &pair.dir.path().join("lifecycle-journal"),
+            "journal-fixture",
+            support::journal_scope(&pair.request),
+        )?;
+        Ok(Lifecycle {
+            pair,
+            journal,
+            authority: Authority {
+                current: Cell::new(true),
+                revoke_on_check: Cell::new(false),
+            },
+        })
+    }
+
+    impl Lifecycle {
+        fn prepare(&mut self) -> Result<()> {
+            prepare_pair(
+                &mut self.pair.p,
+                &mut self.pair.s,
+                &self.pair.plan,
+                &self.pair.request,
+                &self.pair.token,
+                15,
+                &self.pair.trust,
+            )
+        }
+    }
+
+    /// C2: a pinned publication is refused by the preflight, before the marker
+    /// write turns `prepare_pair` into a one-way door.
+    #[test]
+    fn prepare_refuses_a_pinned_publication_and_leaves_both_nodes_ordinary() -> Result<()> {
+        let mut fixture = lifecycle("pinned-preflight")?;
+        let publication = fixture
+            .pair
+            .p
+            .plan_compaction()?
+            .publication
+            .ok_or("publication missing")?;
+        fixture.pair.p.pin_snapshot(&publication, "transfer-1")?;
+        refused(fixture.prepare(), "snapshot publication is pinned");
+        // Both nodes are still ordinary and writable.
+        for node in [&fixture.pair.p, &fixture.pair.s] {
+            assert!(node.checkpoint().is_ok());
+            assert!(node.connection(|c| Ok(!pending_present(c)?))?);
+        }
+        let mut batch = stock_entry().batch;
+        batch.operation_id = "still-writable".into();
+        commit(&mut fixture.pair.p, &mut fixture.pair.s, batch)?;
+        // Releasing the pin makes the pair preparable again. The commit above
+        // moved the cut, so the plan is rebuilt from the live nodes.
+        fixture
+            .pair
+            .p
+            .release_snapshot_pin(&publication, "transfer-1")?;
+        let fresh = lifecycle("pinned-preflight-clean")?;
+        let mut fresh = fresh;
+        fresh.prepare()?;
+        Ok(())
+    }
+
+    /// C3: every durable shape whose APPLY preconditions could never hold is
+    /// refused at preflight instead of bricking both nodes.
+    ///
+    /// Note: for these synthetic shapes the existing structural verifiers
+    /// (`history_format`, `certified::verify_metadata`) already refuse during
+    /// the preflight's own `plan_compaction`, so the new `require_appliable`
+    /// check is defence in depth. What is asserted here is the property that
+    /// matters: every one of them is refused *before any marker is written*, so
+    /// neither node is left in the one-way pending state.
+    #[test]
+    fn prepare_refuses_states_apply_could_never_satisfy() -> Result<()> {
+        for (name, sql) in [
+            (
+                "legacy-version",
+                "UPDATE node_maintenance_format SET version=2 WHERE id=1",
+            ),
+            (
+                "legacy-root",
+                "CREATE TABLE node_compaction_root(id INTEGER PRIMARY KEY CHECK(id=1),base TEXT NOT NULL)",
+            ),
+            (
+                "legacy-history",
+                "CREATE TABLE node_compaction_history(sequence INTEGER PRIMARY KEY,plan TEXT NOT NULL,digest TEXT NOT NULL)",
+            ),
+            (
+                "certificates-without-format",
+                "CREATE TABLE node_compaction_certificates(sequence INTEGER PRIMARY KEY,record TEXT NOT NULL)",
+            ),
+        ] {
+            let mut fixture = lifecycle(name)?;
+            fixture.pair.s.connection(|c| {
+                c.execute_batch(sql)?;
+                Ok(())
+            })?;
+            assert!(fixture.prepare().is_err(), "{name} was prepared");
+            // Neither node was marked, so neither is stuck in pending state.
+            for node in [&fixture.pair.p, &fixture.pair.s] {
+                assert!(
+                    node.connection(|c| Ok(!pending_present(c)?))?,
+                    "{name} left a marker"
+                );
+            }
+            assert!(fixture.pair.p.checkpoint().is_ok());
+        }
+        // The check itself refuses both shapes directly.
+        let fixture = lifecycle("appliable-direct")?;
+        fixture.pair.s.connection(|c| {
+            refused(
+                require_appliable_for_test(c, true, 1),
+                "requires certified maintenance format",
+            );
+            refused(
+                require_appliable_for_test(c, false, 2),
+                "requires a node without legacy compaction",
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// `prepare_pair` with the roles swapped is refused, and nothing is marked.
+    #[test]
+    fn prepare_refuses_swapped_roles() -> Result<()> {
+        let mut fixture = lifecycle("swapped-roles")?;
+        let Lifecycle { pair, .. } = &mut fixture;
+        refused(
+            prepare_pair(
+                &mut pair.s,
+                &mut pair.p,
+                &pair.plan,
+                &pair.request,
+                &pair.token,
+                15,
+                &pair.trust,
+            ),
+            "pending pair mismatch",
+        );
+        for node in [&fixture.pair.p, &fixture.pair.s] {
+            assert!(node.connection(|c| Ok(!pending_present(c)?))?);
+        }
+        Ok(())
+    }
+
+    /// L3 and M2: a node without pending maintenance is a typed error, and a
+    /// pending node can be inspected read-only without knowing the request.
+    #[test]
+    fn peek_reports_the_durable_phase_and_role_without_the_request() -> Result<()> {
+        let mut fixture = lifecycle("peek")?;
+        let identity = fixture.pair.p.identity().clone();
+        let primary_path = fixture.pair.dir.path().join("candidate1");
+        let secondary_path = fixture.pair.dir.path().join("survivor");
+
+        // A node that never prepared gives the typed non-pending error.
+        let plain = fixture.pair.dir.path().join("never-prepared");
+        drop(Node::open(
+            &plain,
+            Role::Primary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+        )?);
+        refused(
+            peek_pending(&plain, &identity, "fixture"),
+            "node has no pending certified maintenance",
+        );
+        fixture.prepare()?;
+
+        // Release every lock but keep the directory alive, the way a restart
+        // leaves the files behind.
+        let Lifecycle { pair, journal, .. } = fixture;
+        let support::CertifiedPair {
+            dir,
+            p,
+            s,
+            request,
+            trust,
+            ..
+        } = pair;
+        drop(p);
+        drop(s);
+        drop(journal);
+
+        let summary = peek_pending(&primary_path, &identity, "fixture")?;
+        assert_eq!(summary.role, Role::Primary);
+        assert_eq!(summary.phase, "prepared");
+        assert_eq!(summary.request, request);
+        assert_eq!(
+            peek_pending(&secondary_path, &identity, "fixture")?.role,
+            Role::Secondary
+        );
+        // The request read back is exactly what the restricted handle needs, so
+        // an operator can resume without having kept it.
+        let handle = PendingMaintenanceHandle::open_existing(
+            &primary_path,
+            Role::Primary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+            &summary.request,
+            &trust,
+        )?;
+        assert_eq!(handle.inspect().role, Role::Primary);
+        drop(handle);
+        // A foreign identity is refused even though the file is pending.
+        let mut other = identity.clone();
+        other.epoch += 1;
+        refused(
+            peek_pending(&primary_path, &other, "fixture"),
+            "pending marker mismatch",
+        );
+        drop(dir);
+        Ok(())
+    }
+
+    /// M3: a symlinked lock file is refused by every opener.
+    #[test]
+    fn symlinked_node_lock_is_refused_by_every_opener() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let identity = stock_entry().batch.identity;
+        let path = dir.path().join("node");
+        let node = Node::open(
+            &path,
+            Role::Primary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+        )?;
+        drop(node);
+        let lock = path.with_extension("node-lock");
+        let decoy = dir.path().join("decoy");
+        std::fs::write(&decoy, b"")?;
+        std::fs::remove_file(&lock)?;
+        std::os::unix::fs::symlink(&decoy, &lock)?;
+
+        refused(
+            Node::<StockSchema>::open(
+                &path,
+                Role::Primary,
+                identity.clone(),
+                "fixture",
+                StockSchema,
+            ),
+            "node lock is not a regular file",
+        );
+        refused(
+            peek_pending(&path, &identity, "fixture"),
+            "node lock is not a regular file",
+        );
+        std::fs::remove_file(&lock)?;
+        Node::<StockSchema>::open(&path, Role::Primary, identity, "fixture", StockSchema)?;
+        Ok(())
+    }
+
+    /// H2: the completion id is derived, stable across retries, and different
+    /// for different requests.
+    #[test]
+    fn completion_ids_are_derived_and_stable() -> Result<()> {
+        let first = support::certified_pair("derived-a", [53; 32], "lifecycle")?;
+        let a = completion_id(&first.request, [7; 32], [true; 2])?;
+        assert_eq!(a, completion_id(&first.request, [7; 32], [true; 2])?);
+        let mut other = first.request.clone();
+        other.id = [54; 32];
+        assert_ne!(a, completion_id(&other, [7; 32], [true; 2])?);
+        assert_ne!(a, completion_id(&first.request, [8; 32], [true; 2])?);
+        assert_ne!(a, completion_id(&first.request, [7; 32], [true, false])?);
+        Ok(())
+    }
+
+    /// H1 plus one assertion per phase boundary: every out-of-order call names
+    /// the phase it refuses, and finalization is restartable per node.
+    #[test]
+    fn phase_boundaries_are_typed_and_finalization_is_restartable() -> Result<()> {
+        let mut fixture = lifecycle("phases")?;
+        fixture.prepare()?;
+        let identity = fixture.pair.p.identity().clone();
+        let primary_path = fixture.pair.dir.path().join("candidate1");
+        let secondary_path = fixture.pair.dir.path().join("survivor");
+        let Lifecycle {
+            pair,
+            journal,
+            authority,
+        } = fixture;
+        let support::CertifiedPair {
+            dir,
+            p,
+            s,
+            request,
+            trust,
+            ..
+        } = pair;
+        drop(p);
+        drop(s);
+
+        let open = |path: &Path, role: Role| {
+            PendingMaintenanceHandle::open_existing(
+                path,
+                role,
+                identity.clone(),
+                "fixture",
+                StockSchema,
+                &request,
+                &trust,
+            )
+        };
+        let mut h = open(&primary_path, Role::Primary)?;
+        let mut hs = open(&secondary_path, Role::Secondary)?;
+
+        // prepared: nothing downstream of the decision may run yet.
+        refused(
+            record_decided(&mut h, &journal, &trust, &authority),
+            "transition missing",
+        );
+        refused(
+            apply_decided(&mut h, &journal, &trust, &authority),
+            "invalid pending apply transition",
+        );
+        refused(
+            acknowledge_applied(&h, &journal, &trust, &authority),
+            "pending node is not applied",
+        );
+        refused(
+            record_complete(&mut h, &journal, &trust, &authority),
+            "transition missing",
+        );
+        refused(
+            finalize_node(&mut h, &journal, &trust, &authority),
+            "pending node is not complete",
+        );
+        refused(
+            complete_authority(&h, &hs, &journal, &trust, &authority),
+            "pending completion pair mismatch",
+        );
+
+        // decided: apply is now legal, acknowledge still is not.
+        decide_prepared(&h, &hs, &journal, 15, &trust, &authority)?;
+        record_decided(&mut h, &journal, &trust, &authority)?;
+        record_decided(&mut hs, &journal, &trust, &authority)?;
+        refused(
+            acknowledge_applied(&h, &journal, &trust, &authority),
+            "pending node is not applied",
+        );
+        refused(
+            finalize_node(&mut h, &journal, &trust, &authority),
+            "pending node is not complete",
+        );
+
+        // applied: acknowledgement opens, completion needs both nodes.
+        apply_decided(&mut h, &journal, &trust, &authority)?;
+        apply_decided(&mut hs, &journal, &trust, &authority)?;
+        refused(
+            record_complete(&mut h, &journal, &trust, &authority),
+            "transition acknowledgements incomplete",
+        );
+        refused(
+            finalize_node(&mut h, &journal, &trust, &authority),
+            "pending node is not complete",
+        );
+
+        // acked-one: completion at the authority is still refused.
+        acknowledge_applied(&h, &journal, &trust, &authority)?;
+        refused(
+            complete_authority(&h, &hs, &journal, &trust, &authority),
+            "acknowledgements incomplete",
+        );
+        // acked-both, then completed.
+        acknowledge_applied(&hs, &journal, &trust, &authority)?;
+        complete_authority(&h, &hs, &journal, &trust, &authority)?;
+        refused(
+            finalize_node(&mut h, &journal, &trust, &authority),
+            "pending node is not complete",
+        );
+
+        // recorded-complete on one node only, then a crash-equivalent restart.
+        record_complete(&mut h, &journal, &trust, &authority)?;
+        record_complete(&mut hs, &journal, &trust, &authority)?;
+        finalize_node(&mut hs, &journal, &trust, &authority)?;
+        drop(h);
+        drop(hs);
+
+        // The secondary is finalised and is an ordinary node again; the primary
+        // is still pending and finalises alone.
+        refused(
+            peek_pending(&secondary_path, &identity, "fixture"),
+            "node has no pending certified maintenance",
+        );
+        assert_eq!(
+            peek_pending(&primary_path, &identity, "fixture")?.phase,
+            "complete"
+        );
+        let mut h = open(&primary_path, Role::Primary)?;
+        finalize_node(&mut h, &journal, &trust, &authority)?;
+        // Repeating on the same handle is a clean no-op, and reopening a
+        // finalised node is the typed non-pending error, never a missing table.
+        finalize_node(&mut h, &journal, &trust, &authority)?;
+        drop(h);
+        refused(
+            open(&primary_path, Role::Primary),
+            "node has no pending certified maintenance",
+        );
+        refused(
+            peek_pending(&primary_path, &identity, "fixture"),
+            "node has no pending certified maintenance",
+        );
+        drop(dir);
         Ok(())
     }
 }

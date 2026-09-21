@@ -110,3 +110,153 @@ fn maintenance_upgrade_failure_is_atomic() -> Result<()> {
     p.enable_maintenance()?;
     Ok(())
 }
+
+/// Shared fixture for the certified maintenance lifecycle and the
+/// participant-loss flow: a recovered, maintenance-enabled pair with one
+/// committed entry, a fresh publication on each node and a signed certified
+/// request that has NOT yet been prepared.
+pub(super) mod support {
+    use super::*;
+    use crate::recovery::transition;
+    use crate::typed::maintenance::certified;
+    use crate::typed::recovery::tests::recovered_pair_for_pending;
+    use ring::signature::EcdsaKeyPair;
+    use sha2::{Digest, Sha256};
+
+    pub(crate) struct CertifiedPair {
+        pub dir: tempfile::TempDir,
+        pub p: Node<StockSchema>,
+        pub s: Node<StockSchema>,
+        pub plan: compaction::PairPlan,
+        pub request: transition::Request,
+        pub token: String,
+        pub trust: transition::TrustStore,
+        pub key: EcdsaKeyPair,
+    }
+
+    pub(crate) fn digest_of<T: Serialize>(value: &T) -> Result<[u8; 32]> {
+        Ok(Sha256::digest(serde_json::to_vec(value)?).into())
+    }
+
+    pub(crate) fn cut(prefix: &Prefix) -> Result<transition::Checkpoint> {
+        Ok(transition::Checkpoint {
+            sequence: prefix.sequence,
+            digest: digest_of(prefix)?,
+        })
+    }
+
+    fn participant(
+        node: &Node<StockSchema>,
+        local: &CompactionPlan,
+        plan: &compaction::PairPlan,
+    ) -> Result<transition::Participant> {
+        Ok(transition::Participant {
+            member: node
+                .recovery_member_identity()?
+                .ok_or("fixture member identity missing")?,
+            generation: node.connection(checkpoint::generation)?,
+            old_base: local.head.base.as_ref().map(cut).transpose()?,
+            target: cut(&local.checkpoint)?,
+            plan: digest_of(plan)?,
+            publication: digest_of(
+                local
+                    .publication
+                    .as_ref()
+                    .ok_or("fixture publication missing")?,
+            )?,
+        })
+    }
+
+    /// Build the pair and sign the request. `seed` names the single committed
+    /// operation so callers can keep their fixtures distinguishable.
+    pub(crate) fn certified_pair(seed: &str, id: [u8; 32], install: &str) -> Result<CertifiedPair> {
+        let dir = tempfile::tempdir()?;
+        let (mut p, mut s) = recovered_pair_for_pending(dir.path())?;
+        p.upgrade_receipt_capacity()?;
+        s.upgrade_receipt_capacity()?;
+        p.enable_maintenance()?;
+        s.enable_maintenance()?;
+        let old_p = p
+            .plan_compaction()?
+            .publication
+            .ok_or("fixture primary publication missing")?;
+        let old_s = s
+            .plan_compaction()?
+            .publication
+            .ok_or("fixture secondary publication missing")?;
+        let mut batch = stock_entry().batch;
+        batch.operation_id = seed.into();
+        commit(&mut p, &mut s, batch)?;
+        p.rotate_snapshot(&old_p)?;
+        s.rotate_snapshot(&old_s)?;
+        let plan = compaction::PairPlan {
+            id,
+            primary: p.plan_compaction()?,
+            secondary: s.plan_compaction()?,
+        };
+        plan.validate_certified()?;
+        let request = transition::Request {
+            format: 1,
+            id: [42; 32],
+            authority_id: [43; 32],
+            revision: 1,
+            install: install.into(),
+            region: "test".into(),
+            scope: digest_of(p.identity())?,
+            schema: digest_of(&plan.primary.contract)?,
+            membership: plan
+                .primary
+                .membership
+                .ok_or("fixture membership missing")?,
+            source_anchor: cut(plan
+                .primary
+                .recovery_anchor
+                .as_ref()
+                .ok_or("fixture anchor missing")?)?,
+            participants: [
+                participant(&p, &plan.primary, &plan)?,
+                participant(&s, &plan.secondary, &plan)?,
+            ],
+        };
+        let (key, public) = certified::tests::signer()?;
+        let token = certified::tests::sign(&key, &request)?;
+        let trust = transition::TrustStore {
+            profile: crate::recovery::grant::Profile {
+                issuer: "issuer".into(),
+                audience: "audience".into(),
+                token_type: transition::TOKEN_TYPE.into(),
+            },
+            keys: vec![("fixture".into(), public)],
+            max_lifetime: 20,
+        };
+        Ok(CertifiedPair {
+            dir,
+            p,
+            s,
+            plan,
+            request,
+            token,
+            trust,
+            key,
+        })
+    }
+
+    /// Journal scope for the signed request above.
+    pub(crate) fn journal_scope(request: &transition::Request) -> transition::JournalScope {
+        transition::JournalScope {
+            install: request.install.clone(),
+            region: request.region.clone(),
+            profile: crate::recovery::grant::Profile {
+                issuer: "issuer".into(),
+                audience: "audience".into(),
+                token_type: transition::TOKEN_TYPE.into(),
+            },
+            scope: request.scope,
+            schema: request.schema,
+            membership: request.membership,
+            source_anchor: request.source_anchor.clone(),
+            authority_id: request.authority_id,
+            initial_revision: request.revision,
+        }
+    }
+}

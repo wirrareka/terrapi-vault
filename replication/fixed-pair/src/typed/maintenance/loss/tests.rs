@@ -4,7 +4,7 @@
 use super::*;
 use crate::envelope_tests::{stock_entry, StockSchema};
 use crate::recovery::transition;
-use crate::typed::recovery::tests::recovered_pair_for_pending;
+use crate::typed::maintenance::tests::support;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
 use ring::{rand::SystemRandom, signature::EcdsaKeyPair};
 use std::sync::{
@@ -199,26 +199,6 @@ fn cut(prefix: &Prefix) -> Result<transition::Checkpoint> {
     })
 }
 
-fn participant(
-    node: &Node<StockSchema>,
-    local: &CompactionPlan,
-    plan: &compaction::PairPlan,
-) -> Result<transition::Participant> {
-    Ok(transition::Participant {
-        member: node
-            .recovery_member_identity()?
-            .ok_or("fixture member identity missing")?,
-        generation: node.connection(checkpoint::generation)?,
-        old_base: local.head.base.as_ref().map(cut).transpose()?,
-        target: cut(&local.checkpoint)?,
-        plan: id(plan)?,
-        publication: id(local
-            .publication
-            .as_ref()
-            .ok_or("fixture publication missing")?)?,
-    })
-}
-
 fn sign_loss(
     key: &EcdsaKeyPair,
     request: &transition::LossRequest,
@@ -409,66 +389,17 @@ fn node_state(node: &Node<StockSchema>) -> Result<(Vec<String>, (u64, u64))> {
 /// optionally leave a committed tail plus a fresh frozen publication on the
 /// survivor, and decide the loss of `lost` through the real journal.
 fn fixture(lost: Role, tail: bool) -> Result<Fixture> {
-    let dir = tempfile::tempdir()?;
-    let (mut p, mut s) = recovered_pair_for_pending(dir.path())?;
-    p.upgrade_receipt_capacity()?;
-    s.upgrade_receipt_capacity()?;
-    p.enable_maintenance()?;
-    s.enable_maintenance()?;
-    let old_p = p
-        .plan_compaction()?
-        .publication
-        .ok_or("fixture primary publication missing")?;
-    let old_s = s
-        .plan_compaction()?
-        .publication
-        .ok_or("fixture secondary publication missing")?;
-    let mut batch = stock_entry().batch;
-    batch.operation_id = "loss-fixture-seed".into();
-    commit(&mut p, &mut s, batch)?;
-    p.rotate_snapshot(&old_p)?;
-    s.rotate_snapshot(&old_s)?;
-    let plan = compaction::PairPlan {
-        id: [41; 32],
-        primary: p.plan_compaction()?,
-        secondary: s.plan_compaction()?,
-    };
-    plan.validate_certified()?;
-    let certificate = transition::Request {
-        format: 1,
-        id: [42; 32],
-        authority_id: [43; 32],
-        revision: 1,
-        install: "loss-fixture".into(),
-        region: "test".into(),
-        scope: id(p.identity())?,
-        schema: id(&plan.primary.contract)?,
-        membership: plan
-            .primary
-            .membership
-            .ok_or("fixture membership missing")?,
-        source_anchor: cut(plan
-            .primary
-            .recovery_anchor
-            .as_ref()
-            .ok_or("fixture anchor missing")?)?,
-        participants: [
-            participant(&p, &plan.primary, &plan)?,
-            participant(&s, &plan.secondary, &plan)?,
-        ],
-    };
-    let (key, public) = certified::tests::signer()?;
-    let token = certified::tests::sign(&key, &certificate)?;
-    let trust = transition::TrustStore {
-        profile: crate::recovery::grant::Profile {
-            issuer: "issuer".into(),
-            audience: "audience".into(),
-            token_type: transition::TOKEN_TYPE.into(),
-        },
-        keys: vec![("fixture".into(), public)],
-        max_lifetime: 20,
-    };
-    pending::prepare_pair(&p, &s, &plan, &certificate, &token, 15, &trust)?;
+    let support::CertifiedPair {
+        dir,
+        mut p,
+        mut s,
+        plan,
+        request: certificate,
+        token,
+        trust,
+        key,
+    } = support::certified_pair("loss-fixture-seed", [41; 32], "loss-fixture")?;
+    pending::prepare_pair(&mut p, &mut s, &plan, &certificate, &token, 15, &trust)?;
     let identity = p.identity().clone();
     let primary_path = dir.path().join("candidate1");
     let secondary_path = dir.path().join("survivor");
@@ -517,7 +448,7 @@ fn fixture(lost: Role, tail: bool) -> Result<Fixture> {
     for handle in [&hp, &hs] {
         pending::acknowledge_applied(handle, &journal, &trust, gate.as_ref())?;
     }
-    pending::complete_authority(&hp, &hs, &journal, [44; 32], &trust, gate.as_ref())?;
+    pending::complete_authority(&hp, &hs, &journal, &trust, gate.as_ref())?;
     for handle in [&mut hp, &mut hs] {
         pending::record_complete(handle, &journal, &trust, gate.as_ref())?;
     }
@@ -2313,8 +2244,6 @@ fn promoted_replacement_rejects_owner_and_record_disagreement() -> Result<()> {
 // S3: acknowledgements, completion and writer admission.
 // ---------------------------------------------------------------------------
 
-const COMPLETION: [u8; 32] = [80; 32];
-
 fn successor_journal_handle(f: &Fixture, name: &str) -> Result<transition::Journal> {
     transition::Journal::open(
         &f.dir.path().join(name),
@@ -2362,7 +2291,7 @@ fn recovery_cycle(lost: Role, tail: bool) -> Result<()> {
     let live = authorities(&f, &successor_journal);
 
     // No install at all: no participant may be acknowledged.
-    assert!(complete_successor(&handle, &replacement, &successor, COMPLETION, &live).is_err());
+    assert!(complete_successor(&handle, &replacement, &successor, &live).is_err());
     // A fabricated acknowledgement is impossible: the default-deny policy has
     // no applied-evidence implementation at all.
     let decision =
@@ -2380,7 +2309,7 @@ fn recovery_cycle(lost: Role, tail: bool) -> Result<()> {
 
     // Only the survivor installed: still no acknowledgement for either side.
     handle.install_successor("fixture", &successor, &live)?;
-    assert!(complete_successor(&handle, &replacement, &successor, COMPLETION, &live).is_err());
+    assert!(complete_successor(&handle, &replacement, &successor, &live).is_err());
     assert_eq!(
         successor_journal
             .fetch_loss_successor(&successor, &f.trust.as_trust(), f.gate.as_ref())?
@@ -2409,10 +2338,31 @@ fn recovery_cycle(lost: Role, tail: bool) -> Result<()> {
     let handle = f.survivor_handle()?;
     let replacement = f.open_replacement(lost)?;
 
-    // Complete at the authority. Exact retry converges, a different id does not.
-    complete_successor(&handle, &replacement, &successor, COMPLETION, &live)?;
-    complete_successor(&handle, &replacement, &successor, COMPLETION, &live)?;
-    assert!(complete_successor(&handle, &replacement, &successor, [81; 32], &live).is_err());
+    // Complete at the authority. The id is derived, so an exact retry always
+    // converges; a conflicting id can only be injected at the journal itself.
+    complete_successor(&handle, &replacement, &successor, &live)?;
+    complete_successor(&handle, &replacement, &successor, &live)?;
+    let decided =
+        successor_journal.fetch_loss_successor(&successor, &f.trust.as_trust(), f.gate.as_ref())?;
+    assert_eq!(
+        successor_journal
+            .fetch_completed_loss_successor(&successor, &f.trust.as_trust(), f.gate.as_ref())?
+            .completion(),
+        completion_id(
+            decided.request(),
+            decided.token_digest(),
+            decided.acknowledgements()
+        )?
+    );
+    assert_err_contains(
+        successor_journal.complete_loss_successor(
+            &decided,
+            [81; 32],
+            &f.trust.as_trust(),
+            f.gate.as_ref(),
+        ),
+        "immutable replacement completion conflict",
+    );
     assert_eq!(
         successor_journal
             .fetch_loss_successor(&successor, &f.trust.as_trust(), f.gate.as_ref())?
@@ -2618,11 +2568,11 @@ fn acknowledgement_requires_both_durable_installs() -> Result<()> {
         &successor,
         &live,
     )?;
-    assert!(complete_successor(&handle, &replacement, &successor, COMPLETION, &live).is_err());
+    assert!(complete_successor(&handle, &replacement, &successor, &live).is_err());
     handle.install_successor("fixture", &successor, &live)?;
 
     // Both installed: the acknowledgement is accepted.
-    complete_successor(&handle, &replacement, &successor, COMPLETION, &live)?;
+    complete_successor(&handle, &replacement, &successor, &live)?;
     let acknowledged = successor_journal
         .fetch_loss_successor(&successor, &f.trust.as_trust(), f.gate.as_ref())?
         .acknowledgements();
@@ -2634,7 +2584,7 @@ fn acknowledgement_requires_both_durable_installs() -> Result<()> {
         successor_proof_with(&f, "successor-journal-other", [90; 32])?;
     let other = other_proof.request().clone();
     let other_live = authorities(&f, &other_journal);
-    assert!(complete_successor(&handle, &replacement, &other, [91; 32], &other_live).is_err());
+    assert!(complete_successor(&handle, &replacement, &other, &other_live).is_err());
 
     // Tamper with the replacement's record: the survivor's ACK is refused too.
     let replacement_path = f.replacement_path.clone();
@@ -2676,7 +2626,7 @@ fn acknowledgement_requires_both_durable_installs() -> Result<()> {
             )
             .is_err());
     }
-    assert!(complete_successor(&handle, &replacement, &other, [91; 32], &other_live).is_err());
+    assert!(complete_successor(&handle, &replacement, &other, &other_live).is_err());
     drop(replacement);
     drop(handle);
     drop(f);
@@ -2708,7 +2658,7 @@ fn returning_lost_member_and_old_membership_stay_rejected() -> Result<()> {
     )?;
     f.live
         .attach_successor(successor_journal_handle(&f, "successor-journal")?)?;
-    complete_successor(&handle, &replacement, &successor, COMPLETION, &live)?;
+    complete_successor(&handle, &replacement, &successor, &live)?;
     drop(replacement);
     drop(handle);
 
@@ -2807,14 +2757,7 @@ fn acknowledgement_binds_the_source_journal_scope() -> Result<()> {
         )?;
         let handle_again = f.survivor_handle()?;
         let replacement_again = f.open_replacement(Role::Secondary)?;
-        assert!(complete_successor(
-            &handle_again,
-            &replacement_again,
-            &successor,
-            COMPLETION,
-            &live
-        )
-        .is_err());
+        assert!(complete_successor(&handle_again, &replacement_again, &successor, &live).is_err());
         assert_eq!(
             successor_journal
                 .fetch_loss_successor(&successor, &f.trust.as_trust(), f.gate.as_ref())?
@@ -2837,7 +2780,7 @@ fn acknowledgement_binds_the_source_journal_scope() -> Result<()> {
     // Restored: the genuine records acknowledge.
     assert_eq!(install_state(&survivor_path)?, good_survivor);
     assert_eq!(node_install_state(&replacement)?, good_replacement);
-    complete_successor(&handle, &replacement, &successor, COMPLETION, &live)?;
+    complete_successor(&handle, &replacement, &successor, &live)?;
     assert_eq!(
         successor_journal
             .fetch_loss_successor(&successor, &f.trust.as_trust(), f.gate.as_ref())?
@@ -2875,7 +2818,6 @@ struct CrashFixture {
     replacement: std::path::PathBuf,
     source_journal: std::path::PathBuf,
     successor_journal: std::path::PathBuf,
-    completion: [u8; 32],
 }
 
 impl CrashFixture {
@@ -3115,7 +3057,7 @@ fn replay(world: &CrashWorld, stop: u32) -> Result<()> {
     if stop <= STEP_SECOND_ACK {
         return Ok(());
     }
-    complete_successor(&handle, &replacement, &f.successor, f.completion, &live)?;
+    complete_successor(&handle, &replacement, &f.successor, &live)?;
     if stop == STEP_AUTHORITY_COMPLETION {
         return Ok(());
     }
@@ -3165,7 +3107,6 @@ fn crash_fixture(lost: Role, tail: bool) -> Result<(Fixture, transition::Journal
         replacement: f.replacement_path.clone(),
         source_journal: f.dir.path().join("loss-journal"),
         successor_journal: f.dir.path().join("successor-journal"),
-        completion: COMPLETION,
     };
     std::fs::write(
         f.dir.path().join("crash-fixture.json"),
@@ -3294,19 +3235,31 @@ fn assert_wrong_inputs_refused(f: &Fixture, world: &CrashWorld, step: u32) -> Re
         "foreign successor accepted at step {step}"
     );
     if step >= STEP_AUTHORITY_COMPLETION {
+        // The completion id is derived, so a conflicting one can only be
+        // injected at the journal itself. It must still be refused.
+        let decision = world.successor.fetch_loss_successor(
+            &world.fixture.successor,
+            &world.trust.as_trust(),
+            world.gate.as_ref(),
+        )?;
+        assert_err_contains(
+            world.successor.complete_loss_successor(
+                &decision,
+                [98; 32],
+                &world.trust.as_trust(),
+                world.gate.as_ref(),
+            ),
+            "immutable replacement completion conflict",
+        );
+        // The derived id still converges on retry.
         let handle = world.handle()?;
         let replacement = world.replacement()?;
-        assert!(
-            complete_successor(
-                &handle,
-                &replacement,
-                &world.fixture.successor,
-                [98; 32],
-                &world.authorities()
-            )
-            .is_err(),
-            "conflicting completion accepted at step {step}"
-        );
+        complete_successor(
+            &handle,
+            &replacement,
+            &world.fixture.successor,
+            &world.authorities(),
+        )?;
     }
     Ok(())
 }
@@ -3636,7 +3589,7 @@ fn stale_peer_copy_and_replayed_successor_journal_grant_nothing() -> Result<()> 
     // installed, the replacement is empty again. Nothing may be acknowledged.
     swap_database(&stale, &replacement_path)?;
     let rolled_back = f.replacement()?;
-    assert!(complete_successor(&handle, &rolled_back, &successor, COMPLETION, &live).is_err());
+    assert!(complete_successor(&handle, &rolled_back, &successor, &live).is_err());
     assert_eq!(
         successor_journal
             .fetch_loss_successor(&successor, &f.trust.as_trust(), f.gate.as_ref())?
@@ -3662,7 +3615,7 @@ fn stale_peer_copy_and_replayed_successor_journal_grant_nothing() -> Result<()> 
     let before_second_ack = f.dir.path().join("successor-journal-old");
     // Snapshot the authority before either acknowledgement.
     swap_database(&journal_path, &before_second_ack)?;
-    complete_successor(&handle, &replacement, &successor, COMPLETION, &live)?;
+    complete_successor(&handle, &replacement, &successor, &live)?;
     drop(replacement);
     drop(handle);
 

@@ -96,7 +96,7 @@ pub struct Progress {
 
 fn has_state(c: &Connection) -> Result<bool> {
     Ok(c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='node_compaction')",
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='node_compaction')",
         [],
         |r| r.get(0),
     )?)
