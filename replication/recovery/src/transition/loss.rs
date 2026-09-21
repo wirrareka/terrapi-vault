@@ -399,7 +399,42 @@ pub trait LossPolicy {
         request: &LossRequest,
     ) -> crate::Result<()>;
     /// Must authenticate the survivor fields against durable participant evidence.
+    ///
+    /// # `source_kind == Decided`
+    ///
+    /// For a finish-forward loss this hook carries a far heavier duty: it
+    /// **must** prove, from live survivor evidence, that the survivor
+    /// durably **applied** the decided transition named by
+    /// `request.abandoned_request`. That transition is never completed and
+    /// the lost member can never acknowledge it, so nothing else in the
+    /// system will ever check it again. An implementation that accepts a
+    /// merely *prepared* or *decided* survivor here promotes an unfinished
+    /// certificate into provenance for data that was never written — which is
+    /// precisely the failure this branch exists to avoid.
     fn survivor_prepared(&self, scope: &JournalScope, request: &LossRequest) -> crate::Result<()>;
+
+    /// Authorize a loss that abandons an in-flight certified maintenance
+    /// request (`source_kind == Completed` with an `abandoned_request`). The
+    /// default is deliberately deny.
+    ///
+    /// The journal can see a decided transition, but a request that was only
+    /// ever *prepared* exists nowhere except on the nodes. An implementation
+    /// **must** prove from live survivor evidence that the survivor holds
+    /// exactly this pending request, in phase `prepared` or `decided`, and
+    /// has **not** applied it. A survivor that applied it must use
+    /// [`SourceKind::Decided`] instead — rolling back an applied transition
+    /// is impossible, because its history has already been pruned.
+    ///
+    /// This hook is also what stops `abandoned_request` from becoming
+    /// padding: on an idle journal it is the only thing that can refuse it.
+    fn maintenance_rollback_authorized(
+        &self,
+        _scope: &JournalScope,
+        _loss: &LossRequest,
+        _abandoned_request: &Id,
+    ) -> crate::Result<()> {
+        Err("maintenance rollback evidence missing".into())
+    }
 
     /// Live-read durable installation evidence for this exact participant.
     /// The default is intentionally deny: a decision handle is not evidence
@@ -1252,17 +1287,6 @@ impl Journal {
     ) -> crate::Result<CommittedLoss> {
         request.validate()?;
         ensure(token.len() <= MAX_TOKEN, "token limit")?;
-        // Shapes that are validated but not yet honoured; they arrive with the
-        // slices that give them meaning, and accepting one early would record
-        // an unenforced claim for ever.
-        ensure(
-            request.kind() != SourceKind::Decided,
-            "decided loss source not enabled",
-        )?;
-        ensure(
-            request.abandoned_request.is_none(),
-            "loss abandoned request not enabled",
-        )?;
         self.connection(|c| {
             let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
             let history = self.read(&tx, trust)?;
@@ -1272,8 +1296,17 @@ impl Journal {
                 SourceKind::LossSuccessor => {
                     self.loss_from_successor(&tx, &history, &request, trust)?
                 }
-                _ => self.loss_from_completed(&history, &request, trust)?,
+                SourceKind::Decided => self.loss_from_decided(&history, &request, trust)?,
+                SourceKind::Completed => self.loss_from_completed(&history, &request, trust)?,
             };
+            // A rollback abandons work the journal may not be able to see:
+            // only the survivor knows about a request that was merely
+            // prepared. The hook runs after every journal-side check.
+            if request.kind() == SourceKind::Completed {
+                if let Some(abandoned) = request.abandoned_request.as_ref() {
+                    policy.maintenance_rollback_authorized(&self.scope, &request, abandoned)?;
+                }
+            }
             let chain = read_loss_history(&tx, trust)?;
             let previous = chain.last();
             if let Some(old) = previous.filter(|o| o.request == request) {
@@ -1315,7 +1348,15 @@ impl Journal {
         })
     }
     /// `SourceKind::Completed` (and every format-1 request): the loss is
-    /// anchored to the completed ordinary head of this journal.
+    /// anchored to the last **completed** ordinary certificate.
+    ///
+    /// If the effective head is a decided transition that never completed,
+    /// the loss must say so (`abandoned_request`) and the survivor must not
+    /// have applied it; the loss then terminates that transition the way a
+    /// maintenance abort would, and anchors itself to the completed record
+    /// below it. A [`Journal::abort`] cannot be used here: it demands proof
+    /// that *both* nodes are durably rolling back, and a lost member can
+    /// never give it.
     fn loss_from_completed(
         &self,
         history: &History,
@@ -1326,11 +1367,95 @@ impl Journal {
             .head
             .as_ref()
             .ok_or("completed transition required")?;
-        let source = committed(head, trust)?;
+        // An open decided head may never be silently ignored: the pair may
+        // still be mid-apply, and a loss that pretends it is not there would
+        // strand it for ever.
+        let abandoning = head.completion.is_none();
+        if abandoning {
+            ensure(
+                request.abandoned_request == Some(head.request.digest()?),
+                "open decided transition must be abandoned or sourced",
+            )?;
+        }
+        let record = if abandoning {
+            history
+                .completed
+                .as_ref()
+                .ok_or("completed transition required")?
+        } else {
+            head
+        };
+        let source = committed(record, trust)?;
         ensure(
-            head.completion.is_some() && head.acknowledgements == [true; 2],
+            record.completion.is_some() && record.acknowledgements == [true; 2],
             "completed transition required",
         )?;
+        let lost_index = record
+            .request
+            .participants
+            .iter()
+            .position(|p| {
+                p.member == request.lost_member && p.generation == request.lost_generation
+            })
+            .ok_or("lost participant mismatch")?;
+        // Rolling back is only possible while the survivor has not applied.
+        // Its acknowledgement on the abandoned head is exactly that evidence.
+        if abandoning {
+            ensure(
+                !head.acknowledgements[1 - lost_index],
+                "abandoned transition already applied by the survivor",
+            )?;
+        }
+        let survivor = &record.request.participants[1 - lost_index];
+        ensure(
+            request.install == self.scope.install
+                && request.region == self.scope.region
+                && request.scope == self.scope.scope
+                && request.schema == self.scope.schema
+                && request.membership == self.scope.membership
+                && request.authority_id == self.scope.authority_id
+                && request.source_certificate == source.certificate_id()
+                && request.source_token_digest == source.token_digest()
+                && request.source_cut == record.request.participants[0].target,
+            "loss source mismatch",
+        )?;
+        ensure(
+            request.survivor.member == survivor.member
+                && request.survivor.generation == survivor.generation
+                && request.survivor.old_base == survivor.old_base
+                && request.replacement_member != record.request.participants[0].member
+                && request.replacement_member != record.request.participants[1].member,
+            "loss participant/revision mismatch",
+        )?;
+        // The revision comes from the monotonic counter, which a maintenance
+        // abort and an abandoned decided head also consume; the source
+        // certificate comes from the last completed record. Without an abort
+        // table and without an abandonment the two are the same record and
+        // this is byte-identical to format 1.
+        Ok(history.last_revision)
+    }
+
+    /// `SourceKind::Decided`: the survivor already **applied** the decided
+    /// transition, so rolling back is impossible — its history has been
+    /// pruned. The loss finishes that transition forward instead, anchoring
+    /// itself to the decided certificate.
+    ///
+    /// The decided record is never marked completed and no acknowledgement is
+    /// ever written on behalf of the lost member: the loss certificate is
+    /// what authenticates the unfinished transition from here on.
+    fn loss_from_decided(
+        &self,
+        history: &History,
+        request: &LossRequest,
+        trust: &Trust<'_>,
+    ) -> crate::Result<u64> {
+        let head = history.head.as_ref().ok_or("decided transition required")?;
+        ensure(head.completion.is_none(), "decided transition required")?;
+        ensure(
+            request.abandoned_request == Some(head.request.digest()?),
+            "abandoned request must name the decided transition",
+        )?;
+        let source = committed(head, trust)?;
         let lost_index = head
             .request
             .participants
@@ -1339,6 +1464,13 @@ impl Journal {
                 p.member == request.lost_member && p.generation == request.lost_generation
             })
             .ok_or("lost participant mismatch")?;
+        // If the lost member already acknowledged, the survivor can
+        // acknowledge too and the authority can complete the transition the
+        // ordinary way; finishing forward by loss would throw that away.
+        ensure(
+            !head.acknowledgements[lost_index],
+            "lost participant already acknowledged; complete the transition instead",
+        )?;
         let survivor = &head.request.participants[1 - lost_index];
         ensure(
             request.install == self.scope.install
@@ -1360,10 +1492,6 @@ impl Journal {
                 && request.replacement_member != head.request.participants[1].member,
             "loss participant/revision mismatch",
         )?;
-        // The revision comes from the monotonic counter, which a maintenance
-        // abort also consumes; the source certificate comes from the effective
-        // head. Without an abort table the two are the same record and this is
-        // byte-identical to format 1.
         Ok(history.last_revision)
     }
 
@@ -1532,7 +1660,8 @@ fn supersedes_previous(
             && request.lost_generation == p.lost_generation
             && request.survivor == p.survivor
             && request.survivor_cut == p.survivor_cut
-            && request.survivor_publication == p.survivor_publication,
+            && request.survivor_publication == p.survivor_publication
+            && request.abandoned_request == p.abandoned_request,
         "superseding loss changes more than the replacement",
     )?;
     // A retired replacement identity may never come back, in any generation
