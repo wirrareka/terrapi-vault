@@ -774,11 +774,14 @@ impl Journal {
                     && request.source_cut == head.request.participants[0].target,
                 "loss source mismatch",
             )?;
+            // The revision comes from the monotonic counter, which a
+            // maintenance abort also consumes; the source certificate comes
+            // from the effective head. Without an abort table the two are the
+            // same record and this is byte-identical to format 1.
             ensure(
                 request.revision
-                    == head
-                        .request
-                        .revision
+                    == history
+                        .last_revision
                         .checked_add(1)
                         .ok_or("loss revision overflow")?
                     && request.survivor.member == survivor.member
