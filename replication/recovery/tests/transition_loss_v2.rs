@@ -1171,7 +1171,7 @@ fn a_loss_from_a_successor_is_refused_in_an_ordinary_journal() {
 }
 
 #[test]
-fn decided_abandoned_and_supersedes_are_validated_but_not_yet_enabled() {
+fn decided_and_abandoned_request_are_validated_but_not_yet_enabled() {
     let w = World::new();
     let p = Authority::default();
     let j = w.certified(&p);
@@ -1219,6 +1219,7 @@ fn decided_abandoned_and_supersedes_are_validated_but_not_yet_enabled() {
         ..base.clone()
     };
     assert!(superseding.validate().is_ok());
+    // S10 enables supersession, but there is nothing here to supersede.
     refused(
         j.decide_loss(
             superseding.clone(),
@@ -1227,7 +1228,7 @@ fn decided_abandoned_and_supersedes_are_validated_but_not_yet_enabled() {
             &w.trust(),
             &p,
         ),
-        "loss supersession not enabled",
+        "superseded loss decision missing",
     );
 
     // Nothing above was recorded; the plain format-2 request still works.
