@@ -218,6 +218,9 @@ fn durable_loss_decision_retries_reopens_rejects_conflict_revocation_tamper_and_
         replacement_member: [24; 32],
         replacement_generation: [25; 32],
         fencing_ref: [26; 32],
+        source_kind: None,
+        abandoned_request: None,
+        supersedes: None,
     };
     let early = make_loss();
     let early_token = sign(
@@ -270,6 +273,7 @@ fn durable_loss_decision_retries_reopens_rejects_conflict_revocation_tamper_and_
                 publication: no_tail.survivor_publication,
             },
         ],
+        survivor_index: None,
     };
     assert!(no_tail_activation.validate().is_ok());
     let mut mismatched_cut = loss.clone();
@@ -485,6 +489,7 @@ fn durable_loss_decision_retries_reopens_rejects_conflict_revocation_tamper_and_
                 publication: loss.survivor_publication,
             },
         ],
+        survivor_index: None,
     };
     let successor_token = sign(
         &k,

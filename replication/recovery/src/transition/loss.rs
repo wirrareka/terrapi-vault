@@ -5,6 +5,31 @@ use rusqlite::OptionalExtension;
 pub const LOSS_TOKEN_TYPE: &str = "terrapi-participant-loss+jwt";
 pub const LOSS_SUCCESSOR_TOKEN_TYPE: &str = "terrapi-loss-successor+jwt";
 
+/// What a loss decision is anchored to. A format-1 request carries no kind
+/// and is always treated as [`SourceKind::Completed`].
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum SourceKind {
+    /// A completed ordinary transition in this journal.
+    Completed,
+    /// A decided-but-unfinished transition the loss abandons (S11).
+    Decided,
+    /// A completed loss successor: the pair already survived one loss and is
+    /// now losing a second participant.
+    LossSuccessor,
+}
+
+/// Evidence that a previous loss attempt was aborted and is being replaced
+/// (S10). Its shape is validated here; `decide_loss` does not accept it yet.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Supersedes {
+    pub loss_certificate: Id,
+    pub loss_token_digest: Id,
+    pub abort_certificate: Id,
+    pub abort_token_digest: Id,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LossRequest {
@@ -29,6 +54,17 @@ pub struct LossRequest {
     pub replacement_member: Id,
     pub replacement_generation: Id,
     pub fencing_ref: Id,
+    /// Format 2 only. `serde_json` omits a skipped field, so a format-1
+    /// request re-serialises to exactly its format-1 bytes and every stored
+    /// digest and token binding stays valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<SourceKind>,
+    /// `Request::digest` of an in-flight certified transition this loss
+    /// abandons. Never padding: only meaningful for `Completed`/`Decided`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abandoned_request: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<Supersedes>,
 }
 
 /// Purpose-specific membership activation following a fenced participant loss.
@@ -53,14 +89,51 @@ pub struct LossSuccessorRequest {
     pub parent_loss_token_digest: Id,
     pub survivor_cut: Checkpoint,
     pub survivor_publication: Id,
+    /// Format 1 orders these `[survivor, replacement]`. Format 2 orders them
+    /// canonically `[primary, secondary]` and names the survivor with
+    /// [`LossSuccessorRequest::survivor_index`]; use [`roles`] or the
+    /// `survivor()`/`replacement()` accessors, never a literal index.
     pub participants: [Participant; 2],
+    /// Format 2 only: which participant is the survivor. Without it a
+    /// recovered pair carries no role information and cannot take a further
+    /// loss, so from S9 on every new recovery must issue format 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub survivor_index: Option<u8>,
+}
+
+/// `(survivor index, replacement index)`.
+///
+/// Format 1 fixed the participant order to `[survivor, replacement]`. Format 2
+/// keeps the canonical `[primary, secondary]` order used everywhere else and
+/// carries the survivor's index explicitly, so the role is still a *result*
+/// derived from the signed request and never a caller-supplied parameter.
+pub fn roles(request: &LossSuccessorRequest) -> Result<(usize, usize), &'static str> {
+    match (request.format, request.survivor_index) {
+        (1, None) => Ok((0, 1)),
+        (2, Some(i @ (0 | 1))) => Ok((usize::from(i), 1 - usize::from(i))),
+        _ => Err("invalid loss successor request"),
+    }
 }
 
 impl LossSuccessorRequest {
+    /// The surviving participant of the parent loss.
+    pub fn survivor(&self) -> Result<&Participant, &'static str> {
+        Ok(&self.participants[roles(self)?.0])
+    }
+    /// The participant installed to replace the lost member.
+    pub fn replacement(&self) -> Result<&Participant, &'static str> {
+        Ok(&self.participants[roles(self)?.1])
+    }
+    /// `0` or `1`; always `0` for a format-1 request.
+    pub fn survivor_index(&self) -> Result<usize, &'static str> {
+        Ok(roles(self)?.0)
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
-        let [survivor, replacement] = &self.participants;
-        if self.format != 1
-            || self.id == [0; 32]
+        let (s, rp) = roles(self)?;
+        let survivor = &self.participants[s];
+        let replacement = &self.participants[rp];
+        if self.id == [0; 32]
             || self.authority_id == [0; 32]
             || self.revision == 0
             || self.revision > i64::MAX as u64
@@ -109,8 +182,44 @@ impl LossSuccessorRequest {
     }
 }
 impl LossRequest {
+    /// The source kind this request means, defaulting a format-1 request
+    /// to [`SourceKind::Completed`].
+    pub fn kind(&self) -> SourceKind {
+        self.source_kind.unwrap_or(SourceKind::Completed)
+    }
+
+    /// The format-2 optional fields, checked independently of the clauses
+    /// that every loss request has always had.
+    fn valid_extensions(&self) -> bool {
+        let present = self.source_kind.is_some()
+            || self.abandoned_request.is_some()
+            || self.supersedes.is_some();
+        match self.format {
+            1 => !present,
+            2 => {
+                self.source_kind.is_some()
+                    // Never padding: an abandoned request is only meaningful
+                    // where an ordinary transition was in flight.
+                    && self.abandoned_request.is_none_or(|d| {
+                        d != [0; 32]
+                            && matches!(
+                                self.source_kind,
+                                Some(SourceKind::Completed | SourceKind::Decided)
+                            )
+                    })
+                    && self.supersedes.as_ref().is_none_or(|s| {
+                        s.loss_certificate != [0; 32]
+                            && s.loss_token_digest != [0; 32]
+                            && s.abort_certificate != [0; 32]
+                            && s.abort_token_digest != [0; 32]
+                    })
+            }
+            _ => false,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.format != 1
+        if !self.valid_extensions()
             || self.id == [0; 32]
             || self.authority_id == [0; 32]
             || self.revision == 0
@@ -568,6 +677,7 @@ impl Journal {
                 self.read(&tx, trust)?.head.is_none(),
                 "ordinary successor history forbidden",
             )?;
+            ensure_successor_live(&tx, trust)?;
             let parent = read_parent(&tx, trust, &self.scope)?.ok_or("loss parent missing")?;
             let loss = &parent.loss.request;
             validate_successor_request(&self.scope, loss, &request)?;
@@ -620,6 +730,7 @@ impl Journal {
                 self.read(&tx, trust)?.head.is_none(),
                 "ordinary successor history forbidden",
             )?;
+            ensure_successor_live(&tx, trust)?;
             let parent = read_parent(&tx, trust, &self.scope)?.ok_or("loss parent missing")?;
             validate_successor_request(&self.scope, &parent.loss.request, request)?;
             let parent_digest: Id = Sha256::digest(parent.loss.token.as_bytes()).into();
@@ -648,6 +759,7 @@ impl Journal {
     ) -> crate::Result<()> {
         self.connection(|c| {
             let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
+            ensure_successor_live(&tx, trust)?;
             let parent = read_parent(&tx, trust, &self.scope)?.ok_or("loss parent missing")?;
             let mut r = read_successor(&tx, trust)?.ok_or("replacement transition missing")?;
             ensure(
@@ -690,6 +802,7 @@ impl Journal {
         ensure(id != [0; 32], "zero replacement completion")?;
         self.connection(|c| {
             let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
+            ensure_successor_live(&tx, trust)?;
             let parent = read_parent(&tx, trust, &self.scope)?.ok_or("loss parent missing")?;
             let mut r = read_successor(&tx, trust)?.ok_or("replacement transition missing")?;
             ensure(
@@ -720,6 +833,7 @@ impl Journal {
             "replacement acknowledgements incomplete",
         )?;
         self.connection(|c| {
+            ensure_successor_live(c, trust)?;
             let r = read_successor(c, trust)?.ok_or("replacement transition missing")?;
             let completion = r.completion.ok_or("replacement completion missing")?;
             Ok(CompletedLossSuccessorTransition {
@@ -741,53 +855,30 @@ impl Journal {
     ) -> crate::Result<CommittedLoss> {
         request.validate()?;
         ensure(token.len() <= MAX_TOKEN, "token limit")?;
+        // Shapes that are validated but not yet honoured; they arrive with the
+        // slices that give them meaning, and accepting one early would record
+        // an unenforced claim for ever.
+        ensure(
+            request.kind() != SourceKind::Decided,
+            "decided loss source not enabled",
+        )?;
+        ensure(
+            request.abandoned_request.is_none(),
+            "loss abandoned request not enabled",
+        )?;
+        ensure(
+            request.supersedes.is_none(),
+            "loss supersession not enabled",
+        )?;
         self.connection(|c| {
             let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
             let history = self.read(&tx, trust)?;
-            let head = history
-                .head
-                .as_ref()
-                .ok_or("completed transition required")?;
-            let source = committed(head, trust)?;
-            ensure(
-                head.completion.is_some() && head.acknowledgements == [true; 2],
-                "completed transition required",
-            )?;
-            let lost_index = head
-                .request
-                .participants
-                .iter()
-                .position(|p| {
-                    p.member == request.lost_member && p.generation == request.lost_generation
-                })
-                .ok_or("lost participant mismatch")?;
-            let survivor = &head.request.participants[1 - lost_index];
-            ensure(
-                request.install == self.scope.install
-                    && request.region == self.scope.region
-                    && request.scope == self.scope.scope
-                    && request.schema == self.scope.schema
-                    && request.membership == self.scope.membership
-                    && request.authority_id == self.scope.authority_id
-                    && request.source_certificate == source.certificate_id()
-                    && request.source_token_digest == source.token_digest()
-                    && request.source_cut == head.request.participants[0].target,
-                "loss source mismatch",
-            )?;
-            ensure(
-                request.revision
-                    == head
-                        .request
-                        .revision
-                        .checked_add(1)
-                        .ok_or("loss revision overflow")?
-                    && request.survivor.member == survivor.member
-                    && request.survivor.generation == survivor.generation
-                    && request.survivor.old_base == survivor.old_base
-                    && request.replacement_member != head.request.participants[0].member
-                    && request.replacement_member != head.request.participants[1].member,
-                "loss participant/revision mismatch",
-            )?;
+            match request.kind() {
+                SourceKind::LossSuccessor => {
+                    self.loss_from_successor(&tx, &history, &request, trust)?
+                }
+                _ => self.loss_from_completed(&history, &request, trust)?,
+            }
             if let Some(old) = read_record(&tx, trust)? {
                 ensure(
                     old.request == request && old.token == token,
@@ -810,6 +901,135 @@ impl Journal {
             committed_loss(record, trust)
         })
     }
+    /// `SourceKind::Completed` (and every format-1 request): the loss is
+    /// anchored to the completed ordinary head of this journal.
+    fn loss_from_completed(
+        &self,
+        history: &History,
+        request: &LossRequest,
+        trust: &Trust<'_>,
+    ) -> crate::Result<()> {
+        let head = history
+            .head
+            .as_ref()
+            .ok_or("completed transition required")?;
+        let source = committed(head, trust)?;
+        ensure(
+            head.completion.is_some() && head.acknowledgements == [true; 2],
+            "completed transition required",
+        )?;
+        let lost_index = head
+            .request
+            .participants
+            .iter()
+            .position(|p| {
+                p.member == request.lost_member && p.generation == request.lost_generation
+            })
+            .ok_or("lost participant mismatch")?;
+        let survivor = &head.request.participants[1 - lost_index];
+        ensure(
+            request.install == self.scope.install
+                && request.region == self.scope.region
+                && request.scope == self.scope.scope
+                && request.schema == self.scope.schema
+                && request.membership == self.scope.membership
+                && request.authority_id == self.scope.authority_id
+                && request.source_certificate == source.certificate_id()
+                && request.source_token_digest == source.token_digest()
+                && request.source_cut == head.request.participants[0].target,
+            "loss source mismatch",
+        )?;
+        // The revision comes from the monotonic counter, which a maintenance
+        // abort also consumes; the source certificate comes from the effective
+        // head. Without an abort table the two are the same record and this is
+        // byte-identical to format 1.
+        ensure(
+            request.revision
+                == history
+                    .last_revision
+                    .checked_add(1)
+                    .ok_or("loss revision overflow")?
+                && request.survivor.member == survivor.member
+                && request.survivor.generation == survivor.generation
+                && request.survivor.old_base == survivor.old_base
+                && request.replacement_member != head.request.participants[0].member
+                && request.replacement_member != head.request.participants[1].member,
+            "loss participant/revision mismatch",
+        )
+    }
+
+    /// `SourceKind::LossSuccessor`: the pair already survived one loss and is
+    /// losing a second participant. The anchor is the completed successor of
+    /// this journal, not an ordinary transition — there is none.
+    fn loss_from_successor(
+        &self,
+        c: &Connection,
+        history: &History,
+        request: &LossRequest,
+        trust: &Trust<'_>,
+    ) -> crate::Result<()> {
+        ensure(
+            history.head.is_none(),
+            "ordinary successor history forbidden",
+        )?;
+        let parent = read_parent(c, trust, &self.scope)?.ok_or("loss parent missing")?;
+        let successor = read_successor(c, trust)?.ok_or("replacement transition missing")?;
+        ensure_successor_not_aborted(c, trust)?;
+        // A format-1 successor carries no role, so neither participant can be
+        // proven survivor or replacement; such a pair cannot take a second
+        // loss until it is re-founded.
+        ensure(
+            successor.request.format == 2,
+            "format-1 loss successor cannot source a loss",
+        )?;
+        ensure(
+            successor.acknowledgements == [true; 2] && successor.completion.is_some(),
+            "completed replacement transition required",
+        )?;
+        let lost_index = successor
+            .request
+            .participants
+            .iter()
+            .position(|p| {
+                p.member == request.lost_member && p.generation == request.lost_generation
+            })
+            .ok_or("lost participant mismatch")?;
+        let survivor = &successor.request.participants[1 - lost_index];
+        ensure(
+            request.install == self.scope.install
+                && request.region == self.scope.region
+                && request.scope == self.scope.scope
+                && request.schema == self.scope.schema
+                && request.membership == self.scope.membership
+                && request.authority_id == self.scope.authority_id
+                && request.source_certificate == successor.certificate_id
+                && request.source_token_digest
+                    == <Id>::from(Sha256::digest(successor.token.as_bytes()))
+                && request.source_cut == successor.request.survivor_cut,
+            "loss source mismatch",
+        )?;
+        // The decided successor consumed `scope.initial_revision`, which the
+        // ordinary counter does not know about.
+        let effective = history.last_revision.max(successor.request.revision);
+        ensure(
+            request.revision == effective.checked_add(1).ok_or("loss revision overflow")?
+                && request.survivor.member == survivor.member
+                && request.survivor.generation == survivor.generation
+                && request.survivor.old_base == survivor.old_base
+                && request.replacement_member != successor.request.participants[0].member
+                && request.replacement_member != successor.request.participants[1].member,
+            "loss participant/revision mismatch",
+        )?;
+        // A retired identity may never come back: the member, generation and
+        // membership burnt by the first loss stay burnt.
+        ensure(
+            request.replacement_member != parent.loss.request.lost_member
+                && request.replacement_generation != parent.loss.request.lost_generation
+                && request.replacement_membership != parent.loss.request.membership,
+            "loss replacement reuses a retired identity",
+        )
+    }
+
     pub fn fetch_loss(
         &self,
         trust: &Trust<'_>,
@@ -877,6 +1097,7 @@ fn validate_successor_request(
     loss: &LossRequest,
     request: &LossSuccessorRequest,
 ) -> crate::Result<()> {
+    let (s, rp) = roles(request)?;
     ensure(
         request.revision == scope.initial_revision
             && request.install == loss.install
@@ -891,15 +1112,37 @@ fn validate_successor_request(
             && request.parent_loss_certificate != [0; 32]
             && request.survivor_cut == loss.survivor_cut
             && request.survivor_publication == loss.survivor_publication
-            && request.participants[0].member == loss.survivor.member
-            && request.participants[0].generation == loss.survivor.generation
-            && request.participants[0].old_base == loss.survivor.old_base
-            && request.participants[1].member == loss.replacement_member
-            && request.participants[1].generation == loss.replacement_generation
+            && request.participants[s].member == loss.survivor.member
+            && request.participants[s].generation == loss.survivor.generation
+            && request.participants[s].old_base == loss.survivor.old_base
+            && request.participants[rp].member == loss.replacement_member
+            && request.participants[rp].generation == loss.replacement_generation
             && request.participants.iter().all(|p| {
                 p.target == loss.survivor_cut && p.publication == loss.survivor_publication
             }),
         "replacement transition binding mismatch",
+    )
+}
+
+/// The single place that decides whether a decided successor has been
+/// cancelled by a `LossSuccessorAbort`.
+///
+/// S10 introduces that record type and the `transition_loss_successor_abort`
+/// singleton; until then no successor can be aborted, so this is vacuously
+/// satisfied. Every caller that must fail closed on an aborted successor is
+/// already wired to it, so S10 only has to fill in the body.
+fn ensure_successor_not_aborted(_c: &Connection, _trust: &Trust<'_>) -> crate::Result<()> {
+    Ok(())
+}
+
+/// Once a *second* loss is decided in a successor journal, the first
+/// successor membership must stop being usable for anything: this is what
+/// closes writer admission for the recovered pair the instant it loses
+/// another participant.
+fn ensure_successor_live(c: &Connection, trust: &Trust<'_>) -> crate::Result<()> {
+    ensure(
+        !loss_record_exists(c, trust)?,
+        "loss successor superseded by participant loss",
     )
 }
 
