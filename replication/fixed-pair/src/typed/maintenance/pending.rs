@@ -1,0 +1,2353 @@
+//! Restricted opener for a certified-maintenance operation which has already
+//! closed ordinary node admission. It never creates, migrates, or repairs data.
+use super::*;
+use sha2::{Digest, Sha256};
+use std::{fs::OpenOptions, path::Path};
+
+const MARKER: &str = "node_pending_certified_maintenance";
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Marker {
+    format: u32,
+    identity: Identity<SchemaId>,
+    role: Role,
+    previous_runtime: u32,
+    request_digest: [u8; 32],
+    plan_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Prepared {
+    format: u32,
+    phase: String,
+    plan: compaction::PairPlan,
+    request: crate::recovery::transition::Request,
+    token: String,
+    decision: Option<[u8; 32]>,
+    completion: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Active {
+    format: u32,
+    request: crate::recovery::decision::Request,
+    token_digest: [u8; 32],
+    grant_id: [u8; 32],
+    checkpoint: Prefix,
+    member: [u8; 32],
+}
+
+fn digest<T: Serialize>(value: &T) -> Result<[u8; 32]> {
+    Ok(Sha256::digest(serde_json::to_vec(value)?).into())
+}
+
+fn singleton_text(c: &Connection, table: &str, column: &str, limit: usize) -> Result<String> {
+    let rows: Vec<(u32, String)> = c
+        .prepare(&format!("SELECT id,{column} FROM {table} ORDER BY id"))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    ensure(
+        rows.len() == 1 && rows[0].0 == 1 && rows[0].1.len() <= limit,
+        "pending singleton mismatch",
+    )?;
+    Ok(rows.into_iter().next().unwrap().1)
+}
+
+pub(crate) fn prepare_pair<A: ReplicatedSchema>(
+    p: &Node<A>,
+    s: &Node<A>,
+    plan: &compaction::PairPlan,
+    request: &crate::recovery::transition::Request,
+    token: &str,
+    now: u64,
+    trust: &crate::recovery::transition::TrustStore,
+) -> Result<()> {
+    plan.validate_certified()?;
+    crate::recovery::transition::verify_issuance(token, &trust.as_trust(), request, now)?;
+    ensure(
+        p.role() == Role::Primary && s.role() == Role::Secondary && p.identity() == s.identity(),
+        "pending pair mismatch",
+    )?;
+    let prepared = Prepared {
+        format: 1,
+        phase: "prepared".into(),
+        plan: plan.clone(),
+        request: request.clone(),
+        token: token.into(),
+        decision: None,
+        completion: None,
+    };
+    let expected_json = serde_json::to_string(&prepared)?;
+    ensure(
+        expected_json.len() <= 256 * 1024 && token.len() <= 64 * 1024,
+        "pending record limit",
+    )?;
+    let scratch = Connection::open_in_memory()?;
+    schema::initialize(&scratch, &p.adapter)?;
+    let contract = schema_contract::describe(&scratch, &p.adapter)?;
+    let initial = hash(&p.adapter.view(&scratch)?)?;
+    let mut existing = [false; 2];
+    for (i, n) in [p, s].into_iter().enumerate() {
+        existing[i]=n.connection(|c|{
+            let present:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='node_pending_certified_maintenance')",[],|r|r.get(0))?;
+            if !present { return Ok(false); }
+            validate_pending(c,&n.adapter,&contract,&initial,n.identity(),n.role(),request,trust,n.certified_authority.as_deref(),Some(&prepared))?;
+            Ok(true)
+        })?;
+    }
+    for (i, n) in [p, s].into_iter().enumerate() {
+        if existing[i] {
+            continue;
+        }
+        ensure(
+            n.plan_compaction()? == *plan.local(n.role()),
+            "stale pending participant",
+        )?;
+        n.connection(|c| {
+            n.recovery_admission(c)?;
+            let previous = if c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='node_compaction_certificates')",
+                [],
+                |r| r.get::<_, bool>(0),
+            )? {
+                let json: String = c.query_row(
+                    "SELECT record FROM node_compaction_certificates ORDER BY sequence DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )?;
+                ensure(json.len() <= 256 * 1024, "previous certificate limit")?;
+                Some(serde_json::from_str::<certified::CertificateRecord>(&json)?)
+            } else {
+                None
+            };
+            certified::validate_record(
+                &certified::CertificateRecord {
+                    format: 1,
+                    plan: plan.clone(),
+                    request: request.clone(),
+                    token: token.into(),
+                },
+                n.identity(),
+                n.role(),
+                previous.as_ref(),
+            )?;
+            Node::<A>::verify_publication_in(
+                c,
+                plan.local(n.role())
+                    .publication
+                    .as_ref()
+                    .ok_or("pending publication missing")?,
+                n.identity(),
+                &n.contract,
+            )
+        })?;
+    }
+    // Only after every non-prepared participant passed read-only preflight.
+    for (i, n) in [p, s].into_iter().enumerate() {
+        if existing[i] {
+            continue;
+        }
+        n.connection(|c|{
+            let tx=c.unchecked_transaction()?;
+            let previous_runtime:u32=tx.query_row("SELECT format FROM node_runtime WHERE id=1",[],|r|r.get(0))?;
+            ensure(matches!(previous_runtime,3|4),"unsupported pending previous runtime")?;
+            let marker=Marker{format:1,identity:n.identity().clone(),role:n.role(),previous_runtime,request_digest:digest(request)?,plan_digest:digest(plan)?};
+            tx.execute_batch("CREATE TABLE node_pending_certified_maintenance(id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL); CREATE TABLE node_pending_certified_progress(id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL,digest TEXT NOT NULL);")?;
+            ensure(tx.execute("DELETE FROM replication_readiness",[])?<=1,"pending readiness transition failed")?;
+            ensure(tx.execute("UPDATE node_runtime SET format=5 WHERE id=1 AND format=?1",[previous_runtime])?==1,"pending runtime transition failed")?;
+            ensure(tx.execute("INSERT INTO node_pending_certified_maintenance VALUES(1,?1)",[serde_json::to_string(&marker)?])?==1,"pending marker write failed")?;
+            ensure(tx.execute("INSERT INTO node_pending_certified_progress VALUES(1,?1,?2)",params![&expected_json,hash(&prepared)?])?==1,"pending progress write failed")?;
+            ensure(tx.query_row("SELECT count(*)=0 FROM replication_readiness",[],|r|r.get::<_,bool>(0))?,"pending readiness remained")?;
+            tx.commit()?; Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingInspection {
+    pub role: Role,
+    pub identity: Identity<SchemaId>,
+    pub checkpoint: Prefix,
+    pub base: Option<Prefix>,
+}
+
+/// Deliberately does not contain a `Node`, implement `Deref`, or expose a
+/// connection callback. Dropping it releases the ordinary node lock.
+pub(crate) struct PendingMaintenanceHandle<A: ReplicatedSchema> {
+    db: Vesta,
+    adapter: A,
+    contract: schema_contract::Contract,
+    initial: String,
+    identity: Identity<SchemaId>,
+    role: Role,
+    inspection: PendingInspection,
+    prepared: Prepared,
+    finalized: bool,
+    certified_authority: Option<std::sync::Arc<dyn crate::typed::CertifiedAuthority>>,
+    _lock: File,
+}
+
+impl<A: ReplicatedSchema> PendingMaintenanceHandle<A> {
+    pub(crate) fn open_existing(
+        path: impl AsRef<Path>,
+        role: Role,
+        identity: Identity<SchemaId>,
+        passphrase: &str,
+        adapter: A,
+        expected: &crate::recovery::transition::Request,
+        trust: &crate::recovery::transition::TrustStore,
+    ) -> Result<Self> {
+        Self::open_existing_with_authority(
+            path, role, identity, passphrase, adapter, expected, trust, None,
+        )
+    }
+
+    pub(crate) fn open_existing_with_authority(
+        path: impl AsRef<Path>,
+        role: Role,
+        identity: Identity<SchemaId>,
+        passphrase: &str,
+        adapter: A,
+        expected: &crate::recovery::transition::Request,
+        trust: &crate::recovery::transition::TrustStore,
+        certified_authority: Option<std::sync::Arc<dyn crate::typed::CertifiedAuthority>>,
+    ) -> Result<Self> {
+        ensure(
+            identity.schema == adapter.identity()
+                && identity.epoch > 0
+                && !identity.cluster.is_empty()
+                && !identity.tenant.is_empty(),
+            "invalid pending identity",
+        )?;
+        let path = path.as_ref();
+        let path = path
+            .parent()
+            .ok_or("missing parent")?
+            .canonicalize()?
+            .join(path.file_name().ok_or("missing filename")?);
+        ensure(
+            path.is_file() && !path.is_symlink(),
+            "pending database absent",
+        )?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("node-lock"))?;
+        lock.try_lock()?;
+        let scratch = Connection::open_in_memory()?;
+        schema::initialize(&scratch, &adapter)?;
+        let contract = schema_contract::describe(&scratch, &adapter)?;
+        let initial = hash(&adapter.view(&scratch)?)?;
+        let readonly = Vesta::open_read_only_with_passphrase(&path, passphrase)?;
+        let (inspection, prepared) = readonly.with_connection(|c| {
+            c.pragma_update(None, "query_only", true)?;
+            Ok(validate_pending(
+                c,
+                &adapter,
+                &contract,
+                &initial,
+                &identity,
+                role,
+                expected,
+                trust,
+                certified_authority.as_deref(),
+                None,
+            ))
+        })??;
+        drop(readonly);
+        let db = Vesta::open_existing_read_write_with_passphrase(&path, passphrase)?;
+        db.with_connection(|c| {
+            validate_pending(
+                c,
+                &adapter,
+                &contract,
+                &initial,
+                &identity,
+                role,
+                expected,
+                trust,
+                certified_authority.as_deref(),
+                Some(&prepared),
+            )
+            .map(|_| ())
+            .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        Ok(Self {
+            db,
+            adapter,
+            contract,
+            initial,
+            identity,
+            role,
+            inspection,
+            prepared,
+            finalized: false,
+            certified_authority,
+            _lock: lock,
+        })
+    }
+
+    pub(crate) fn inspect(&self) -> &PendingInspection {
+        &self.inspection
+    }
+
+    fn replace_progress(
+        &mut self,
+        trust: &crate::recovery::transition::TrustStore,
+        next: Prepared,
+        authorize: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        self.db.with_connection(|c| {
+            let run = || -> Result<()> {
+                let tx = rusqlite::Transaction::new_unchecked(
+                    c,
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
+                validate_pending(
+                    &tx,
+                    &self.adapter,
+                    &self.contract,
+                    &self.initial,
+                    &self.identity,
+                    self.role,
+                    &self.prepared.request,
+                    trust,
+                    self.certified_authority.as_deref(),
+                    Some(&self.prepared),
+                )?;
+                authorize()?;
+                let old_json = serde_json::to_string(&self.prepared)?;
+                let next_json = serde_json::to_string(&next)?;
+                ensure(
+                    tx.execute(
+                        "UPDATE node_pending_certified_progress SET record=?1,digest=?2 WHERE id=1 AND record=?3 AND digest=?4",
+                        params![next_json, hash(&next)?, old_json, hash(&self.prepared)?],
+                    )? == 1,
+                    "pending progress transition failed",
+                )?;
+                tx.commit()?;
+                Ok(())
+            };
+            run().map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        self.prepared = next;
+        Ok(())
+    }
+}
+
+struct PreparedPolicy<'a, P> {
+    external: &'a P,
+    request: &'a crate::recovery::transition::Request,
+    participants: [&'a crate::recovery::transition::Participant; 2],
+}
+
+struct AppliedPolicy<'a, P> {
+    external: &'a P,
+    participant: &'a crate::recovery::transition::Participant,
+}
+
+impl<P: crate::recovery::transition::Policy> crate::recovery::transition::Policy
+    for AppliedPolicy<'_, P>
+{
+    fn continuity(
+        &self,
+        scope: &crate::recovery::transition::JournalScope,
+        request: &crate::recovery::transition::Request,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        self.external.continuity(scope, request)
+    }
+
+    fn prepared(
+        &self,
+        scope: &crate::recovery::transition::JournalScope,
+        request: &crate::recovery::transition::Request,
+        member: &crate::recovery::transition::Participant,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        self.external.prepared(scope, request, member)
+    }
+
+    fn applied(
+        &self,
+        scope: &crate::recovery::transition::JournalScope,
+        decision: &crate::recovery::transition::CommittedTransition,
+        member: &crate::recovery::transition::Participant,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        ensure(
+            member == self.participant,
+            "pending ACK participant mismatch",
+        )?;
+        self.external.applied(scope, decision, member)
+    }
+}
+
+impl<P: crate::recovery::transition::Policy> crate::recovery::transition::Policy
+    for PreparedPolicy<'_, P>
+{
+    fn continuity(
+        &self,
+        scope: &crate::recovery::transition::JournalScope,
+        request: &crate::recovery::transition::Request,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        ensure(request == self.request, "pending decision request mismatch")?;
+        self.external.continuity(scope, request)
+    }
+
+    fn prepared(
+        &self,
+        scope: &crate::recovery::transition::JournalScope,
+        request: &crate::recovery::transition::Request,
+        member: &crate::recovery::transition::Participant,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        ensure(
+            request == self.request && self.participants.contains(&member),
+            "pending decision participant mismatch",
+        )?;
+        self.external.prepared(scope, request, member)
+    }
+
+    fn applied(
+        &self,
+        scope: &crate::recovery::transition::JournalScope,
+        decision: &crate::recovery::transition::CommittedTransition,
+        member: &crate::recovery::transition::Participant,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        self.external.applied(scope, decision, member)
+    }
+}
+
+/// Persist only the authority decision. Both restricted handles remain in the
+/// PREPARED phase; this does not mutate either node or record an ACK.
+pub(crate) fn decide_prepared<A: ReplicatedSchema>(
+    primary: &PendingMaintenanceHandle<A>,
+    secondary: &PendingMaintenanceHandle<A>,
+    journal: &crate::recovery::transition::Journal,
+    now: u64,
+    trust: &crate::recovery::transition::TrustStore,
+    policy: &impl crate::recovery::transition::Policy,
+) -> Result<crate::recovery::transition::CommittedTransition> {
+    ensure(
+        primary.role == Role::Primary
+            && secondary.role == Role::Secondary
+            && primary.identity == secondary.identity
+            && primary.prepared == secondary.prepared,
+        "pending decision pair mismatch",
+    )?;
+    let prepared = &primary.prepared;
+    ensure(
+        prepared.phase == "prepared"
+            && primary.inspection.role == Role::Primary
+            && secondary.inspection.role == Role::Secondary
+            && primary.inspection.checkpoint == prepared.plan.primary.checkpoint
+            && secondary.inspection.checkpoint == prepared.plan.secondary.checkpoint,
+        "unsupported pending decision state",
+    )?;
+    // This is deliberately fresh even though Journal::decide verifies again
+    // inside its immediate transaction.
+    crate::recovery::transition::verify_issuance(
+        &prepared.token,
+        &trust.as_trust(),
+        &prepared.request,
+        now,
+    )?;
+    let guarded = PreparedPolicy {
+        external: policy,
+        request: &prepared.request,
+        participants: [
+            &prepared.request.participants[0],
+            &prepared.request.participants[1],
+        ],
+    };
+    Ok(journal.decide(
+        prepared.request.clone(),
+        &prepared.token,
+        now,
+        &trust.as_trust(),
+        &guarded,
+    )?)
+}
+
+pub(crate) fn record_decided<A: ReplicatedSchema>(
+    handle: &mut PendingMaintenanceHandle<A>,
+    journal: &crate::recovery::transition::Journal,
+    trust: &crate::recovery::transition::TrustStore,
+    policy: &impl crate::recovery::transition::Policy,
+) -> Result<()> {
+    let verified = crate::recovery::transition::verify_historical(
+        &handle.prepared.token,
+        &trust.as_trust(),
+        &handle.prepared.request,
+    )?;
+    if handle.prepared.phase == "decided" {
+        let decision = journal.fetch(&handle.prepared.request, &trust.as_trust(), policy)?;
+        return ensure(
+            handle.prepared.decision == Some(decision.token_digest()),
+            "pending decided conflict",
+        );
+    }
+    ensure(
+        handle.prepared.phase == "prepared" && handle.prepared.decision.is_none(),
+        "invalid pending decision transition",
+    )?;
+    let mut next = handle.prepared.clone();
+    next.phase = "decided".into();
+    next.decision = Some(verified.token_digest());
+    let request = handle.prepared.request.clone();
+    let expected_digest = verified.token_digest();
+    handle.replace_progress(trust, next, || {
+        let decision = journal.fetch(&request, &trust.as_trust(), policy)?;
+        ensure(
+            decision.token_digest() == expected_digest,
+            "pending decision token mismatch",
+        )
+    })
+}
+
+pub(crate) fn apply_decided<A: ReplicatedSchema>(
+    handle: &mut PendingMaintenanceHandle<A>,
+    journal: &crate::recovery::transition::Journal,
+    trust: &crate::recovery::transition::TrustStore,
+    policy: &impl crate::recovery::transition::Policy,
+) -> Result<()> {
+    if handle.prepared.phase == "applied" {
+        journal.fetch(&handle.prepared.request, &trust.as_trust(), policy)?;
+        return Ok(());
+    }
+    ensure(
+        handle.prepared.phase == "decided" && handle.prepared.decision.is_some(),
+        "invalid pending apply transition",
+    )?;
+    let mut next = handle.prepared.clone();
+    next.phase = "applied".into();
+    let old = handle.prepared.clone();
+    handle.db.with_connection(|c| {
+        let run = || -> Result<()> {
+            let tx = rusqlite::Transaction::new_unchecked(
+                c,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            validate_pending(
+                &tx,
+                &handle.adapter,
+                &handle.contract,
+                &handle.initial,
+                &handle.identity,
+                handle.role,
+                &old.request,
+                trust,
+                handle.certified_authority.as_deref(),
+                Some(&old),
+            )?;
+            let decision = journal.fetch(&old.request, &trust.as_trust(), policy)?;
+            ensure(
+                Some(decision.token_digest()) == old.decision,
+                "pending apply decision mismatch",
+            )?;
+            require_unpinned(&tx)?;
+            let local = old.plan.local(handle.role);
+            ensure(
+                checkpoint::current_for(
+                    &tx,
+                    &handle.adapter,
+                    &handle.identity,
+                    &handle.initial,
+                    true,
+                )?
+                .0 == local.checkpoint
+                    && journal::head_for(&tx, &handle.identity)? == local.head,
+                "pending apply cut changed",
+            )?;
+            let prior: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='node_compaction_certificates')",
+                [],
+                |r| r.get(0),
+            )?;
+            if !prior {
+                tx.execute_batch(
+                    "CREATE TABLE node_compaction_root(id INTEGER PRIMARY KEY CHECK(id=1),base TEXT NOT NULL);
+                     CREATE TABLE node_compaction_history(sequence INTEGER PRIMARY KEY,plan TEXT NOT NULL,digest TEXT NOT NULL);
+                     CREATE TABLE node_compaction_certificates(sequence INTEGER PRIMARY KEY,record TEXT NOT NULL);",
+                )?;
+                ensure(
+                    tx.execute(
+                        "INSERT INTO node_compaction_root VALUES(1,?1)",
+                        [serde_json::to_string(&local.head.base)?],
+                    )? == 1,
+                    "pending compaction root write failed",
+                )?;
+            }
+            ensure(
+                tx.execute(
+                    "INSERT INTO node_compaction_history VALUES(?1,?2,?3)",
+                    params![local.checkpoint.sequence, serde_json::to_string(&old.plan)?, hash(&old.plan)?],
+                )? == 1,
+                "pending compaction history write failed",
+            )?;
+            let certificate = certified::CertificateRecord {
+                format: 1,
+                plan: old.plan.clone(),
+                request: old.request.clone(),
+                token: old.token.clone(),
+            };
+            ensure(
+                tx.execute(
+                    "INSERT INTO node_compaction_certificates VALUES(?1,?2)",
+                    params![local.checkpoint.sequence, serde_json::to_string(&certificate)?],
+                )? == 1,
+                "pending certificate write failed",
+            )?;
+            ensure(
+                tx.execute(
+                    "INSERT INTO replication_base VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET checkpoint=excluded.checkpoint",
+                    [serde_json::to_string(&local.checkpoint)?],
+                )? == 1,
+                "pending base write failed",
+            )?;
+            tx.execute(
+                "DELETE FROM replication_log WHERE sequence<=?1",
+                [local.checkpoint.sequence],
+            )?;
+            if prior {
+                ensure(
+                    tx.query_row(
+                        "SELECT version=3 FROM node_maintenance_format WHERE id=1",
+                        [],
+                        |r| r.get::<_, bool>(0),
+                    )?,
+                    "pending maintenance format mismatch",
+                )?;
+            } else {
+                ensure(
+                    tx.execute(
+                        "UPDATE node_maintenance_format SET version=3 WHERE id=1 AND version=1",
+                        [],
+                    )? == 1,
+                    "pending maintenance format transition failed",
+                )?;
+            }
+            let old_json = serde_json::to_string(&old)?;
+            let next_json = serde_json::to_string(&next)?;
+            ensure(
+                tx.execute(
+                    "UPDATE node_pending_certified_progress SET record=?1,digest=?2 WHERE id=1 AND record=?3 AND digest=?4",
+                    params![next_json, hash(&next)?, old_json, hash(&old)?],
+                )? == 1,
+                "pending apply progress transition failed",
+            )?;
+            validate_pending(
+                &tx,
+                &handle.adapter,
+                &handle.contract,
+                &handle.initial,
+                &handle.identity,
+                handle.role,
+                &old.request,
+                trust,
+                handle.certified_authority.as_deref(),
+                Some(&next),
+            )?;
+            tx.commit()?;
+            Ok(())
+        };
+        run().map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))
+    })?;
+    handle.prepared = next;
+    Ok(())
+}
+
+pub(crate) fn acknowledge_applied<A: ReplicatedSchema>(
+    handle: &PendingMaintenanceHandle<A>,
+    journal: &crate::recovery::transition::Journal,
+    trust: &crate::recovery::transition::TrustStore,
+    policy: &impl crate::recovery::transition::Policy,
+) -> Result<()> {
+    ensure(
+        handle.prepared.phase == "applied",
+        "pending node is not applied",
+    )?;
+    let participant =
+        &handle.prepared.request.participants[if handle.role == Role::Primary { 0 } else { 1 }];
+    handle.db.with_connection(|c| {
+        let run = || -> Result<()> {
+            let tx =
+                rusqlite::Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
+            validate_pending(
+                &tx,
+                &handle.adapter,
+                &handle.contract,
+                &handle.initial,
+                &handle.identity,
+                handle.role,
+                &handle.prepared.request,
+                trust,
+                handle.certified_authority.as_deref(),
+                Some(&handle.prepared),
+            )?;
+            let decision = journal.fetch(&handle.prepared.request, &trust.as_trust(), policy)?;
+            ensure(
+                Some(decision.token_digest()) == handle.prepared.decision,
+                "pending ACK decision mismatch",
+            )?;
+            journal.acknowledge(
+                &decision,
+                participant,
+                &trust.as_trust(),
+                &AppliedPolicy {
+                    external: policy,
+                    participant,
+                },
+            )?;
+            tx.commit()?;
+            Ok(())
+        };
+        run().map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))
+    })?;
+    Ok(())
+}
+
+fn validate_retained<A: ReplicatedSchema>(
+    handle: &PendingMaintenanceHandle<A>,
+    trust: &crate::recovery::transition::TrustStore,
+) -> Result<()> {
+    handle.db.with_connection(|c| {
+        validate_pending(
+            c,
+            &handle.adapter,
+            &handle.contract,
+            &handle.initial,
+            &handle.identity,
+            handle.role,
+            &handle.prepared.request,
+            trust,
+            handle.certified_authority.as_deref(),
+            Some(&handle.prepared),
+        )
+        .map(|_| ())
+        .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))
+    })?;
+    Ok(())
+}
+
+pub(crate) fn complete_authority<A: ReplicatedSchema>(
+    primary: &PendingMaintenanceHandle<A>,
+    secondary: &PendingMaintenanceHandle<A>,
+    journal: &crate::recovery::transition::Journal,
+    completion: [u8; 32],
+    trust: &crate::recovery::transition::TrustStore,
+    policy: &impl crate::recovery::transition::Policy,
+) -> Result<()> {
+    ensure(
+        completion != [0; 32]
+            && primary.role == Role::Primary
+            && secondary.role == Role::Secondary
+            && primary.identity == secondary.identity
+            && primary.prepared == secondary.prepared
+            && primary.prepared.phase == "applied",
+        "pending completion pair mismatch",
+    )?;
+    validate_retained(primary, trust)?;
+    validate_retained(secondary, trust)?;
+    let decision = journal.fetch(&primary.prepared.request, &trust.as_trust(), policy)?;
+    journal.complete(&decision, completion, &trust.as_trust(), policy)?;
+    Ok(())
+}
+
+pub(crate) fn record_complete<A: ReplicatedSchema>(
+    handle: &mut PendingMaintenanceHandle<A>,
+    journal: &crate::recovery::transition::Journal,
+    trust: &crate::recovery::transition::TrustStore,
+    policy: &impl crate::recovery::transition::Policy,
+) -> Result<()> {
+    let completed = journal.fetch_completed(&handle.prepared.request, &trust.as_trust(), policy)?;
+    if handle.prepared.phase == "complete" {
+        return ensure(
+            handle.prepared.completion == Some(completed.completion()),
+            "pending node completion conflict",
+        );
+    }
+    ensure(
+        handle.prepared.phase == "applied" && handle.prepared.completion.is_none(),
+        "invalid pending completion transition",
+    )?;
+    let mut next = handle.prepared.clone();
+    next.phase = "complete".into();
+    next.completion = Some(completed.completion());
+    let request = handle.prepared.request.clone();
+    let completion = completed.completion();
+    handle.replace_progress(trust, next, || {
+        let current = journal.fetch_completed(&request, &trust.as_trust(), policy)?;
+        ensure(
+            current.completion() == completion,
+            "pending completion changed",
+        )
+    })
+}
+
+fn finalize_complete<A: ReplicatedSchema>(
+    handle: &mut PendingMaintenanceHandle<A>,
+    journal: &crate::recovery::transition::Journal,
+    trust: &crate::recovery::transition::TrustStore,
+    policy: &impl crate::recovery::transition::Policy,
+) -> Result<()> {
+    if handle.finalized {
+        journal.fetch_completed(&handle.prepared.request, &trust.as_trust(), policy)?;
+        return Ok(());
+    }
+    ensure(
+        handle.prepared.phase == "complete" && handle.prepared.completion.is_some(),
+        "pending node is not complete",
+    )?;
+    handle.db.with_connection(|c| {
+        let run = || -> Result<()> {
+            let tx = rusqlite::Transaction::new_unchecked(
+                c,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            validate_pending(
+                &tx,
+                &handle.adapter,
+                &handle.contract,
+                &handle.initial,
+                &handle.identity,
+                handle.role,
+                &handle.prepared.request,
+                trust,
+                handle.certified_authority.as_deref(),
+                Some(&handle.prepared),
+            )?;
+            let completed = journal.fetch_completed(
+                &handle.prepared.request,
+                &trust.as_trust(),
+                policy,
+            )?;
+            ensure(
+                Some(completed.completion()) == handle.prepared.completion
+                    && completed.token_digest() == handle.prepared.decision.unwrap(),
+                "pending finalization proof mismatch",
+            )?;
+            let marker_json = singleton_text(
+                &tx,
+                "node_pending_certified_maintenance",
+                "record",
+                64 * 1024,
+            )?;
+            let marker: Marker = serde_json::from_str(&marker_json)?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS node_compaction_completion(id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL);",
+            )?;
+            ensure(
+                tx.execute(
+                    "INSERT INTO node_compaction_completion VALUES(1,?1)
+                     ON CONFLICT(id) DO UPDATE SET record=excluded.record",
+                    [serde_json::to_string(&(
+                        1u32,
+                        completed.request().id,
+                        completed.token_digest(),
+                        completed.completion(),
+                    ))?],
+                )? == 1,
+                "pending completion archive failed",
+            )?;
+            tx.execute_batch(
+                "DROP TABLE node_pending_certified_progress;
+                 DROP TABLE node_pending_certified_maintenance;",
+            )?;
+            ensure(
+                tx.execute(
+                    "UPDATE node_runtime SET format=?1 WHERE id=1 AND format=5",
+                    [marker.previous_runtime],
+                )? == 1,
+                "pending runtime finalization failed",
+            )?;
+            ensure(
+                tx.execute(
+                    "INSERT INTO replication_readiness VALUES(1,?1)",
+                    [serde_json::to_string(&handle.prepared.plan.local(handle.role).checkpoint)?],
+                )? == 1,
+                "pending readiness finalization failed",
+            )?;
+            tx.commit()?;
+            Ok(())
+        };
+        run().map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))
+    })?;
+    handle.finalized = true;
+    Ok(())
+}
+
+pub(crate) fn finalize_pair<A: ReplicatedSchema>(
+    primary: &mut PendingMaintenanceHandle<A>,
+    secondary: &mut PendingMaintenanceHandle<A>,
+    journal: &crate::recovery::transition::Journal,
+    trust: &crate::recovery::transition::TrustStore,
+    policy: &impl crate::recovery::transition::Policy,
+) -> Result<()> {
+    ensure(
+        primary.prepared == secondary.prepared
+            && primary.prepared.phase == "complete"
+            && secondary.prepared.phase == "complete",
+        "pending finalization pair mismatch",
+    )?;
+    finalize_complete(secondary, journal, trust, policy)?;
+    finalize_complete(primary, journal, trust, policy)
+}
+
+fn validate_pending<A: ReplicatedSchema>(
+    c: &Connection,
+    adapter: &A,
+    contract: &schema_contract::Contract,
+    initial: &str,
+    identity: &Identity<SchemaId>,
+    role: Role,
+    expected: &crate::recovery::transition::Request,
+    trust: &crate::recovery::transition::TrustStore,
+    certified_authority: Option<&dyn crate::typed::CertifiedAuthority>,
+    exact: Option<&Prepared>,
+) -> Result<(PendingInspection, Prepared)> {
+    let marker_rows: Vec<(u32, String)> = c
+        .prepare(&format!("SELECT id,record FROM {MARKER} ORDER BY id"))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    ensure(
+        marker_rows.len() == 1 && marker_rows[0].0 == 1 && marker_rows[0].1.len() <= 64 * 1024,
+        "pending marker row mismatch",
+    )?;
+    let marker: Marker = serde_json::from_str(&marker_rows[0].1)?;
+    ensure(
+        marker.format == 1
+            && marker.identity == *identity
+            && marker.role == role
+            && matches!(marker.previous_runtime, 3 | 4),
+        "pending marker owner mismatch",
+    )?;
+    let runtime: Vec<(u32, u32, String)> = c
+        .prepare("SELECT id,format,initial_digest FROM node_runtime")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    ensure(
+        runtime == [(1, 5, initial.to_owned())],
+        "unsupported pending runtime",
+    )?;
+    ensure(
+        c.query_row("SELECT count(*)=0 FROM replication_readiness", [], |r| {
+            r.get::<_, bool>(0)
+        })?,
+        "pending readiness present",
+    )?;
+    let owner: Vec<(i64, String)> = c
+        .prepare("SELECT rowid,value FROM node_identity")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    ensure(
+        owner == [(1, serde_json::to_string(&(&identity, role))?)],
+        "pending node owner mismatch",
+    )?;
+    let progress_rows: Vec<(u32, String, String)> = c
+        .prepare("SELECT id,record,digest FROM node_pending_certified_progress ORDER BY id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    ensure(
+        progress_rows.len() == 1
+            && progress_rows[0].0 == 1
+            && progress_rows[0].1.len() <= 256 * 1024
+            && progress_rows[0].2.len() <= 128,
+        "pending progress row mismatch",
+    )?;
+    let progress: Prepared = serde_json::from_str(&progress_rows[0].1)?;
+    if let Some(exact) = exact {
+        ensure(&progress == exact, "pending maintenance conflict")?;
+    }
+    ensure(
+        hash(&progress)? == progress_rows[0].2,
+        "pending progress integrity",
+    )?;
+    ensure(
+        progress.format == 1
+            && matches!(
+                progress.phase.as_str(),
+                "prepared" | "decided" | "applied" | "complete"
+            )
+            && &progress.request == expected,
+        "unsupported pending phase",
+    )?;
+    schema_contract::verify(c, adapter, contract)?;
+    sql_snapshot::verify_binding(c, adapter, &snapshot::scope(identity))?;
+    if matches!(progress.phase.as_str(), "applied" | "complete") {
+        recovery::verify_history(c, marker.previous_runtime - 2)?;
+        let lineage = certified::verify_metadata(c, 3, Some(trust))?
+            .ok_or("pending certified lineage missing")?;
+        ensure(
+            lineage.source_anchor
+                == progress
+                    .plan
+                    .local(role)
+                    .recovery_anchor
+                    .clone()
+                    .ok_or("pending recovery anchor missing")?
+                && lineage.current_base == progress.plan.local(role).checkpoint,
+            "pending certified lineage mismatch",
+        )?;
+    } else {
+        let derived = history_format(c, marker.previous_runtime)?;
+        recovery::verify_history(c, derived)?;
+    }
+    let receipt_format: Vec<(u32, u32)> = c
+        .prepare("SELECT id,version FROM receipt_format ORDER BY id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    ensure(
+        receipt_format.len() == 1
+            && receipt_format[0].0 == 1
+            && matches!(receipt_format[0].1, 1 | 2),
+        "pending receipt format mismatch",
+    )?;
+    let checkpoint_format: Vec<(u32, u32)> = c
+        .prepare("SELECT id,version FROM checkpoint_format ORDER BY id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    ensure(
+        checkpoint_format == [(1, 2)],
+        "pending checkpoint format mismatch",
+    )?;
+    capacity::verify_schema(c)?;
+    capacity::verify_accounting(c)?;
+    ensure(
+        marker.request_digest == digest(&progress.request)?
+            && marker.plan_digest == digest(&progress.plan)?,
+        "pending marker/progress mismatch",
+    )?;
+    ensure(progress.token.len() <= 64 * 1024, "pending token limit")?;
+    progress.plan.validate_certified()?;
+    let previous_certificate = if c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='node_compaction_certificates')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        let json: Option<String> = if matches!(progress.phase.as_str(), "applied" | "complete") {
+            c.query_row(
+                "SELECT record FROM node_compaction_certificates WHERE sequence<?1 ORDER BY sequence DESC LIMIT 1",
+                [progress.plan.local(role).checkpoint.sequence],
+                |r| r.get(0),
+            ).optional()?
+        } else {
+            c.query_row(
+                "SELECT record FROM node_compaction_certificates ORDER BY sequence DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            ).optional()?
+        };
+        json.map(|json| -> Result<certified::CertificateRecord> {
+            ensure(json.len() <= 256 * 1024, "previous certificate limit")?;
+            Ok(serde_json::from_str::<certified::CertificateRecord>(&json)?)
+        })
+        .transpose()?
+    } else {
+        None
+    };
+    certified::validate_record(
+        &certified::CertificateRecord {
+            format: 1,
+            plan: progress.plan.clone(),
+            request: progress.request.clone(),
+            token: progress.token.clone(),
+        },
+        identity,
+        role,
+        previous_certificate.as_ref(),
+    )?;
+    let local = progress.plan.local(role);
+    ensure(
+        local.checkpoint.identity == *identity,
+        "pending checkpoint identity mismatch",
+    )?;
+    let checkpoint = checkpoint::current_for(c, adapter, identity, initial, true)?.0;
+    ensure(
+        checkpoint == local.checkpoint,
+        "pending physical checkpoint mismatch",
+    )?;
+    ensure(
+        checkpoint::base_for::<SchemaId>(c)?
+            == if matches!(progress.phase.as_str(), "applied" | "complete") {
+                Some(local.checkpoint.clone())
+            } else {
+                local.head.base.clone()
+            },
+        "pending base mismatch",
+    )?;
+    let publication_json = singleton_text(c, "node_publication", "manifest", 256 * 1024)?;
+    ensure(
+        snapshot::Manifest::decode(publication_json.as_bytes())?
+            == *local
+                .publication
+                .as_ref()
+                .ok_or("pending publication missing")?,
+        "pending publication mismatch",
+    )?;
+    Node::<A>::verify_publication_in(
+        c,
+        local
+            .publication
+            .as_ref()
+            .ok_or("pending publication missing")?,
+        identity,
+        contract,
+    )?;
+    // This authenticates inspection bytes only. It is deliberately historical:
+    // starting/deciding the operation still requires fresh issuance after BOTH
+    // durable Prepared records. An expired proposal must be aborted/replaced;
+    // this handle cannot renew it or authorize Journal::decide.
+    let verified = crate::recovery::transition::verify_historical(
+        &progress.token,
+        &trust.as_trust(),
+        expected,
+    )?;
+    ensure(
+        if progress.phase == "prepared" {
+            progress.decision.is_none() && progress.completion.is_none()
+        } else if progress.phase == "complete" {
+            progress.decision == Some(verified.token_digest())
+                && progress.completion.is_some_and(|id| id != [0; 32])
+        } else {
+            progress.decision == Some(verified.token_digest()) && progress.completion.is_none()
+        },
+        "pending phase evidence mismatch",
+    )?;
+    let active_json = singleton_text(c, "recovery_active", "record", 64 * 1024)?;
+    let active: Active = serde_json::from_str(&active_json)?;
+    let plan = &active.request.plan;
+    active.request.validate(&plan.baseline)?;
+    let index = if active.member == plan.candidate {
+        0
+    } else if active.member == plan.baseline.survivor {
+        1
+    } else {
+        return Err("active member mismatch".into());
+    };
+    let generation: Vec<u8> = c.query_row(
+        "SELECT value FROM replication_generation WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    let participant = &expected.participants[if role == Role::Primary { 0 } else { 1 }];
+    ensure(
+        active.format == 1
+            && active.token_digest != [0; 32]
+            && active.grant_id != [0; 32]
+            && serde_json::to_string(identity)? == plan.baseline.scope
+            && index == if role == Role::Primary { 0 } else { 1 }
+            && active.request.prepared[index].member == active.member
+            && active.request.prepared[index].generation.as_slice() == generation.as_slice()
+            && active.checkpoint.identity == *identity
+            && digest(&active.checkpoint)? == plan.baseline.checkpoint,
+        "pending active recovery mismatch",
+    )?;
+    let certified_history: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='node_compaction_certificates')",
+        [],
+        |r| r.get(0),
+    )?;
+    if certified_history && matches!(progress.phase.as_str(), "prepared" | "decided") {
+        maintenance::verify_certified(c, Some(trust))?;
+        maintenance::verify_historical_certified(c, certified_authority)?;
+    }
+    if !certified_history {
+        let anchored = checkpoint::calculate_for(
+            c,
+            adapter,
+            identity,
+            initial,
+            true,
+            Some(active.checkpoint.sequence),
+        )?;
+        ensure(
+            anchored == active.checkpoint,
+            "pending recovery anchor mismatch",
+        )?;
+        if role == Role::Primary {
+            ensure(
+                checkpoint::base_for::<SchemaId>(c)?.as_ref() == Some(&active.checkpoint),
+                "pending candidate anchor base mismatch",
+            )?;
+        }
+    }
+    ensure(
+        certified_history || matches!(progress.phase.as_str(), "prepared" | "decided"),
+        "pending certified segment mismatch",
+    )?;
+    let seal_json = singleton_text(c, "recovery_seal", "plan", 32 * 1024)?;
+    ensure(
+        serde_json::from_str::<crate::recovery::model::Plan>(&seal_json)? == *plan,
+        "pending seal mismatch",
+    )?;
+    let delivery = singleton_text(c, "recovery_delivery", "receipt", 256 * 1024)?;
+    ensure(
+        delivery
+            == serde_json::to_string(&(
+                1u32,
+                &active.request,
+                active.token_digest,
+                active.grant_id,
+                &active.request.prepared[index],
+            ))?,
+        "pending delivery mismatch",
+    )?;
+    let completion = singleton_text(c, "recovery_completion", "receipt", 256 * 1024)?;
+    let (v, request, token, grant, done): (
+        u32,
+        crate::recovery::decision::Request,
+        [u8; 32],
+        [u8; 32],
+        [u8; 32],
+    ) = serde_json::from_str(&completion)?;
+    ensure(
+        v == 1
+            && request == active.request
+            && token == active.token_digest
+            && grant == active.grant_id
+            && done != [0; 32],
+        "pending completion mismatch",
+    )?;
+    ensure(
+        participant.member == active.member
+            && participant.generation.as_slice() == generation.as_slice(),
+        "pending live member/generation mismatch",
+    )?;
+    ensure(
+        expected.membership
+            == digest(&(
+                &active.request,
+                active.token_digest,
+                active.grant_id,
+                &active.checkpoint,
+            ))?
+            && Some(expected.membership) == local.membership,
+        "pending membership mismatch",
+    )?;
+    let inspection = PendingInspection {
+        role,
+        identity: identity.clone(),
+        checkpoint,
+        base: checkpoint::base_for::<SchemaId>(c)?,
+    };
+    Ok((inspection, progress))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{envelope_tests::StockSchema, typed::recovery::tests::recovered_pair_for_pending};
+    use std::cell::Cell;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+
+    struct Authority {
+        current: Cell<bool>,
+        revoke_on_check: Cell<bool>,
+    }
+
+    impl crate::recovery::transition::Policy for Authority {
+        fn continuity(
+            &self,
+            _: &crate::recovery::transition::JournalScope,
+            _: &crate::recovery::transition::Request,
+        ) -> terrapi_vesta_recovery::Result<()> {
+            if self.revoke_on_check.replace(false) {
+                self.current.set(false);
+            }
+            ensure(self.current.get(), "stale pending authority")
+        }
+
+        fn prepared(
+            &self,
+            _: &crate::recovery::transition::JournalScope,
+            _: &crate::recovery::transition::Request,
+            _: &crate::recovery::transition::Participant,
+        ) -> terrapi_vesta_recovery::Result<()> {
+            Ok(())
+        }
+
+        fn applied(
+            &self,
+            _: &crate::recovery::transition::JournalScope,
+            _: &crate::recovery::transition::CommittedTransition,
+            _: &crate::recovery::transition::Participant,
+        ) -> terrapi_vesta_recovery::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct WriterAuthority {
+        journal: Mutex<crate::recovery::transition::Journal>,
+        trust: crate::recovery::transition::TrustStore,
+        current: AtomicBool,
+    }
+
+    impl crate::recovery::transition::Policy for WriterAuthority {
+        fn continuity(
+            &self,
+            _: &crate::recovery::transition::JournalScope,
+            _: &crate::recovery::transition::Request,
+        ) -> terrapi_vesta_recovery::Result<()> {
+            ensure(
+                self.current.load(Ordering::SeqCst),
+                "stale writer authority",
+            )
+        }
+        fn prepared(
+            &self,
+            _: &crate::recovery::transition::JournalScope,
+            _: &crate::recovery::transition::Request,
+            _: &crate::recovery::transition::Participant,
+        ) -> terrapi_vesta_recovery::Result<()> {
+            Ok(())
+        }
+        fn applied(
+            &self,
+            _: &crate::recovery::transition::JournalScope,
+            _: &crate::recovery::transition::CommittedTransition,
+            _: &crate::recovery::transition::Participant,
+        ) -> terrapi_vesta_recovery::Result<()> {
+            Ok(())
+        }
+
+        fn historical_completion(
+            &self,
+            _: &crate::recovery::transition::JournalScope,
+            historical: &crate::recovery::transition::Request,
+            current_head: &crate::recovery::transition::Request,
+        ) -> terrapi_vesta_recovery::Result<()> {
+            ensure(
+                self.current.load(Ordering::SeqCst)
+                    && (current_head == historical || current_head.revision > historical.revision)
+                    && current_head.authority_id == historical.authority_id
+                    && current_head.install == historical.install
+                    && current_head.region == historical.region
+                    && current_head.scope == historical.scope
+                    && current_head.schema == historical.schema
+                    && current_head.membership == historical.membership
+                    && current_head.source_anchor == historical.source_anchor,
+                "stale historical writer authority",
+            )
+        }
+    }
+
+    impl crate::typed::CertifiedAuthority for WriterAuthority {
+        fn fetch_completed(
+            &self,
+            request: &crate::recovery::transition::Request,
+        ) -> terrapi_vesta_recovery::Result<crate::recovery::transition::CompletedTransition>
+        {
+            self.journal
+                .lock()
+                .map_err(|_| "writer authority poisoned")?
+                .fetch_completed(request, &self.trust.as_trust(), self)
+        }
+
+        fn fetch_completed_revision(
+            &self,
+            request: &crate::recovery::transition::Request,
+        ) -> terrapi_vesta_recovery::Result<
+            crate::recovery::transition::HistoricalCompletedTransition,
+        > {
+            self.journal
+                .lock()
+                .map_err(|_| "writer authority poisoned")?
+                .fetch_completed_revision(request, &self.trust.as_trust(), self)
+        }
+    }
+
+    fn pending_evidence<A: ReplicatedSchema>(
+        h: &PendingMaintenanceHandle<A>,
+    ) -> Result<(u32, u64, String, String, u64, u64, u64)> {
+        Ok(h.db.with_connection(|c| {
+            Ok((
+                c.query_row("SELECT format FROM node_runtime WHERE id=1", [], |r| r.get(0))?,
+                c.query_row("SELECT count(*) FROM replication_readiness", [], |r| r.get(0))?,
+                c.query_row(
+                    "SELECT record FROM node_pending_certified_maintenance WHERE id=1",
+                    [],
+                    |r| r.get(0),
+                )?,
+                c.query_row(
+                    "SELECT record || ':' || digest FROM node_pending_certified_progress WHERE id=1",
+                    [],
+                    |r| r.get(0),
+                )?,
+                c.query_row("SELECT count(*) FROM replication_log", [], |r| r.get(0))?,
+                c.query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE name IN ('node_compaction','node_compaction_history','node_compaction_root','node_compaction_certificates')",
+                    [],
+                    |r| r.get(0),
+                )?,
+                c.query_row("SELECT count(*) FROM recovery_completion", [], |r| r.get(0))?,
+            ))
+        })?)
+    }
+
+    fn cid<T: Serialize>(v: &T) -> Result<[u8; 32]> {
+        digest(v)
+    }
+    fn cp(v: &Prefix) -> Result<crate::recovery::transition::Checkpoint> {
+        Ok(crate::recovery::transition::Checkpoint {
+            sequence: v.sequence,
+            digest: cid(v)?,
+        })
+    }
+
+    #[test]
+    fn real_recovered_prepared_opens_restricted_and_rejects_mutations() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (mut p, mut s) = recovered_pair_for_pending(dir.path())?;
+        p.upgrade_receipt_capacity()?;
+        s.upgrade_receipt_capacity()?;
+        p.enable_maintenance()?;
+        s.enable_maintenance()?;
+        let old_p = p
+            .plan_compaction()?
+            .publication
+            .ok_or("candidate publication missing")?;
+        let old_s = s
+            .plan_compaction()?
+            .publication
+            .ok_or("survivor publication missing")?;
+        let mut batch = crate::envelope_tests::stock_entry().batch;
+        batch.operation_id = "pending-write".into();
+        commit(&mut p, &mut s, batch)?;
+        p.rotate_snapshot(&old_p)?;
+        s.rotate_snapshot(&old_s)?;
+        let pp = p.plan_compaction()?;
+        let sp = s.plan_compaction()?;
+        let plan = compaction::PairPlan {
+            id: [31; 32],
+            primary: pp,
+            secondary: sp,
+        };
+        plan.validate_certified()?;
+        let request = crate::recovery::transition::Request {
+            format: 1,
+            id: [32; 32],
+            authority_id: [33; 32],
+            revision: 1,
+            install: "fixture".into(),
+            region: "test".into(),
+            scope: cid(p.identity())?,
+            schema: cid(&plan.primary.contract)?,
+            membership: plan.primary.membership.unwrap(),
+            source_anchor: cp(plan.primary.recovery_anchor.as_ref().unwrap())?,
+            participants: [
+                crate::recovery::transition::Participant {
+                    member: p.recovery_member_identity()?.unwrap(),
+                    generation: p.connection(checkpoint::generation)?,
+                    old_base: plan.primary.head.base.as_ref().map(cp).transpose()?,
+                    target: cp(&plan.primary.checkpoint)?,
+                    plan: cid(&plan)?,
+                    publication: cid(plan.primary.publication.as_ref().unwrap())?,
+                },
+                crate::recovery::transition::Participant {
+                    member: s.recovery_member_identity()?.unwrap(),
+                    generation: s.connection(checkpoint::generation)?,
+                    old_base: plan.secondary.head.base.as_ref().map(cp).transpose()?,
+                    target: cp(&plan.secondary.checkpoint)?,
+                    plan: cid(&plan)?,
+                    publication: cid(plan.secondary.publication.as_ref().unwrap())?,
+                },
+            ],
+        };
+        let (key, public) = super::super::certified::tests::signer()?;
+        let token = super::super::certified::tests::sign(&key, &request)?;
+        let trust = crate::recovery::transition::TrustStore {
+            profile: crate::recovery::grant::Profile {
+                issuer: "issuer".into(),
+                audience: "audience".into(),
+                token_type: crate::recovery::transition::TOKEN_TYPE.into(),
+            },
+            keys: vec![("fixture".into(), public)],
+            max_lifetime: 20,
+        };
+        let mut wrong_plan = plan.clone();
+        wrong_plan.id = [99; 32];
+        assert!(prepare_pair(&p, &s, &wrong_plan, &request, &token, 15, &trust).is_err());
+        for n in [&p, &s] {
+            n.connection(|c| {
+                ensure(c.query_row("SELECT format FROM node_runtime WHERE id=1",[],|r|r.get::<_,u32>(0))? != 5,"failed preflight changed runtime")?;
+                ensure(!c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='node_pending_certified_maintenance')",[],|r|r.get::<_,bool>(0))?,"failed preflight created pending state")
+            })?;
+        }
+        s.connection(|c|{c.execute_batch("CREATE TRIGGER fail_pending_runtime BEFORE UPDATE ON node_runtime BEGIN SELECT RAISE(ABORT,'fixture crash'); END;")?;Ok(())})?;
+        let crash = prepare_pair(&p, &s, &plan, &request, &token, 15, &trust).unwrap_err();
+        ensure(
+            crash.to_string().contains("fixture crash"),
+            "pending fixture failed before injected boundary",
+        )?;
+        assert_eq!(
+            p.connection(|c| c
+                .query_row("SELECT format FROM node_runtime WHERE id=1", [], |r| r
+                    .get::<_, u32>(0))
+                .map_err(Into::into))?,
+            5
+        );
+        assert_ne!(
+            s.connection(|c| c
+                .query_row("SELECT format FROM node_runtime WHERE id=1", [], |r| r
+                    .get::<_, u32>(0))
+                .map_err(Into::into))?,
+            5
+        );
+        ensure(!s.connection(|c|c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='node_pending_certified_maintenance' OR name='node_pending_certified_progress')",[],|r|r.get::<_,bool>(0)).map_err(Into::into))?,"failed node2 transaction left pending tables")?;
+        let saved_digest = p.connection(|c| {
+            c.query_row(
+                "SELECT digest FROM node_pending_certified_progress WHERE id=1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(Into::into)
+        })?;
+        p.connection(|c| {
+            c.execute(
+                "UPDATE node_pending_certified_progress SET digest='corrupt' WHERE id=1",
+                [],
+            )?;
+            Ok(())
+        })?;
+        assert!(prepare_pair(&p, &s, &plan, &request, &token, 15, &trust).is_err());
+        assert_ne!(
+            s.connection(|c| c
+                .query_row("SELECT format FROM node_runtime WHERE id=1", [], |r| r
+                    .get::<_, u32>(0))
+                .map_err(Into::into))?,
+            5
+        );
+        p.connection(|c| {
+            c.execute(
+                "UPDATE node_pending_certified_progress SET digest=?1 WHERE id=1",
+                [saved_digest],
+            )?;
+            Ok(())
+        })?;
+        s.connection(|c| {
+            c.execute_batch("DROP TRIGGER fail_pending_runtime")?;
+            Ok(())
+        })?;
+        prepare_pair(&p, &s, &plan, &request, &token, 15, &trust)?;
+        let alternate = super::super::certified::tests::sign(&key, &request)?;
+        ensure(
+            alternate != token,
+            "fixture signature unexpectedly repeated",
+        )?;
+        assert!(prepare_pair(&p, &s, &plan, &request, &alternate, 15, &trust).is_err());
+        prepare_pair(&p, &s, &plan, &request, &token, 15, &trust)?;
+        assert!(prepare_pair(&p, &s, &plan, &request, &token, 21, &trust).is_err());
+        let id = p.identity().clone();
+        drop(p);
+        drop(s);
+        assert!(Node::open(
+            dir.path().join("candidate1"),
+            Role::Primary,
+            id.clone(),
+            "fixture",
+            StockSchema
+        )
+        .is_err());
+        let mut h = PendingMaintenanceHandle::open_existing(
+            dir.path().join("candidate1"),
+            Role::Primary,
+            id,
+            "fixture",
+            StockSchema,
+            &request,
+            &trust,
+        )?;
+        assert_eq!(h.inspect().checkpoint, plan.primary.checkpoint);
+        let mut hs = PendingMaintenanceHandle::open_existing(
+            dir.path().join("survivor"),
+            Role::Secondary,
+            h.inspect().identity.clone(),
+            "fixture",
+            StockSchema,
+            &request,
+            &trust,
+        )?;
+        assert_eq!(hs.inspect().checkpoint, plan.secondary.checkpoint);
+
+        let journal_path = dir.path().join("maintenance-journal");
+        let journal_scope = crate::recovery::transition::JournalScope {
+            install: request.install.clone(),
+            region: request.region.clone(),
+            profile: trust.profile.clone(),
+            scope: request.scope,
+            schema: request.schema,
+            membership: request.membership,
+            source_anchor: request.source_anchor.clone(),
+            authority_id: request.authority_id,
+            initial_revision: request.revision,
+        };
+        let journal = crate::recovery::transition::Journal::create(
+            &journal_path,
+            "journal-fixture",
+            journal_scope.clone(),
+        )?;
+        assert!(journal.status(&trust.as_trust())?.request.is_none());
+        let before = (pending_evidence(&h)?, pending_evidence(&hs)?);
+        let authority = Authority {
+            current: Cell::new(false),
+            revoke_on_check: Cell::new(false),
+        };
+        assert!(decide_prepared(&h, &hs, &journal, 15, &trust, &authority).is_err());
+        assert!(journal.status(&trust.as_trust())?.request.is_none());
+        assert_eq!(before, (pending_evidence(&h)?, pending_evidence(&hs)?));
+        let saved_prepared = hs.prepared.clone();
+        hs.prepared.token = alternate.clone();
+        assert!(decide_prepared(&h, &hs, &journal, 15, &trust, &authority).is_err());
+        hs.prepared = saved_prepared.clone();
+        hs.prepared.request.id = [88; 32];
+        assert!(decide_prepared(&h, &hs, &journal, 15, &trust, &authority).is_err());
+        hs.prepared = saved_prepared.clone();
+        hs.prepared.plan.id = [89; 32];
+        assert!(decide_prepared(&h, &hs, &journal, 15, &trust, &authority).is_err());
+        hs.prepared = saved_prepared;
+        assert!(journal.status(&trust.as_trust())?.request.is_none());
+        assert_eq!(before, (pending_evidence(&h)?, pending_evidence(&hs)?));
+        authority.current.set(true);
+        let decision = decide_prepared(&h, &hs, &journal, 15, &trust, &authority)?;
+        assert_eq!(decision.request(), &request);
+        let status = journal.status(&trust.as_trust())?;
+        assert_eq!(status.request.as_ref(), Some(&request));
+        assert_eq!(status.acknowledgements, [false; 2]);
+        assert_eq!(status.completion, None);
+        assert_eq!(before, (pending_evidence(&h)?, pending_evidence(&hs)?));
+        let retry = decide_prepared(&h, &hs, &journal, 15, &trust, &authority)?;
+        assert_eq!(retry.token_digest(), decision.token_digest());
+        authority.current.set(false);
+        assert!(decide_prepared(&h, &hs, &journal, 15, &trust, &authority).is_err());
+        assert_eq!(before, (pending_evidence(&h)?, pending_evidence(&hs)?));
+        authority.current.set(true);
+        drop(journal);
+        let reopened = crate::recovery::transition::Journal::open(
+            &journal_path,
+            "journal-fixture",
+            journal_scope.clone(),
+            &trust.as_trust(),
+        )?;
+        let reopened_status = reopened.status(&trust.as_trust())?;
+        assert_eq!(reopened_status.request.as_ref(), Some(&request));
+        assert_eq!(reopened_status.acknowledgements, [false; 2]);
+        assert_eq!(reopened_status.completion, None);
+        assert_eq!(before, (pending_evidence(&h)?, pending_evidence(&hs)?));
+        record_decided(&mut h, &reopened, &trust, &authority)?;
+        let after_primary = (pending_evidence(&h)?, pending_evidence(&hs)?);
+        assert_ne!(after_primary.0, before.0);
+        assert_eq!(after_primary.1, before.1);
+        authority.current.set(true);
+        authority.revoke_on_check.set(true);
+        assert!(record_decided(&mut hs, &reopened, &trust, &authority).is_err());
+        assert_eq!(
+            after_primary,
+            (pending_evidence(&h)?, pending_evidence(&hs)?)
+        );
+        authority.current.set(true);
+        let survivor_path = dir.path().join("survivor");
+        let moved_path = dir.path().join("survivor-retained");
+        let replacement_path = dir.path().join("survivor-replacement");
+        let displaced_path = dir.path().join("survivor-displaced");
+        std::fs::copy(&survivor_path, &replacement_path)?;
+        let replacement_before = std::fs::read(&replacement_path)?;
+        std::fs::rename(&survivor_path, &moved_path)?;
+        std::fs::rename(&replacement_path, &survivor_path)?;
+        let substituted = record_decided(&mut hs, &reopened, &trust, &authority);
+        drop(hs);
+        std::fs::rename(&survivor_path, &displaced_path)?;
+        std::fs::rename(&moved_path, &survivor_path)?;
+        ensure(
+            std::fs::read(&displaced_path)? == replacement_before,
+            "path substitute was mutated",
+        )?;
+        let mut hs = PendingMaintenanceHandle::open_existing(
+            &survivor_path,
+            Role::Secondary,
+            h.inspect().identity.clone(),
+            "fixture",
+            StockSchema,
+            &request,
+            &trust,
+        )?;
+        if substituted.is_err() {
+            record_decided(&mut hs, &reopened, &trust, &authority)?;
+        } else {
+            ensure(
+                hs.prepared.phase == "decided",
+                "retained connection did not advance original file",
+            )?;
+        }
+        let both_decided = (pending_evidence(&h)?, pending_evidence(&hs)?);
+        record_decided(&mut h, &reopened, &trust, &authority)?;
+        record_decided(&mut hs, &reopened, &trust, &authority)?;
+        assert_eq!(
+            both_decided,
+            (pending_evidence(&h)?, pending_evidence(&hs)?)
+        );
+        apply_decided(&mut h, &reopened, &trust, &authority)?;
+        let primary_applied = (pending_evidence(&h)?, pending_evidence(&hs)?);
+        assert_ne!(primary_applied.0, both_decided.0);
+        assert_eq!(primary_applied.1, both_decided.1);
+        authority.current.set(true);
+        authority.revoke_on_check.set(true);
+        assert!(apply_decided(&mut hs, &reopened, &trust, &authority).is_err());
+        assert_eq!(
+            primary_applied,
+            (pending_evidence(&h)?, pending_evidence(&hs)?)
+        );
+        authority.current.set(true);
+        apply_decided(&mut hs, &reopened, &trust, &authority)?;
+        let both_applied = (pending_evidence(&h)?, pending_evidence(&hs)?);
+        apply_decided(&mut h, &reopened, &trust, &authority)?;
+        apply_decided(&mut hs, &reopened, &trust, &authority)?;
+        assert_eq!(
+            both_applied,
+            (pending_evidence(&h)?, pending_evidence(&hs)?)
+        );
+        acknowledge_applied(&h, &reopened, &trust, &authority)?;
+        assert_eq!(
+            reopened.status(&trust.as_trust())?.acknowledgements,
+            [true, false]
+        );
+        authority.current.set(true);
+        authority.revoke_on_check.set(true);
+        assert!(acknowledge_applied(&hs, &reopened, &trust, &authority).is_err());
+        assert_eq!(
+            reopened.status(&trust.as_trust())?.acknowledgements,
+            [true, false]
+        );
+        authority.current.set(true);
+        acknowledge_applied(&hs, &reopened, &trust, &authority)?;
+        assert_eq!(
+            reopened.status(&trust.as_trust())?.acknowledgements,
+            [true, true]
+        );
+        acknowledge_applied(&h, &reopened, &trust, &authority)?;
+        acknowledge_applied(&hs, &reopened, &trust, &authority)?;
+        authority.current.set(true);
+        authority.revoke_on_check.set(true);
+        assert!(complete_authority(&h, &hs, &reopened, [90; 32], &trust, &authority,).is_err());
+        assert_eq!(reopened.status(&trust.as_trust())?.completion, None);
+        authority.current.set(true);
+        complete_authority(&h, &hs, &reopened, [90; 32], &trust, &authority)?;
+        assert_eq!(
+            reopened.status(&trust.as_trust())?.completion,
+            Some([90; 32])
+        );
+        assert!(complete_authority(&h, &hs, &reopened, [91; 32], &trust, &authority,).is_err());
+        record_complete(&mut h, &reopened, &trust, &authority)?;
+        let primary_complete = (pending_evidence(&h)?, pending_evidence(&hs)?);
+        authority.current.set(true);
+        authority.revoke_on_check.set(true);
+        assert!(record_complete(&mut hs, &reopened, &trust, &authority).is_err());
+        assert_eq!(
+            primary_complete,
+            (pending_evidence(&h)?, pending_evidence(&hs)?)
+        );
+        authority.current.set(true);
+        record_complete(&mut hs, &reopened, &trust, &authority)?;
+        let both_complete = (pending_evidence(&h)?, pending_evidence(&hs)?);
+        record_complete(&mut h, &reopened, &trust, &authority)?;
+        record_complete(&mut hs, &reopened, &trust, &authority)?;
+        assert_eq!(
+            both_complete,
+            (pending_evidence(&h)?, pending_evidence(&hs)?)
+        );
+        let peer_before_capacity_corruption = pending_evidence(&hs)?;
+        h.db.with_connection(|c| {
+            c.execute(
+                "UPDATE receipt_capacity SET receipt_bytes=receipt_bytes+1 WHERE id=1",
+                [],
+            )?;
+            Ok(())
+        })?;
+        let primary_identity = h.inspect().identity.clone();
+        drop(h);
+        assert!(PendingMaintenanceHandle::open_existing(
+            dir.path().join("candidate1"),
+            Role::Primary,
+            primary_identity.clone(),
+            "fixture",
+            StockSchema,
+            &request,
+            &trust,
+        )
+        .is_err());
+        assert_eq!(peer_before_capacity_corruption, pending_evidence(&hs)?);
+        let raw = Vesta::open(&dir.path().join("candidate1"), "fixture")?;
+        raw.with_connection(|c| {
+            c.execute(
+                "UPDATE receipt_capacity SET receipt_bytes=receipt_bytes-1 WHERE id=1",
+                [],
+            )?;
+            Ok(())
+        })?;
+        drop(raw);
+        let h = PendingMaintenanceHandle::open_existing(
+            dir.path().join("candidate1"),
+            Role::Primary,
+            primary_identity,
+            "fixture",
+            StockSchema,
+            &request,
+            &trust,
+        )?;
+        let insert_trigger = h.db.with_connection(|c| {
+            c.query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='receipt_capacity_insert'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+        })?;
+        h.db.with_connection(|c| {
+            c.execute_batch(
+                "DROP TRIGGER receipt_capacity_insert;
+                 CREATE TRIGGER receipt_capacity_insert AFTER INSERT ON operation_receipts BEGIN SELECT 1; END;",
+            )?;
+            Ok(())
+        })?;
+        drop(h);
+        assert!(PendingMaintenanceHandle::open_existing(
+            dir.path().join("candidate1"),
+            Role::Primary,
+            hs.inspect().identity.clone(),
+            "fixture",
+            StockSchema,
+            &request,
+            &trust,
+        )
+        .is_err());
+        assert_eq!(peer_before_capacity_corruption, pending_evidence(&hs)?);
+        let raw = Vesta::open(&dir.path().join("candidate1"), "fixture")?;
+        raw.with_connection(|c| {
+            c.execute_batch("DROP TRIGGER receipt_capacity_insert")?;
+            c.execute_batch(&insert_trigger)?;
+            Ok(())
+        })?;
+        drop(raw);
+        let h = PendingMaintenanceHandle::open_existing(
+            dir.path().join("candidate1"),
+            Role::Primary,
+            hs.inspect().identity.clone(),
+            "fixture",
+            StockSchema,
+            &request,
+            &trust,
+        )?;
+        drop(hs);
+        assert!(PendingMaintenanceHandle::open_existing(
+            dir.path().join("candidate1"),
+            Role::Primary,
+            h.inspect().identity.clone(),
+            "fixture",
+            StockSchema,
+            &request,
+            &trust
+        )
+        .is_err());
+        let identity = h.inspect().identity.clone();
+        drop(h);
+        let path = dir.path().join("candidate1");
+        let raw = Vesta::open(&path, "fixture")?;
+        let saved = raw.with_connection(|c| {
+            c.query_row(
+                "SELECT record,digest FROM node_pending_certified_progress WHERE id=1",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+        })?;
+        raw.with_connection(|c| {
+            c.execute("DELETE FROM node_pending_certified_progress", [])
+                .map(|_| ())
+        })?;
+        drop(raw);
+        assert!(PendingMaintenanceHandle::open_existing(
+            &path,
+            Role::Primary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+            &request,
+            &trust
+        )
+        .is_err());
+        let raw = Vesta::open(&path, "fixture")?;
+        raw.with_connection(|c| {
+            c.execute(
+                "INSERT INTO node_pending_certified_progress VALUES(1,?1,?2)",
+                params![saved.0, saved.1],
+            )
+            .map(|_| ())
+        })?;
+        raw.with_connection(|c| {
+            c.execute("UPDATE node_runtime SET format=4 WHERE id=1", [])
+                .map(|_| ())
+        })?;
+        drop(raw);
+        assert!(PendingMaintenanceHandle::open_existing(
+            &path,
+            Role::Primary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+            &request,
+            &trust
+        )
+        .is_err());
+        let raw = Vesta::open(&path, "fixture")?;
+        raw.with_connection(|c| {
+            c.execute("UPDATE node_runtime SET format=5 WHERE id=1", [])
+                .map(|_| ())
+        })?;
+        drop(raw);
+        let wrong = crate::recovery::transition::TrustStore {
+            profile: trust.profile.clone(),
+            keys: Vec::new(),
+            max_lifetime: trust.max_lifetime,
+        };
+        assert!(PendingMaintenanceHandle::open_existing(
+            &path,
+            Role::Primary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+            &request,
+            &wrong
+        )
+        .is_err());
+        let raw = Vesta::open(&path, "fixture")?;
+        raw.with_connection(|c| {
+            let record: String =
+                c.query_row("SELECT record FROM recovery_active WHERE id=1", [], |r| {
+                    r.get(0)
+                })?;
+            c.pragma_update(None, "ignore_check_constraints", true)?;
+            c.execute("INSERT INTO recovery_active VALUES(2,?1)", [record])?;
+            Ok(())
+        })?;
+        drop(raw);
+        assert!(PendingMaintenanceHandle::open_existing(
+            &path,
+            Role::Primary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+            &request,
+            &trust
+        )
+        .is_err());
+        let raw = Vesta::open(&path, "fixture")?;
+        raw.with_connection(|c| {
+            c.execute("DELETE FROM recovery_active WHERE id=2", [])?;
+            Ok(())
+        })?;
+        drop(raw);
+        let mut h = PendingMaintenanceHandle::open_existing(
+            &path,
+            Role::Primary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+            &request,
+            &trust,
+        )?;
+        let mut hs = PendingMaintenanceHandle::open_existing(
+            dir.path().join("survivor"),
+            Role::Secondary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+            &request,
+            &trust,
+        )?;
+        finalize_complete(&mut hs, &reopened, &trust, &authority)?;
+        ensure(
+            h.db.with_connection(|c| c.query_row(
+                "SELECT format=5 AND NOT EXISTS(SELECT 1 FROM replication_readiness) FROM node_runtime WHERE id=1",
+                [],
+                |r| r.get::<_, bool>(0),
+            ))?,
+            "primary admitted before finalization",
+        )?;
+        finalize_pair(&mut h, &mut hs, &reopened, &trust, &authority)?;
+        drop(h);
+        drop(hs);
+        let writer_authority = Arc::new(WriterAuthority {
+            journal: Mutex::new(reopened),
+            trust: trust.clone(),
+            current: AtomicBool::new(false),
+        });
+        assert!(Node::open_with_completed_transition(
+            &path,
+            Role::Primary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+            trust.clone(),
+            writer_authority.clone(),
+        )
+        .is_err());
+        writer_authority.current.store(true, Ordering::SeqCst);
+        let mut primary = Node::open_with_completed_transition(
+            &path,
+            Role::Primary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+            trust.clone(),
+            writer_authority.clone(),
+        )?;
+        let mut secondary = Node::open_with_completed_transition(
+            dir.path().join("survivor"),
+            Role::Secondary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+            trust.clone(),
+            writer_authority.clone(),
+        )?;
+        let second_old_primary = primary
+            .plan_compaction()?
+            .publication
+            .ok_or("second primary publication missing")?;
+        let second_old_secondary = secondary
+            .plan_compaction()?
+            .publication
+            .ok_or("second secondary publication missing")?;
+        let mut batch = crate::envelope_tests::stock_entry().batch;
+        batch.operation_id = "after-certified-finalization".into();
+        writer_authority.current.store(false, Ordering::SeqCst);
+        assert!(commit(&mut primary, &mut secondary, batch.clone()).is_err());
+        writer_authority.current.store(true, Ordering::SeqCst);
+        commit(&mut primary, &mut secondary, batch)?;
+        primary.rotate_snapshot(&second_old_primary)?;
+        secondary.rotate_snapshot(&second_old_secondary)?;
+        let second_plan = compaction::PairPlan {
+            id: [101; 32],
+            primary: primary.plan_compaction()?,
+            secondary: secondary.plan_compaction()?,
+        };
+        second_plan.validate_certified()?;
+        ensure(
+            second_plan.primary.head.base.as_ref() == Some(&plan.primary.checkpoint)
+                && second_plan.secondary.head.base.as_ref() == Some(&plan.secondary.checkpoint),
+            "second cycle did not follow first certified bases",
+        )?;
+        let second_request = crate::recovery::transition::Request {
+            format: 1,
+            id: [102; 32],
+            authority_id: request.authority_id,
+            revision: request.revision + 1,
+            install: request.install.clone(),
+            region: request.region.clone(),
+            scope: request.scope,
+            schema: request.schema,
+            membership: request.membership,
+            source_anchor: request.source_anchor.clone(),
+            participants: [
+                crate::recovery::transition::Participant {
+                    member: primary.recovery_member_identity()?.unwrap(),
+                    generation: primary.connection(checkpoint::generation)?,
+                    old_base: second_plan.primary.head.base.as_ref().map(cp).transpose()?,
+                    target: cp(&second_plan.primary.checkpoint)?,
+                    plan: cid(&second_plan)?,
+                    publication: cid(second_plan.primary.publication.as_ref().unwrap())?,
+                },
+                crate::recovery::transition::Participant {
+                    member: secondary.recovery_member_identity()?.unwrap(),
+                    generation: secondary.connection(checkpoint::generation)?,
+                    old_base: second_plan
+                        .secondary
+                        .head
+                        .base
+                        .as_ref()
+                        .map(cp)
+                        .transpose()?,
+                    target: cp(&second_plan.secondary.checkpoint)?,
+                    plan: cid(&second_plan)?,
+                    publication: cid(second_plan.secondary.publication.as_ref().unwrap())?,
+                },
+            ],
+        };
+        let second_token = super::super::certified::tests::sign(&key, &second_request)?;
+        prepare_pair(
+            &primary,
+            &secondary,
+            &second_plan,
+            &second_request,
+            &second_token,
+            15,
+            &trust,
+        )?;
+        drop(primary);
+        drop(secondary);
+        let mut second_primary = PendingMaintenanceHandle::open_existing_with_authority(
+            &path,
+            Role::Primary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+            &second_request,
+            &trust,
+            Some(writer_authority.clone()),
+        )?;
+        let mut second_secondary = PendingMaintenanceHandle::open_existing_with_authority(
+            dir.path().join("survivor"),
+            Role::Secondary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+            &second_request,
+            &trust,
+            Some(writer_authority.clone()),
+        )?;
+        let second_journal = crate::recovery::transition::Journal::open(
+            &journal_path,
+            "journal-fixture",
+            journal_scope,
+            &trust.as_trust(),
+        )?;
+        decide_prepared(
+            &second_primary,
+            &second_secondary,
+            &second_journal,
+            15,
+            &trust,
+            writer_authority.as_ref(),
+        )?;
+        writer_authority.current.store(false, Ordering::SeqCst);
+        assert!(record_decided(
+            &mut second_primary,
+            &second_journal,
+            &trust,
+            writer_authority.as_ref(),
+        )
+        .is_err());
+        writer_authority.current.store(true, Ordering::SeqCst);
+        record_decided(
+            &mut second_primary,
+            &second_journal,
+            &trust,
+            writer_authority.as_ref(),
+        )?;
+        record_decided(
+            &mut second_secondary,
+            &second_journal,
+            &trust,
+            writer_authority.as_ref(),
+        )?;
+        apply_decided(
+            &mut second_primary,
+            &second_journal,
+            &trust,
+            writer_authority.as_ref(),
+        )?;
+        apply_decided(
+            &mut second_secondary,
+            &second_journal,
+            &trust,
+            writer_authority.as_ref(),
+        )?;
+        acknowledge_applied(
+            &second_primary,
+            &second_journal,
+            &trust,
+            writer_authority.as_ref(),
+        )?;
+        acknowledge_applied(
+            &second_secondary,
+            &second_journal,
+            &trust,
+            writer_authority.as_ref(),
+        )?;
+        complete_authority(
+            &second_primary,
+            &second_secondary,
+            &second_journal,
+            [103; 32],
+            &trust,
+            writer_authority.as_ref(),
+        )?;
+        record_complete(
+            &mut second_primary,
+            &second_journal,
+            &trust,
+            writer_authority.as_ref(),
+        )?;
+        record_complete(
+            &mut second_secondary,
+            &second_journal,
+            &trust,
+            writer_authority.as_ref(),
+        )?;
+        finalize_complete(
+            &mut second_secondary,
+            &second_journal,
+            &trust,
+            writer_authority.as_ref(),
+        )?;
+        drop(second_primary);
+        drop(second_secondary);
+        assert!(Node::open_with_completed_transition(
+            &path,
+            Role::Primary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+            trust.clone(),
+            writer_authority.clone(),
+        )
+        .is_err());
+        let restarted_secondary = Node::open_with_completed_transition(
+            dir.path().join("survivor"),
+            Role::Secondary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+            trust.clone(),
+            writer_authority.clone(),
+        )?;
+        drop(restarted_secondary);
+        let mut restarted_primary = PendingMaintenanceHandle::open_existing_with_authority(
+            &path,
+            Role::Primary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+            &second_request,
+            &trust,
+            Some(writer_authority.clone()),
+        )?;
+        finalize_complete(
+            &mut restarted_primary,
+            &second_journal,
+            &trust,
+            writer_authority.as_ref(),
+        )?;
+        drop(restarted_primary);
+        let mut reopened_primary = Node::open_with_completed_transition(
+            &path,
+            Role::Primary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+            trust.clone(),
+            writer_authority.clone(),
+        )?;
+        let mut reopened_secondary = Node::open_with_completed_transition(
+            dir.path().join("survivor"),
+            Role::Secondary,
+            identity,
+            "fixture",
+            StockSchema,
+            trust.clone(),
+            writer_authority,
+        )?;
+        ensure(
+            reopened_primary.connection(|c| {
+                c.query_row(
+                    "SELECT count(*) FROM node_compaction_certificates",
+                    [],
+                    |r| r.get::<_, u64>(0),
+                )
+                .map_err(Into::into)
+            })? == 2
+                && reopened_secondary.connection(|c| {
+                    c.query_row(
+                        "SELECT count(*) FROM node_compaction_certificates",
+                        [],
+                        |r| r.get::<_, u64>(0),
+                    )
+                    .map_err(Into::into)
+                })? == 2,
+            "second certified segment missing",
+        )?;
+        ensure(
+            reopened_primary.plan_compaction()?.head.base
+                == Some(second_plan.primary.checkpoint.clone())
+                && reopened_secondary.plan_compaction()?.head.base
+                    == Some(second_plan.secondary.checkpoint.clone()),
+            "second certified bases not durable",
+        )?;
+        let second_verified = crate::recovery::transition::verify_historical(
+            &second_token,
+            &trust.as_trust(),
+            &second_request,
+        )?;
+        let loss_request = crate::recovery::transition::LossRequest {
+            format: 1,
+            id: [104; 32],
+            authority_id: second_request.authority_id,
+            revision: second_request.revision + 1,
+            install: second_request.install.clone(),
+            region: second_request.region.clone(),
+            scope: second_request.scope,
+            schema: second_request.schema,
+            membership: second_request.membership,
+            replacement_membership: [105; 32],
+            source_certificate: second_verified.certificate_id(),
+            source_token_digest: second_verified.token_digest(),
+            source_cut: second_request.participants[0].target.clone(),
+            lost_member: second_request.participants[0].member,
+            lost_generation: second_request.participants[0].generation,
+            survivor: second_request.participants[1].clone(),
+            survivor_cut: second_request.participants[1].target.clone(),
+            survivor_publication: second_request.participants[1].publication,
+            replacement_member: [106; 32],
+            replacement_generation: [107; 32],
+            fencing_ref: [108; 32],
+        };
+        loss_request.validate()?;
+        reopened_secondary.connection(|c| {
+            super::loss::validate::<StockSchema>(
+                c,
+                &reopened_secondary.adapter,
+                &reopened_secondary.identity,
+                &reopened_secondary.contract,
+                &reopened_secondary.initial,
+                &trust,
+                &loss_request,
+            )
+            .map(|_| ())
+        })?;
+        let mut wrong_loss = loss_request.clone();
+        wrong_loss.survivor.generation = [109; 32];
+        assert!(reopened_secondary
+            .connection(|c| super::loss::validate::<StockSchema>(
+                c,
+                &reopened_secondary.adapter,
+                &reopened_secondary.identity,
+                &reopened_secondary.contract,
+                &reopened_secondary.initial,
+                &trust,
+                &wrong_loss,
+            )
+            .map(|_| ()))
+            .is_err());
+        let _before_intervening = reopened_primary.view()?;
+        let mut intervening = crate::envelope_tests::stock_entry().batch;
+        intervening.operation_id = "after-second-certified-cycle".into();
+        commit(
+            &mut reopened_primary,
+            &mut reopened_secondary,
+            intervening.clone(),
+        )?;
+        let _after_intervening = reopened_primary.view()?;
+        ensure(
+            reopened_primary
+                .receipt(&intervening.operation_id)?
+                .is_some()
+                && reopened_secondary
+                    .receipt(&intervening.operation_id)?
+                    .is_some(),
+            "second-cycle intervening receipt/view missing",
+        )?;
+        Ok(())
+    }
+}

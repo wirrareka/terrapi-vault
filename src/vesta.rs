@@ -7,7 +7,7 @@ use crate::kdf::{
 use crate::keyslot;
 use crate::meta::{meta_path_for, KeySlot, MetaV2, StoredMeta, VestaMeta};
 use crate::recovery::RecoveryCode;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use secrecy::{ExposeSecret, SecretBox};
 use std::path::{Path, PathBuf};
 
@@ -179,6 +179,54 @@ impl Vesta {
         }
     }
 
+    /// Open an existing steady-state v2 vault read-write without performing
+    /// creation, migration, staged recovery, metadata cleanup, or rekeying.
+    ///
+    /// This is a low-level integration primitive. It does not initialize an
+    /// application schema or provide concurrency/fencing policy; callers must
+    /// arrange exclusive use appropriate to their protocol.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing or non-regular database/metadata files, legacy v1 or
+    /// malformed metadata, any staged migration/rekey artifact, a wrong
+    /// passphrase, unavailable SQLCipher, and SQLite/I/O failures.
+    pub fn open_existing_read_write_with_passphrase<P: AsRef<Path>>(
+        path: P,
+        passphrase: &str,
+    ) -> Result<Self> {
+        let vault_path = path.as_ref().to_path_buf();
+        let meta_path = meta_path_for(&vault_path);
+        ensure_regular_file(&vault_path, "vault database")?;
+        ensure_regular_file(&meta_path, "vault metadata")?;
+        ensure_no_staged_artifact(&rekey_staging_path(&meta_path))?;
+        let meta = match StoredMeta::read(&meta_path)? {
+            StoredMeta::V2(meta) => meta,
+            StoredMeta::V1(_) => {
+                return Err(Error::UnsupportedFormat {
+                    found: crate::meta::FORMAT_VERSION,
+                    supported: crate::meta::CURRENT_FORMAT_VERSION,
+                });
+            }
+        };
+        let slot = &meta.slots.password;
+        let slot_key = derive_key(passphrase, &slot.salt()?, slot.kdf_params)?;
+        let key = keyslot::open(
+            slot_key.expose_secret().expose_bytes(),
+            &slot.wrap,
+            PASSWORD_SLOT,
+        )?
+        .ok_or(Error::WrongPassphrase)?;
+        let conn = open_keyed_existing_read_write(&vault_path, &key)?;
+        verify_key(&conn)?;
+        Ok(Self {
+            conn,
+            key,
+            vault_path,
+            meta_path,
+        })
+    }
+
     /// Open an existing vault at `path` with a raw 32-byte key.
     ///
     /// Unlike [`Vesta::open`], this skips Argon2id derivation and uses
@@ -248,6 +296,57 @@ impl Vesta {
         let meta_path = meta_path_for(&vault_path);
         // Same early sidecar validation as `open_with_key`.
         let _meta = StoredMeta::read(&meta_path)?;
+        let conn = open_keyed_read_only(&vault_path, &key)?;
+        verify_key(&conn)?;
+        Ok(Self {
+            conn,
+            key,
+            vault_path,
+            meta_path,
+        })
+    }
+
+    /// Open an existing vault read-only using its passphrase.
+    ///
+    /// Unlike [`Self::open`], this never migrates a legacy vault, recovers or
+    /// removes staged migration metadata, or opens SQLite read-write. Both v1
+    /// and v2 sidecars are validated; an interrupted legacy migration must be
+    /// completed through the normal read-write open path before this API can be
+    /// used. The underlying SQLite handle is opened with
+    /// `SQLITE_OPEN_READ_ONLY`, with `query_only` retained as defense in depth.
+    ///
+    /// # Errors
+    /// [`Error::WrongPassphrase`] if the passphrase is incorrect,
+    /// [`Error::MetaMissing`]/[`Error::MetaInvalid`] for sidecar problems,
+    /// otherwise [`Error::Db`]/[`Error::Io`]. A missing database is never
+    /// created.
+    pub fn open_read_only_with_passphrase<P: AsRef<Path>>(
+        path: P,
+        passphrase: &str,
+    ) -> Result<Self> {
+        let vault_path = path.as_ref().to_path_buf();
+        let meta_path = meta_path_for(&vault_path);
+        let key = match StoredMeta::read(&meta_path)? {
+            StoredMeta::V2(meta) => {
+                let slot = &meta.slots.password;
+                let slot_key = derive_key(passphrase, &slot.salt()?, slot.kdf_params)?;
+                keyslot::open(
+                    slot_key.expose_secret().expose_bytes(),
+                    &slot.wrap,
+                    PASSWORD_SLOT,
+                )?
+                .ok_or(Error::WrongPassphrase)?
+            }
+            StoredMeta::V1(meta) => {
+                if rekey_staging_path(&meta_path).exists() {
+                    return Err(Error::MetaInvalid(
+                        "legacy vault has an unfinished migration; complete normal open first"
+                            .into(),
+                    ));
+                }
+                derive_key(passphrase, &meta.salt()?, meta.kdf_params)?
+            }
+        };
         let conn = open_keyed_read_only(&vault_path, &key)?;
         verify_key(&conn)?;
         Ok(Self {
@@ -690,6 +789,48 @@ fn open_keyed(path: &Path, key: &SecretBox<DerivedKey>) -> Result<Connection> {
     Ok(conn)
 }
 
+fn ensure_regular_file(path: &Path, label: &str) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(Error::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::MetaInvalid(format!("{label} is not a regular file")));
+    }
+    Ok(())
+}
+
+fn ensure_no_staged_artifact(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::Io(e)),
+        Ok(_) => Err(Error::MetaInvalid(
+            "staged migration/rekey metadata requires normal recovery".into(),
+        )),
+    }
+}
+
+/// Minimal existing-file read-write open. In particular this omits CREATE,
+/// journal-mode changes, schema-table migration, metadata writes and recovery.
+fn open_keyed_existing_read_write(path: &Path, key: &SecretBox<DerivedKey>) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let cipher = conn.query_row("PRAGMA cipher_version", [], |r| r.get::<_, String>(0));
+    if !matches!(&cipher, Ok(v) if !v.trim().is_empty()) {
+        return Err(Error::EncryptionUnavailable);
+    }
+    let literal = key.expose_secret().pragma_literal();
+    conn.pragma_update(None, "key", literal.as_str())
+        .map_err(map_cipher_err)?;
+    conn.pragma_update(None, "cipher_memory_security", "ON")
+        .map_err(map_cipher_err)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")
+        .map_err(map_cipher_err)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(map_cipher_err)?;
+    Ok(conn)
+}
+
 /// Rename the legacy `vault_schema` table to `vesta_schema` if a pre-rename vault still has it.
 /// Idempotent; a no-op for new / already-migrated vaults. A wrong key surfaces as
 /// [`Error::WrongPassphrase`] from the `sqlite_master` read (same as [`verify_key`]).
@@ -716,7 +857,10 @@ fn migrate_schema_table(conn: &Connection) -> Result<()> {
 /// `journal_mode`/`synchronous` (those are writes; the primary connection
 /// already put the file in WAL, which a reader joins automatically).
 fn open_keyed_read_only(path: &Path, key: &SecretBox<DerivedKey>) -> Result<Connection> {
-    let conn = Connection::open(path)?;
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
     let cipher = conn.query_row("PRAGMA cipher_version", [], |r| r.get::<_, String>(0));
     if !matches!(&cipher, Ok(v) if !v.trim().is_empty()) {
         return Err(Error::EncryptionUnavailable);
@@ -1044,6 +1188,168 @@ mod tests {
     }
 
     #[test]
+    fn existing_read_write_v2_opens_and_allows_explicit_transaction_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("existing-rw.terrapi");
+        let meta_path = meta_path_for(&path);
+        let vault = Vesta::create(&path, "pw", p()).unwrap();
+        vault
+            .with_connection(|c| {
+                c.execute_batch("CREATE TABLE item(id INTEGER PRIMARY KEY,value TEXT NOT NULL);")
+            })
+            .unwrap();
+        vault.lock();
+        let meta_before = fs::read(&meta_path).unwrap();
+        let mut vault = Vesta::open_existing_read_write_with_passphrase(&path, "pw").unwrap();
+        vault
+            .with_connection_mut(|c| {
+                let tx = c.transaction()?;
+                tx.execute("INSERT INTO item VALUES(1,'written')", [])?;
+                tx.commit()
+            })
+            .unwrap();
+        let value: String = vault
+            .with_connection(|c| c.query_row("SELECT value FROM item WHERE id=1", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(value, "written");
+        let schema: Vec<String> = vault
+            .with_connection(|c| {
+                c.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?
+                    .query_map([], |r| r.get(0))?
+                    .collect()
+            })
+            .unwrap();
+        assert_eq!(schema, ["item", "vesta_schema"]);
+        vault.lock();
+        assert_eq!(fs::read(meta_path).unwrap(), meta_before);
+    }
+
+    #[test]
+    fn existing_read_write_rejects_nonsteady_inputs_without_mutation() {
+        let dir = TempDir::new().unwrap();
+
+        let absent = dir.path().join("absent.terrapi");
+        assert!(Vesta::open_existing_read_write_with_passphrase(&absent, "pw").is_err());
+        assert!(!absent.exists());
+        assert!(!meta_path_for(&absent).exists());
+
+        let missing_db = dir.path().join("missing-db.terrapi");
+        let v = Vesta::create(&missing_db, "pw", p()).unwrap();
+        v.lock();
+        let missing_db_meta = meta_path_for(&missing_db);
+        let meta_before = fs::read(&missing_db_meta).unwrap();
+        fs::remove_file(&missing_db).unwrap();
+        assert!(Vesta::open_existing_read_write_with_passphrase(&missing_db, "pw").is_err());
+        assert!(!missing_db.exists());
+        assert_eq!(fs::read(&missing_db_meta).unwrap(), meta_before);
+
+        let missing_meta = dir.path().join("missing-meta.terrapi");
+        let v = Vesta::create(&missing_meta, "pw", p()).unwrap();
+        v.lock();
+        let db_before = fs::read(&missing_meta).unwrap();
+        fs::remove_file(meta_path_for(&missing_meta)).unwrap();
+        assert!(Vesta::open_existing_read_write_with_passphrase(&missing_meta, "pw").is_err());
+        assert_eq!(fs::read(&missing_meta).unwrap(), db_before);
+        assert!(!meta_path_for(&missing_meta).exists());
+
+        let staged = dir.path().join("staged.terrapi");
+        let v = Vesta::create(&staged, "pw", p()).unwrap();
+        v.lock();
+        let staged_meta = meta_path_for(&staged);
+        let staged_path = rekey_staging_path(&staged_meta);
+        fs::write(&staged_path, b"staged fixture").unwrap();
+        let committed_before = fs::read(&staged_meta).unwrap();
+        assert!(Vesta::open_existing_read_write_with_passphrase(&staged, "pw").is_err());
+        assert_eq!(fs::read(&staged_meta).unwrap(), committed_before);
+        assert_eq!(fs::read(&staged_path).unwrap(), b"staged fixture");
+
+        let staged_dir = dir.path().join("staged-dir.terrapi");
+        let v = Vesta::create(&staged_dir, "pw", p()).unwrap();
+        v.lock();
+        let staged_dir_path = rekey_staging_path(&meta_path_for(&staged_dir));
+        fs::create_dir(&staged_dir_path).unwrap();
+        assert!(Vesta::open_existing_read_write_with_passphrase(&staged_dir, "pw").is_err());
+        assert!(staged_dir_path.is_dir());
+
+        let legacy = dir.path().join("legacy.terrapi");
+        create_v1_vault(&legacy, "pw", p());
+        let legacy_meta = meta_path_for(&legacy);
+        let legacy_before = fs::read(&legacy_meta).unwrap();
+        assert!(matches!(
+            Vesta::open_existing_read_write_with_passphrase(&legacy, "pw"),
+            Err(Error::UnsupportedFormat {
+                found: 1,
+                supported: 2
+            })
+        ));
+        assert_eq!(fs::read(&legacy_meta).unwrap(), legacy_before);
+
+        let wrong = dir.path().join("wrong.terrapi");
+        let v = Vesta::create(&wrong, "right", p()).unwrap();
+        v.lock();
+        let wrong_meta = meta_path_for(&wrong);
+        let wrong_before = fs::read(&wrong_meta).unwrap();
+        assert!(matches!(
+            Vesta::open_existing_read_write_with_passphrase(&wrong, "wrong"),
+            Err(Error::WrongPassphrase)
+        ));
+        assert_eq!(fs::read(&wrong_meta).unwrap(), wrong_before);
+
+        let malformed = dir.path().join("malformed.terrapi");
+        let v = Vesta::create(&malformed, "pw", p()).unwrap();
+        v.lock();
+        let malformed_meta = meta_path_for(&malformed);
+        let malformed_bytes = br#"{"version":2,"unknown":true}"#;
+        fs::write(&malformed_meta, malformed_bytes).unwrap();
+        assert!(Vesta::open_existing_read_write_with_passphrase(&malformed, "pw").is_err());
+        assert_eq!(fs::read(&malformed_meta).unwrap(), malformed_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_read_write_rejects_database_metadata_and_staged_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+
+        let db_link = dir.path().join("db-link.terrapi");
+        let db_target = dir.path().join("db-target.terrapi");
+        let v = Vesta::create(&db_target, "pw", p()).unwrap();
+        v.lock();
+        symlink(&db_target, &db_link).unwrap();
+        fs::copy(meta_path_for(&db_target), meta_path_for(&db_link)).unwrap();
+        assert!(Vesta::open_existing_read_write_with_passphrase(&db_link, "pw").is_err());
+        assert!(fs::symlink_metadata(&db_link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let meta_link_db = dir.path().join("meta-link.terrapi");
+        let v = Vesta::create(&meta_link_db, "pw", p()).unwrap();
+        v.lock();
+        let meta_link = meta_path_for(&meta_link_db);
+        let meta_target = dir.path().join("meta-target.json");
+        fs::rename(&meta_link, &meta_target).unwrap();
+        symlink(&meta_target, &meta_link).unwrap();
+        assert!(Vesta::open_existing_read_write_with_passphrase(&meta_link_db, "pw").is_err());
+        assert!(fs::symlink_metadata(&meta_link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let staged_link_db = dir.path().join("staged-link.terrapi");
+        let v = Vesta::create(&staged_link_db, "pw", p()).unwrap();
+        v.lock();
+        let staged_link = rekey_staging_path(&meta_path_for(&staged_link_db));
+        symlink(dir.path().join("missing-target"), &staged_link).unwrap();
+        assert!(Vesta::open_existing_read_write_with_passphrase(&staged_link_db, "pw").is_err());
+        assert!(fs::symlink_metadata(&staged_link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
     fn create_close_open_roundtrip() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v.memento");
@@ -1069,6 +1375,12 @@ mod tests {
         primary
             .with_connection(|c| c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (7);"))
             .unwrap();
+        let mut wal_path = path.as_os_str().to_owned();
+        wal_path.push("-wal");
+        assert!(
+            fs::metadata(PathBuf::from(wal_path)).unwrap().len() > 0,
+            "fixture must exercise committed live-WAL reads"
+        );
 
         // A second, read-only handle opened with a clone of the live DEK sees
         // the committed row...
@@ -1082,12 +1394,26 @@ mod tests {
         let write = ro.with_connection(|c| c.execute("INSERT INTO t VALUES (8)", []));
         assert!(write.is_err(), "query_only must reject the write");
 
+        // SQLite's immutable READ_ONLY open flag remains authoritative even if
+        // caller code disables the defense-in-depth query_only pragma.
+        let write = ro.with_connection(|c| {
+            c.pragma_update(None, "query_only", "OFF")?;
+            c.execute("INSERT INTO t VALUES (8)", [])
+        });
+        assert!(write.is_err(), "READ_ONLY must reject the write");
+
         // A write the primary makes AFTER the read handle opened is still
         // visible to it (WAL: committed writes reach new reads).
         primary
             .with_connection(|c| c.execute("INSERT INTO t VALUES (9)", []))
             .unwrap();
         let max: i64 = ro
+            .with_connection(|c| c.query_row("SELECT MAX(x) FROM t", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(max, 9);
+
+        let passphrase_ro = Vesta::open_read_only_with_passphrase(&path, "pw").unwrap();
+        let max: i64 = passphrase_ro
             .with_connection(|c| c.query_row("SELECT MAX(x) FROM t", [], |r| r.get(0)))
             .unwrap();
         assert_eq!(max, 9);
@@ -1101,6 +1427,52 @@ mod tests {
         let bogus = SecretBox::new(Box::new(DerivedKey::from_bytes([0u8; crate::KEY_LEN])));
         let err = Vesta::open_read_only(&path, bogus).unwrap_err();
         assert!(matches!(err, Error::WrongPassphrase), "got {err:?}");
+    }
+
+    #[test]
+    fn read_only_passphrase_rejects_wrong_secret_and_never_creates_missing_database() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.memento");
+        let key = {
+            let vault = Vesta::create(&path, "right", p()).unwrap();
+            let key = vault.derived_key();
+            vault.lock();
+            key
+        };
+        let err = Vesta::open_read_only_with_passphrase(&path, "wrong").unwrap_err();
+        assert!(matches!(err, Error::WrongPassphrase), "got {err:?}");
+
+        fs::remove_file(&path).unwrap();
+        assert!(!path.exists());
+        assert!(Vesta::open_read_only_with_passphrase(&path, "right").is_err());
+        assert!(
+            !path.exists(),
+            "read-only passphrase open created a database"
+        );
+        assert!(Vesta::open_read_only(&path, key).is_err());
+        assert!(!path.exists(), "read-only keyed open created a database");
+    }
+
+    #[test]
+    fn read_only_passphrase_reads_v1_without_migration_and_rejects_staged_migration() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.memento");
+        create_v1_vault(&path, "pw", p());
+
+        let read_only = Vesta::open_read_only_with_passphrase(&path, "pw").unwrap();
+        let value: i64 = read_only
+            .with_connection(|c| c.query_row("SELECT x FROM t", [], |row| row.get(0)))
+            .unwrap();
+        assert_eq!(value, 7);
+        read_only.lock();
+        assert!(matches!(
+            StoredMeta::read(&meta_path_for(&path)).unwrap(),
+            StoredMeta::V1(_)
+        ));
+
+        fs::write(rekey_staging_path(&meta_path_for(&path)), b"staged").unwrap();
+        let err = Vesta::open_read_only_with_passphrase(&path, "pw").unwrap_err();
+        assert!(matches!(err, Error::MetaInvalid(_)), "got {err:?}");
     }
 
     #[test]

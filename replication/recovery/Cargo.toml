@@ -1,0 +1,20 @@
+[package]
+name = "terrapi-vesta-recovery"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Vesta encrypted immutable recovery decision journal and strict grant verification"
+
+[dependencies]
+terrapi-vesta = { path = "../..", default-features = false }
+rusqlite = { version = "=0.32.1", features = ["bundled-sqlcipher"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "=0.22.1"
+ring = "=0.17.14"
+
+[dev-dependencies]
+tempfile = "3"

@@ -3,6 +3,68 @@
 terrapi-vesta — the secrets boundary for the quanto / proximi.io stack: a network
 secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew from.
 
+## Unreleased — replication product integration
+
+- Added an experimental checkpoint-transition certificate verifier with external
+  ES256 trust and separate issuance/historical result types, plus an encrypted
+  decision journal with authenticated-policy hooks and exact decision retries.
+  Typed read-side lineage verification is experimental; recovered-pair compaction
+  remains disabled pending lifecycle integration.
+  See [transition contract](docs/planning/checkpoint-transition-certificates.md).
+- Added opt-in typed maintenance: durable snapshot pins, exact bootstrap cancellation,
+  completed staging cleanup and receipt-preserving local original-pair compaction with
+  restartable phases. Recovered memberships and permanently lost-member maintenance
+  remain unsupported; receipt capacity is unchanged. See
+  [maintenance operations](docs/planning/typed-maintenance-operations.md).
+- Added `typed::Node<A>` and typed Coordinator using the existing shared commit,
+  reconciliation, schema replay, receipt and checkpoint implementation. Independent
+  SQL schemas now support durable writes, encrypted reopen and exact-result retries.
+- Added encrypted frozen typed snapshot publication and bounded receipt/data pages.
+  Final data, receipt prefix and checkpoint installation is one transaction; restart,
+  conflicting-page rejection, lost finish-ACK retry and journal catch-up are supported.
+- Added `network::typed` using shared TLS 1.3/pinning/deadline/framing machinery and
+  explicit `vesta-typed-pair-v1` scope/contract admission. Legacy protocol 12 is unchanged.
+- Added a typed local/offline member-replacement bridge to the existing neutral
+  authority journal. It remains fail-closed until both ACKs, authority completion and
+  local completion receipts; restored peers require the newly authorized pins.
+- Corrected the inherited ACK-loss test's 150 ms ordinary RPC budget: the functional
+  fault remains (dropped ACK or delay beyond deadline), with 5 s normal/6 s fault
+  budgets. Production timeouts and the separate slow-drip deadline test are unchanged.
+  Database-open/KDF readiness is established before spawning the peer, rather than
+  incorrectly subjecting encrypted startup to a short test-channel deadline.
+  CI also compiles minimal mTLS/recovery feature test targets without the demo API.
+  See [typed integration](docs/planning/typed-product-integration.md) for verification
+  and explicit first-version limits.
+- Reference replication TLS protocol 12 requires schema contracts on every request
+  and reply; recovery compares verified contracts before journal transfer or mutation.
+  Protocol 11 and missing contracts are rejected without downgrade. This changes only
+  the unreleased replication workspace, not broker/sync services or root file formats.
+  See [peer schema admission](docs/planning/peer-schema-admission.md).
+- Added a separate `replication/` workspace owning the previously Proximi-hosted
+  fixed-pair replication and recovery implementation; the Proximi harness consumes it.
+- Extracted schema/transport-neutral `terrapi-vesta-recovery`, with explicit trusted
+  issuer/audience/token-type profiles and no permissive default recovery policy.
+- Optional mTLS and demo HTTP dependencies; fixture crash hooks require the explicit
+  `test-support` feature and are absent from the default product library build.
+- Preserved root library API, encrypted file formats, Rust 1.83 floor and service contracts.
+- Replication Node now requires exactly one matching persisted identity before
+  initializing an existing database. Missing/duplicate identities and non-Node
+  encrypted files are rejected, never implicitly adopted or repaired. Interrupted
+  first initialization may require explicit operator recovery; no automatic reset.
+  See [Node identity admission](docs/planning/node-identity-admission.md).
+- Replication Node persists a format-1 application schema contract (adapter identity,
+  fingerprint version and exact catalog digest). Existing pre-contract Nodes now
+  require explicit `Node::upgrade_legacy_schema_contract`; ordinary open never
+  installs a missing contract. See [schema contracts](docs/planning/node-schema-contract.md).
+- Added typed SQL schema capture/replay adapters, used by the reference Node; reject
+  undeclared changeset tables, invalid primary keys and schema/state mismatches atomically.
+  The typed Node now integrates these helpers with receipts, snapshots and transport.
+- Added a generic SQL snapshot transfer primitive with explicit format/scope/catalog
+  binding, typed rows, bounded operation codecs, restartable encrypted staging and
+  atomic installation. Does not alter the legacy Node/TLS protocol or export receipts.
+- Unreleased: deployment trust/fencing, capacity/security review and physical
+  failure-domain validation remain release gates. No release/deployment is implied.
+
 ## 0.1.13 (2026-06-13) — vault → Vesta rename + Stage-3 cutover prep
 
 The project is renamed **vault → Vesta**. This is the first deployable Stage-3 build; the live

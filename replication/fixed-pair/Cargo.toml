@@ -1,0 +1,73 @@
+[package]
+name = "terrapi-vesta-replication"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Vesta fixed-writer two-copy replication and controlled member recovery"
+
+[features]
+default = []
+mtls = ["dep:rustls"]
+demo-api = ["mtls", "dep:axum", "dep:tokio"]
+# Never enable this feature in a deployed application: it compiles crash fixtures.
+test-support = ["demo-api"]
+experimental-recovery = ["mtls"]
+
+[dependencies]
+terrapi-vesta-recovery = { path = "../recovery" }
+terrapi-vesta = { path = "../..", default-features = false }
+rusqlite = { version = "=0.32.1", features = ["bundled-sqlcipher", "session"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+getrandom = "=0.2.17"
+rustls = { version = "=0.23.43", optional = true, default-features = false, features = ["std", "ring"] }
+axum = { version = "=0.8.9", optional = true }
+tokio = { version = "=1.53.1", optional = true, features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+
+base64 = "=0.22.1"
+ring = "=0.17.14"
+
+[dev-dependencies]
+tempfile = "3"
+rcgen = "=0.13.2"
+tower = { version = "0.5", features = ["util"] }
+
+[[bin]]
+name = "vesta-node"
+path = "src/main.rs"
+required-features = ["test-support"]
+
+[[bin]]
+name = "vesta-peer"
+path = "src/bin/vesta-peer.rs"
+required-features = ["demo-api"]
+
+[[bin]]
+name = "vesta-api"
+path = "src/bin/vesta-api.rs"
+required-features = ["demo-api"]
+
+[[test]]
+name = "process_crash"
+required-features = ["test-support"]
+[[test]]
+name = "base_activation"
+required-features = ["test-support"]
+[[test]]
+name = "publication"
+required-features = ["test-support"]
+[[test]]
+name = "published_restore"
+required-features = ["test-support"]
+[[test]]
+name = "network"
+required-features = ["test-support"]
+[[test]]
+name = "api"
+required-features = ["demo-api"]
+[[test]]
+name = "secondary"
+required-features = ["demo-api"]

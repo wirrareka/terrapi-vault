@@ -46,6 +46,22 @@ consume as a path dependency) plus the network **services** it has grown into, u
 The library stays platform-neutral (no networking/UI deps) so memento/probe are never
 constrained; the services are a separate workspace under `services/`.
 
+### Replication and controlled recovery (unreleased)
+
+The separate [`replication/`](replication/README.md) workspace owns the fixed-writer,
+two-copy storage and recovery foundation originally exercised by Proximi.io.
+`terrapi-vesta-recovery` is the schema-neutral encrypted control journal and grant
+verifier; `terrapi-vesta-replication` contains receipts, snapshot transfer, read
+admission, optional mTLS and experimental member replacement. Neither is added to
+the root library dependency tree or to the broker/personal-sync services.
+
+The data engine offers `typed::Node<A>` for application-owned SQL schemas, with a
+shared commit/recovery/coordinator engine, receipt-bearing snapshots and optional
+typed mTLS transport. The reference `places/features` profile remains compatible.
+Controlled typed replacement requires both member ACKs and authority completion
+before data admission opens. This remains **unreleased**, not production certification;
+see [typed product integration and operating limits](docs/planning/typed-product-integration.md).
+
 ## Usage
 
 ```toml

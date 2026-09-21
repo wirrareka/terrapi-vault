@@ -8,6 +8,34 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Separate from the root library's 1.83 contract; never deployed by this job.
+  replication:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: replication
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: SQLCipher session build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libclang-dev pkg-config libssl-dev
+      - run: rustup toolchain install 1.89.0 --profile minimal --component clippy --component rustfmt
+      - run: cargo +1.89.0 fmt --all -- --check
+      - run: cargo +1.89.0 clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo +1.89.0 clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo +1.89.0 check --locked -p terrapi-vesta-replication --no-default-features --features mtls --tests
+      - run: cargo +1.89.0 check --locked -p terrapi-vesta-replication --no-default-features --features experimental-recovery --tests
+      - run: cargo +1.89.0 test --locked -p terrapi-vesta-replication --lib -- --test-threads=4
+      - run: cargo +1.89.0 test --locked -p terrapi-vesta-recovery
+      - name: Stopped-pair backup/restore qualification (native Linux)
+        run: cargo +1.89.0 test --locked -p terrapi-vesta-replication --test backup_restore_qualification
+      - run: cargo +1.89.0 test --locked -p terrapi-vesta-replication --test production_features --test recovery_foundation --test sql_schema --test sql_snapshot
+      - run: cargo +1.89.0 test --locked --workspace --all-features -- --test-threads=4
+
   # The at-rest library: must keep building + testing on its 1.83 MSRV floor.
   lib-msrv:
     runs-on: ubuntu-latest

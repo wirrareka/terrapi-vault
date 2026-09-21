@@ -1,4 +1,4 @@
-name: FreeBSD build smoke
+name: FreeBSD build and replication runtime
 
 # Build the vesta-broker on the medina FreeBSD builder (the same `runner-fbsd`
 # mechanism kalista uses), NOT vmactions/freebsd-vm. The broker lives in the
@@ -9,6 +9,7 @@ on:
     branches: [main]
     paths:
       - 'src/**'
+      - 'replication/**'
       - 'services/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -17,6 +18,7 @@ on:
     branches: [main]
     paths:
       - 'src/**'
+      - 'replication/**'
       - 'services/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -46,6 +48,7 @@ jobs:
           # target/ + services/target/ live in the VM (cargo cache persists).
           rsync -az --delete \
             --exclude '/target' \
+            --exclude '/replication/target' \
             --exclude '/services/target' \
             --exclude '/.git' \
             -e ssh \
@@ -64,4 +67,23 @@ jobs:
             cargo build --release -p vesta-broker
             ls -l target/release/vesta-broker
             file target/release/vesta-broker || true
+          '
+
+      # Native runtime qualification, separate from the broker build smoke above.
+      # Adding this hook is not evidence that the self-hosted job has executed.
+      - name: stopped-pair backup/restore qualification on the FreeBSD VM
+        run: |
+          set -euo pipefail
+          ssh runner-fbsd '
+            set -eu
+            export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:"$HOME/.cargo/bin"
+            cd "$HOME/build/terrapi-vesta/replication"
+            uname -a
+            rustc +1.89.0 -Vv
+            cargo +1.89.0 -V
+            cargo +1.89.0 test --locked -p terrapi-vesta-replication --test backup_restore_qualification
+            # Supported default-feature workspace runtime suite. Feature-specific mTLS,
+            # crash-process and experimental recovery suites remain in Linux CI until
+            # the FreeBSD runner has an explicit qualification budget for them.
+            cargo +1.89.0 test --locked --workspace
           '
