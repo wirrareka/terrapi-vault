@@ -1171,12 +1171,14 @@ fn a_loss_from_a_successor_is_refused_in_an_ordinary_journal() {
 }
 
 #[test]
-fn decided_abandoned_and_supersedes_are_validated_but_not_yet_enabled() {
+fn decided_and_abandoned_request_are_refused_without_their_preconditions() {
     let w = World::new();
     let p = Authority::default();
     let j = w.certified(&p);
     let base = w.first_loss(0, 2);
 
+    // S11 enables `Decided`, but this journal's head is completed: there is
+    // nothing in flight to finish forward.
     let decided = LossRequest {
         source_kind: Some(SourceKind::Decided),
         ..base.clone()
@@ -1190,9 +1192,11 @@ fn decided_abandoned_and_supersedes_are_validated_but_not_yet_enabled() {
             &w.trust(),
             &p,
         ),
-        "decided loss source not enabled",
+        "decided transition required",
     );
 
+    // S11 enables `abandoned_request`, but on an idle journal only the
+    // default-deny rollback hook can judge it, so it cannot be padding.
     let abandoned = LossRequest {
         abandoned_request: Some([77; 32]),
         ..base.clone()
@@ -1206,7 +1210,7 @@ fn decided_abandoned_and_supersedes_are_validated_but_not_yet_enabled() {
             &w.trust(),
             &p,
         ),
-        "loss abandoned request not enabled",
+        "maintenance rollback evidence missing",
     );
 
     let superseding = LossRequest {
@@ -1219,6 +1223,7 @@ fn decided_abandoned_and_supersedes_are_validated_but_not_yet_enabled() {
         ..base.clone()
     };
     assert!(superseding.validate().is_ok());
+    // S10 enables supersession, but there is nothing here to supersede.
     refused(
         j.decide_loss(
             superseding.clone(),
@@ -1227,7 +1232,7 @@ fn decided_abandoned_and_supersedes_are_validated_but_not_yet_enabled() {
             &w.trust(),
             &p,
         ),
-        "loss supersession not enabled",
+        "superseded loss decision missing",
     );
 
     // Nothing above was recorded; the plain format-2 request still works.

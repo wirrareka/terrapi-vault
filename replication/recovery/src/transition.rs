@@ -287,6 +287,10 @@ struct History {
     /// consumed by an abort. `None` for an empty journal and for a journal
     /// whose every record was aborted.
     head: Option<Record>,
+    /// The last non-aborted record that actually completed. Equal to `head`
+    /// whenever the head is completed; otherwise the record the head chains
+    /// to, which is the certificate the pair is still live on.
+    completed: Option<Record>,
     ids: HashSet<Id>,
     aborts: BTreeMap<u64, AbortRecord>,
     /// The highest revision consumed by any history record or abort, `None`
@@ -566,6 +570,7 @@ impl Journal {
             c.prepare("SELECT revision,record,digest FROM transition_history ORDER BY revision")?;
         let mut rows = stmt.query([])?;
         let mut effective: Option<Record> = None;
+        let mut completed: Option<Record> = None;
         let mut consumed: Option<u64> = None;
         let mut selected = None;
         let mut ids = HashSet::new();
@@ -609,6 +614,9 @@ impl Journal {
             if pending.next_if_eq(&rev).is_some() {
                 decided_abort(&aborts[&rev].abort, &record)?;
             } else {
+                if record.completion.is_some() {
+                    completed = Some(record.clone());
+                }
                 effective = Some(record);
             }
         }
@@ -628,6 +636,7 @@ impl Journal {
         Ok((
             History {
                 head: effective,
+                completed,
                 ids,
                 aborts,
                 consumed,
