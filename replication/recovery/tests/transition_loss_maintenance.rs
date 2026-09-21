@@ -69,6 +69,7 @@ struct Authority {
     ok: Cell<bool>,
     installed: Cell<u8>,
     rollback_ok: Cell<bool>,
+    finish_ok: Cell<bool>,
     survivor_ok: Cell<bool>,
     superseded_ok: Cell<bool>,
     abort_ok: Cell<bool>,
@@ -79,6 +80,7 @@ impl Default for Authority {
             ok: Cell::new(true),
             installed: Cell::new(0),
             rollback_ok: Cell::new(true),
+            finish_ok: Cell::new(true),
             survivor_ok: Cell::new(true),
             superseded_ok: Cell::new(true),
             abort_ok: Cell::new(true),
@@ -132,6 +134,18 @@ impl LossPolicy for Authority {
             Ok(())
         } else {
             Err("survivor does not hold that pending request".into())
+        }
+    }
+    fn maintenance_finish_forward_authorized(
+        &self,
+        _: &JournalScope,
+        _: &LossRequest,
+        _: &[u8; 32],
+    ) -> Result<()> {
+        if self.finish_ok.get() {
+            Ok(())
+        } else {
+            Err("survivor has not applied that decided transition".into())
         }
     }
     fn loss_successor_applied(

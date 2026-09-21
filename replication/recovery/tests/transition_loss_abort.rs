@@ -1419,6 +1419,29 @@ fn a_superseding_loss_may_change_nothing_but_the_replacement() {
 
 // ----------------------------------------------------- durable fail-closed
 
+/// Burn the one-way format-2 marker, as every genuine writer of a format-2
+/// table does in the same transaction.
+fn mark_format_two(path: &Path) {
+    let raw = terrapi_vesta::Vesta::open(path, "pass").unwrap();
+    raw.with_connection(|c| {
+        let stored: String =
+            c.query_row("SELECT record FROM transition_scope WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        let mut value: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("journal_format".into(), json!(2));
+        c.execute(
+            "UPDATE transition_scope SET record=?1 WHERE id=1",
+            [value.to_string()],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+}
+
 fn plant(path: &Path, sql: &str, args: &[&dyn rusqlite::ToSql]) {
     let raw = terrapi_vesta::Vesta::open(path, "pass").unwrap();
     raw.with_connection(|c| {
@@ -1531,6 +1554,7 @@ fn a_tampered_broken_or_overfull_loss_chain_fails_the_source_journal_closed() {
     let i = installed(&w, &p, 0);
     abort_it(&w, &i, &p, 50);
     drop(i.j);
+    mark_format_two(&w.path("authority"));
     let raw = terrapi_vesta::Vesta::open(w.path("authority"), "pass").unwrap();
     raw.with_connection(|c| {
         c.execute_batch("CREATE TABLE IF NOT EXISTS main.transition_loss_chain(revision INTEGER PRIMARY KEY,record TEXT NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=32)); BEGIN;")?;

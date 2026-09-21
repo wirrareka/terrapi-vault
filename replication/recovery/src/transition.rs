@@ -27,6 +27,11 @@ const MAX_RECORD: usize = 256 * 1024;
 const MAX_ABORT_ROWS: usize = 4096;
 pub const TOKEN_TYPE: &str = "terrapi-checkpoint-transition+jwt";
 pub const ABORT_TOKEN_TYPE: &str = "terrapi-maintenance-abort+jwt";
+/// Member added to the stored scope row the first time this journal records
+/// state an older binary cannot see. Old readers decode `JournalScope` with
+/// `deny_unknown_fields`, so its presence makes them fail closed.
+const JOURNAL_FORMAT_MARKER: &str = "journal_format";
+const JOURNAL_FORMAT_TWO: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -555,15 +560,7 @@ impl Journal {
             "transition trust profile mismatch",
         )?;
         validate_successor_parent(c, trust, &self.scope)?;
-        let raw: String =
-            c.query_row("SELECT record FROM transition_scope WHERE id=1", [], |r| {
-                r.get(0)
-            })?;
-        super::ensure(raw.len() <= 64 * 1024, "transition scope limit")?;
-        super::ensure(
-            serde_json::from_str::<JournalScope>(&raw)? == self.scope,
-            "transition journal scope mismatch",
-        )?;
+        self.ensure_journal_format(c)?;
         let aborts = self.read_aborts(c, trust)?;
         let mut pending = aborts.keys().copied().peekable();
         let mut stmt =
@@ -646,6 +643,28 @@ impl Journal {
         ))
     }
 
+    /// Both directions of the one-way journal format marker.
+    ///
+    /// A binary that predates format 2 cannot see `transition_abort`,
+    /// `transition_loss_chain` or `transition_loss_successor_abort`, so it
+    /// would read a cancelled transition as live, hand out a writer proof for
+    /// an aborted successor, or treat a superseded loss as current. It must
+    /// therefore fail *closed* on such a journal, and the only thing every
+    /// old binary already validates strictly is the stored scope row: adding
+    /// a member to it breaks their `deny_unknown_fields` decode.
+    ///
+    /// So: state in any of the three tables ⇒ the marker must be present, and
+    /// a marker is always accepted. A journal that never touches those tables
+    /// keeps its scope row byte-identical and stays readable by old binaries.
+    pub(super) fn ensure_journal_format(&self, c: &Connection) -> super::Result<()> {
+        let (stored, format) = read_scope(c)?;
+        super::ensure(stored == self.scope, "transition journal scope mismatch")?;
+        super::ensure(
+            format == JOURNAL_FORMAT_TWO || !format_two_state(c)?,
+            "format-2 journal state without format marker",
+        )
+    }
+
     /// Bounded, digest-checked, signature-checked scan of the lazily created
     /// append-only abort table. A journal without the table yields an empty
     /// map and is therefore byte-for-byte a format-1 journal.
@@ -654,11 +673,7 @@ impl Journal {
         c: &Connection,
         trust: &Trust<'_>,
     ) -> super::Result<BTreeMap<u64, AbortRecord>> {
-        if !c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='transition_abort')",
-            [],
-            |r| r.get(0),
-        )? {
+        if !table_exists(c, "transition_abort")? {
             return Ok(BTreeMap::new());
         }
         let rows: i64 = c.query_row("SELECT count(*) FROM main.transition_abort", [], |r| {
@@ -667,6 +682,11 @@ impl Journal {
         super::ensure(
             usize::try_from(rows).is_ok_and(|n| n <= MAX_ABORT_ROWS),
             "transition abort row limit",
+        )?;
+        ensure_row_sizes(
+            c,
+            "SELECT count(*) FROM main.transition_abort WHERE length(record)>?1",
+            "transition abort record limit",
         )?;
         let mut aborts: BTreeMap<u64, AbortRecord> = BTreeMap::new();
         let mut ids = HashSet::new();
@@ -1075,6 +1095,21 @@ impl Journal {
     ///   transition is still open — an open decision must be cancelled on its
     ///   own revision, never stepped over.
     ///
+    /// # Validity window of a never-decided abort
+    ///
+    /// The second shape is only issuable while `last_revision + 1` is still
+    /// the revision the abandoned request was prepared for. Nothing can
+    /// consume a revision in between except a participant loss, and a loss
+    /// that lands first makes this abort permanently unissuable — the pair
+    /// must then use the loss's own rollback branch (`source_kind =
+    /// Completed` with `abandoned_request`), which needs no node-side
+    /// aborting phase and therefore no cooperation from the lost member.
+    ///
+    /// The abort is nonetheless bound to the *request*, never to the revision
+    /// it happened to consume: [`Journal::fetch_abort`] matches on the
+    /// request digest and id alone, so the node that prepared the request can
+    /// always find the abort that cancelled it even if the two differ.
+    ///
     /// An exact retry of an already recorded abort converges and, crucially,
     /// does **not** re-check the token's validity window: the C2 crash window
     /// (abort recorded, process died before the nodes rolled back) must be
@@ -1092,6 +1127,12 @@ impl Journal {
         self.connection(|c| {
             let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
             let history = self.read(&tx, trust)?;
+            // Certified maintenance never runs in a successor journal, so an
+            // abort there could only ever be a confused or forged one.
+            super::ensure(
+                !successor_parent_exists(&tx)?,
+                "maintenance abort is not available in a successor journal",
+            )?;
             super::ensure(
                 !loss_record_exists(&tx, trust)?,
                 "maintenance abort superseded by participant loss",
@@ -1112,6 +1153,12 @@ impl Journal {
             // Exact retry first: a recorded abort is immutable and its
             // revision is already consumed, so every later shape check would
             // reject the very request that must converge.
+            //
+            // This branch deliberately skips `Policy::abort_applicable` and
+            // the `now` check: the C2 crash window is resumed with the same,
+            // by then expired, token, and the nodes it would ask about have
+            // already moved on. `Policy::continuity` still runs on both sides
+            // of the branch, so a revoked authority still stops the read.
             if let Some(existing) = history.aborts.get(&abort.aborted_revision) {
                 super::ensure(
                     existing.abort == abort && existing.token == token,
@@ -1179,6 +1226,12 @@ impl Journal {
     /// caller's continuity policy. This is the value a node must match its
     /// locally persisted rollback marker against after a restart; local bytes
     /// are never authority evidence.
+    ///
+    /// The lookup is by request digest and request id only. A never-decided
+    /// abort consumes `last_revision + 1`, which need not equal the revision
+    /// the abandoned request was issued for, so binding the lookup to the
+    /// revision as well would hide a recorded abort from the very node that
+    /// prepared the request.
     pub fn fetch_abort(
         &self,
         aborted_request: &Request,
@@ -1195,7 +1248,6 @@ impl Journal {
                 .find(|r| {
                     r.abort.aborted_request == digest
                         && r.abort.aborted_request_id == aborted_request.id
-                        && r.abort.aborted_revision == aborted_request.revision
                 })
                 .ok_or("maintenance abort missing")?;
             if let Some(head) = history.head.as_ref() {
@@ -1223,6 +1275,7 @@ fn save_abort(c: &Connection, r: &AbortRecord) -> super::Result<()> {
     let json = serde_json::to_string(r)?;
     super::ensure(json.len() <= MAX_RECORD, "transition abort record limit")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS main.transition_abort(revision INTEGER PRIMARY KEY,record TEXT NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=32));")?;
+    mark_journal_format_two(c)?;
     super::ensure(
         c.execute(
             "INSERT INTO main.transition_abort VALUES(?1,?2,?3)",
@@ -1248,6 +1301,97 @@ fn committed_abort(r: &AbortRecord, trust: &Trust<'_>) -> super::Result<Committe
         token_digest: Sha256::digest(r.token.as_bytes()).into(),
         certificate_id,
     })
+}
+
+pub(super) fn table_exists(c: &Connection, name: &str) -> super::Result<bool> {
+    Ok(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+        [name],
+        |r| r.get(0),
+    )?)
+}
+
+/// Reject any row whose payload exceeds the record cap *in SQL*, before a
+/// single byte of it is materialised into this process. `sql` must count the
+/// rows whose `record` is longer than the bound parameter.
+pub(super) fn ensure_row_sizes(c: &Connection, sql: &str, message: &str) -> super::Result<()> {
+    let cap = i64::try_from(MAX_RECORD).map_err(|_| "transition record limit")?;
+    let oversized: i64 = c.query_row(sql, [cap], |r| r.get(0))?;
+    super::ensure(oversized == 0, message)
+}
+
+/// The stored scope row, split into the journal scope and the one-way format
+/// marker. A format-1 row has no marker and decodes exactly as before.
+fn read_scope(c: &Connection) -> super::Result<(JournalScope, u32)> {
+    let raw: String = c.query_row("SELECT record FROM transition_scope WHERE id=1", [], |r| {
+        r.get(0)
+    })?;
+    super::ensure(raw.len() <= 64 * 1024, "transition scope limit")?;
+    let mut value: serde_json::Value = serde_json::from_str(&raw)?;
+    let object = value
+        .as_object_mut()
+        .ok_or("transition journal scope mismatch")?;
+    let format = match object.remove(JOURNAL_FORMAT_MARKER) {
+        None => 1,
+        Some(marker) => u32::try_from(marker.as_u64().ok_or("transition journal format")?)
+            .ok()
+            .filter(|f| *f == JOURNAL_FORMAT_TWO)
+            .ok_or("transition journal format")?,
+    };
+    Ok((serde_json::from_value(value)?, format))
+}
+
+/// Does this journal hold any state an old binary cannot see?
+fn format_two_state(c: &Connection) -> super::Result<bool> {
+    for (name, sql) in [
+        (
+            "transition_abort",
+            "SELECT count(*) FROM main.transition_abort",
+        ),
+        (
+            "transition_loss_chain",
+            "SELECT count(*) FROM main.transition_loss_chain",
+        ),
+        (
+            "transition_loss_successor_abort",
+            "SELECT count(*) FROM main.transition_loss_successor_abort",
+        ),
+    ] {
+        if table_exists(c, name)? {
+            let rows: i64 = c.query_row(sql, [], |r| r.get(0))?;
+            if rows > 0 {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Burn the one-way format marker into the stored scope row. Idempotent, and
+/// always called in the same transaction as the first write to a table an old
+/// binary cannot see.
+pub(super) fn mark_journal_format_two(c: &Connection) -> super::Result<()> {
+    let raw: String = c.query_row("SELECT record FROM transition_scope WHERE id=1", [], |r| {
+        r.get(0)
+    })?;
+    super::ensure(raw.len() <= 64 * 1024, "transition scope limit")?;
+    let mut value: serde_json::Value = serde_json::from_str(&raw)?;
+    let object = value
+        .as_object_mut()
+        .ok_or("transition journal scope mismatch")?;
+    if object.contains_key(JOURNAL_FORMAT_MARKER) {
+        return Ok(());
+    }
+    object.insert(
+        JOURNAL_FORMAT_MARKER.into(),
+        serde_json::Value::from(JOURNAL_FORMAT_TWO),
+    );
+    let json = serde_json::to_string(&value)?;
+    super::ensure(json.len() <= 64 * 1024, "transition scope limit")?;
+    super::ensure(
+        c.execute("UPDATE transition_scope SET record=?1 WHERE id=1", [json])? == 1,
+        "transition scope marker write failed",
+    )
 }
 
 fn save(c: &Connection, r: &Record) -> super::Result<()> {
