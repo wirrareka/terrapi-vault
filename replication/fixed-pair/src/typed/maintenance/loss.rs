@@ -2,6 +2,8 @@
 //! the atomic local installation of the signed successor membership.
 use super::*;
 use crate::recovery::transition;
+#[cfg(any(test, feature = "experimental-recovery"))]
+use crate::recovery::transition::roles;
 use sha2::{Digest, Sha256};
 #[cfg(any(test, feature = "experimental-recovery"))]
 use std::{
@@ -262,6 +264,7 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
                 && successor_binds(request, &self.request),
             "loss successor installation mismatch",
         )?;
+        require_canonical_role(request, request.survivor_index()?, self.role)?;
         Ok(Installed {
             format: 1,
             loss: self.request.clone(),
@@ -480,15 +483,20 @@ fn singleton(c: &Connection, table: &str, column: &str, limit: usize) -> Result<
     Ok(Some(value))
 }
 
-/// The `recovery_*` tables this node kind may legitimately carry: the survivor
-/// is participant 0 of the successor membership, the replacement participant 1.
+/// The `recovery_*` tables this node kind may legitimately carry. The kind is
+/// decided by comparing this node's position with the successor's own
+/// `survivor_index`, never by assuming a fixed slot.
 #[cfg(any(test, feature = "experimental-recovery"))]
 fn recovery_tables_for(record: &Installed) -> Result<&'static [&'static str]> {
-    Ok(if successor_index(record)? == 0 {
-        SURVIVOR_RECOVERY_TABLES
-    } else {
-        REPLACEMENT_RECOVERY_TABLES
-    })
+    // Which participant this node is, never which slot it occupies: format 2
+    // orders participants canonically, so the survivor may sit at either index.
+    Ok(
+        if successor_index(record)? == record.successor.survivor_index()? {
+            SURVIVOR_RECOVERY_TABLES
+        } else {
+            REPLACEMENT_RECOVERY_TABLES
+        },
+    )
 }
 
 #[cfg(any(test, feature = "experimental-recovery"))]
@@ -539,10 +547,48 @@ fn successor_binds(
         && successor.source_cut == loss.source_cut
         && successor.survivor_cut == loss.survivor_cut
         && successor.survivor_publication == loss.survivor_publication
-        && successor.participants[0].member == loss.survivor.member
-        && successor.participants[0].generation == loss.survivor.generation
-        && successor.participants[1].member == loss.replacement_member
-        && successor.participants[1].generation == loss.replacement_generation
+        && matches!(
+            (successor.survivor(), successor.replacement()),
+            (Ok(s), Ok(r))
+                if s.member == loss.survivor.member
+                    && s.generation == loss.survivor.generation
+                    && r.member == loss.replacement_member
+                    && r.generation == loss.replacement_generation
+        )
+}
+
+/// The role the canonical participant order implies for `index`. Format 1
+/// ordered participants `[survivor, replacement]` and carries no role, so it
+/// has none; format 2 orders them `[primary, secondary]`.
+#[cfg(any(test, feature = "experimental-recovery"))]
+fn canonical_role(
+    successor: &transition::LossSuccessorRequest,
+    index: usize,
+) -> Result<Option<Role>> {
+    Ok(match successor.format {
+        1 => None,
+        2 => Some(if index == 0 {
+            Role::Primary
+        } else {
+            Role::Secondary
+        }),
+        _ => return Err("unsupported loss successor format".into()),
+    })
+}
+
+/// A format-2 successor states each participant's role twice: once through the
+/// canonical order and once through the evidence the install derived it from.
+/// They must agree, or the successor is not describing this pair.
+#[cfg(any(test, feature = "experimental-recovery"))]
+fn require_canonical_role(
+    successor: &transition::LossSuccessorRequest,
+    index: usize,
+    derived: Role,
+) -> Result<()> {
+    ensure(
+        canonical_role(successor, index)?.is_none_or(|role| role == derived),
+        "loss successor role mismatch",
+    )
 }
 
 #[cfg(any(test, feature = "experimental-recovery"))]
@@ -655,6 +701,7 @@ pub fn install_replacement<A: ReplicatedSchema, P: transition::LossPolicy>(
         "loss replacement installation mismatch",
     )?;
     let installed_role = replacement_role(certificate, certificate_token, trust, parent)?;
+    require_canonical_role(request, roles(request)?.1, installed_role)?;
     let record = Installed {
         format: 1,
         loss: parent.clone(),
@@ -898,10 +945,10 @@ pub fn validate_successor_installation<A: ReplicatedSchema>(
             && request.parent_loss_token_digest == proof.loss_token_digest()
             && request.survivor_cut == loss.survivor_cut
             && request.survivor_publication == loss.survivor_publication
-            && request.participants[0].member == loss.survivor.member
-            && request.participants[0].generation == loss.survivor.generation
-            && request.participants[1].member == loss.replacement_member
-            && request.participants[1].generation == loss.replacement_generation
+            && request.survivor()?.member == loss.survivor.member
+            && request.survivor()?.generation == loss.survivor.generation
+            && request.replacement()?.member == loss.replacement_member
+            && request.replacement()?.generation == loss.replacement_generation
             && replacement.role == Role::Secondary
             && replacement.identity == survivor.identity,
         "loss successor installation mismatch",
@@ -1411,7 +1458,8 @@ impl<A: ReplicatedSchema, P: transition::LossPolicy> transition::LossPolicy
         // scope this successor journal records as its parent.
         let survivor = self.survivor.installed(source_scope)?;
         let replacement = replacement_installed(self.replacement, source_scope)?;
-        let [first, second] = &successor.participants;
+        let first = successor.survivor()?;
+        let second = successor.replacement()?;
         ensure(
             survivor.loss == *loss
                 && replacement.loss == *loss

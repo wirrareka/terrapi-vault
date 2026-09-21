@@ -971,7 +971,47 @@ fn successor_request_with(f: &Fixture, id: [u8; 32]) -> transition::LossSuccesso
     }
 }
 
+/// Format-2 successor: participants are in the canonical `[primary, secondary]`
+/// order and `survivor_index` names the survivor, so the recovered pair still
+/// carries its roles and can take a further loss. Both index values occur
+/// naturally — a lost Primary leaves a Secondary survivor at index 1.
 fn successor_request(f: &Fixture) -> transition::LossSuccessorRequest {
+    successor_request_of(f, 2)
+}
+
+/// Format-1 successor, kept for the compatibility test.
+fn successor_request_v1(f: &Fixture) -> transition::LossSuccessorRequest {
+    successor_request_of(f, 1)
+}
+
+fn successor_request_of(f: &Fixture, format: u32) -> transition::LossSuccessorRequest {
+    let replacement = transition::Participant {
+        member: f.loss.replacement_member,
+        generation: f.loss.replacement_generation,
+        old_base: Some(f.loss.survivor_cut.clone()),
+        target: f.loss.survivor_cut.clone(),
+        plan: f.loss.survivor.plan,
+        publication: f.loss.survivor_publication,
+    };
+    // Format 1 always orders `[survivor, replacement]`. Format 2 uses the
+    // canonical `[primary, secondary]` order: the survivor keeps its pre-loss
+    // role and the replacement takes the lost one, so the order follows
+    // directly from which role was lost.
+    let survivor_index = u8::from(format == 2 && f.survivor_role() == Role::Secondary);
+    let participants = if survivor_index == 0 {
+        [f.loss.survivor.clone(), replacement]
+    } else {
+        [replacement, f.loss.survivor.clone()]
+    };
+    transition::LossSuccessorRequest {
+        format,
+        survivor_index: (format == 2).then_some(survivor_index),
+        participants,
+        ..successor_skeleton(f)
+    }
+}
+
+fn successor_skeleton(f: &Fixture) -> transition::LossSuccessorRequest {
     transition::LossSuccessorRequest {
         format: 1,
         id: [60; 32],
@@ -989,19 +1029,7 @@ fn successor_request(f: &Fixture) -> transition::LossSuccessorRequest {
         parent_loss_token_digest: f.loss_token_digest,
         survivor_cut: f.loss.survivor_cut.clone(),
         survivor_publication: f.loss.survivor_publication,
-        // Role convention: participants[0] is the survivor (Primary in the new
-        // membership), participants[1] is the replacement (Secondary).
-        participants: [
-            f.loss.survivor.clone(),
-            transition::Participant {
-                member: f.loss.replacement_member,
-                generation: f.loss.replacement_generation,
-                old_base: Some(f.loss.survivor_cut.clone()),
-                target: f.loss.survivor_cut.clone(),
-                plan: f.loss.survivor.plan,
-                publication: f.loss.survivor_publication,
-            },
-        ],
+        participants: [f.loss.survivor.clone(), f.loss.survivor.clone()],
         survivor_index: None,
     }
 }
@@ -3655,5 +3683,134 @@ fn stale_peer_copy_and_replayed_successor_journal_grant_nothing() -> Result<()> 
     drop(survivor_node);
     drop(replacement_node);
     drop(f);
+    Ok(())
+}
+
+/// Format-1 successors keep working exactly as before: they carry no role, so
+/// the canonical cross-check has nothing to compare and the installs derive
+/// every role from the source certificate alone.
+#[test]
+fn format_one_successor_still_completes_a_recovery() -> Result<()> {
+    let f = fixture(Role::Primary, false)?;
+    let handle = f.survivor_handle()?;
+    let mut replacement = f.replacement()?;
+    bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
+
+    let request = successor_request_v1(&f);
+    assert_eq!(request.format, 1);
+    assert_eq!(request.survivor_index, None);
+    assert_eq!(request.survivor()?.member, f.loss.survivor.member);
+    assert_eq!(request.replacement()?.member, f.loss.replacement_member);
+    let token = sign_successor(&f.signer, &request, &f.trust)?;
+    let journal = transition::Journal::create_loss_successor(
+        &f.dir.path().join("successor-v1"),
+        "successor-fixture",
+        successor_scope(&f),
+        &f.journal,
+        &f.trust.as_trust(),
+        f.gate.as_ref(),
+    )?;
+    journal.decide_loss_successor(
+        request.clone(),
+        &token,
+        15,
+        &f.trust.as_trust(),
+        f.gate.as_ref(),
+    )?;
+    let live = authorities(&f, &journal);
+    install_pair(
+        &handle,
+        &mut replacement,
+        "fixture",
+        &f.certificate,
+        &f.certificate_token,
+        &request,
+        &live,
+    )?;
+    f.live
+        .attach_successor(successor_journal_handle(&f, "successor-v1")?)?;
+    complete_successor(&handle, &replacement, &request, &live)?;
+    drop(replacement);
+    drop(handle);
+
+    let survivor_node = open_with_authority(&f, &f.survivor_path, Role::Secondary)?;
+    let replacement_node = open_with_authority(&f, &f.replacement_path, Role::Primary)?;
+    record_completion(&survivor_node)?;
+    record_completion(&replacement_node)?;
+    let (mut primary, mut secondary) = (replacement_node, survivor_node);
+    let mut batch = stock_entry().batch;
+    batch.operation_id = "after-format-one-recovery".into();
+    assert_eq!(
+        commit(&mut primary, &mut secondary, batch)?.sequence,
+        f.loss.survivor_cut.sequence + 1
+    );
+    drop(primary);
+    drop(secondary);
+    drop(f);
+    Ok(())
+}
+
+/// A format-2 successor states each role twice; the canonical order and the
+/// role derived from the source certificate must agree.
+#[test]
+fn format_two_successor_binds_the_canonical_participant_order() -> Result<()> {
+    for lost in [Role::Primary, Role::Secondary] {
+        let f = fixture(lost, false)?;
+        let request = successor_request(&f);
+        assert_eq!(request.format, 2);
+        // A lost Primary leaves a Secondary survivor, which sits at index 1.
+        assert_eq!(
+            request.survivor_index,
+            Some(u8::from(lost == Role::Primary))
+        );
+        assert_eq!(request.survivor()?.member, f.loss.survivor.member);
+        assert_eq!(request.replacement()?.member, f.loss.replacement_member);
+
+        let handle = f.survivor_handle()?;
+        let mut replacement = f.replacement()?;
+        bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
+        let (successor_journal, proof) = successor_proof(&f, "successor-journal")?;
+        let successor = proof.request().clone();
+        let live = authorities(&f, &successor_journal);
+
+        // Swapping the canonical order, or relabelling which index is the
+        // survivor, makes the signed roles disagree. `LossSuccessorRequest`'s
+        // own shape validation refuses both before the install's canonical
+        // cross-check is reached, so that check is defence in depth.
+        let mut swapped = successor.clone();
+        swapped.participants.swap(0, 1);
+        assert_err_contains(
+            handle.install_successor("fixture", &swapped, &live),
+            "invalid loss successor request",
+        );
+        let mut relabelled = successor.clone();
+        relabelled.survivor_index = Some(1 - successor.survivor_index.ok_or("survivor index")?);
+        assert_err_contains(
+            handle.install_successor("fixture", &relabelled, &live),
+            "invalid loss successor request",
+        );
+        // The cross-check itself refuses a role that contradicts the canonical
+        // position, for the survivor and for the replacement.
+        let survivor_slot = successor.survivor_index().map_err(|e| e.to_string())?;
+        assert!(require_canonical_role(&successor, survivor_slot, f.lost_role()).is_err());
+        assert!(
+            require_canonical_role(&successor, roles(&successor)?.1, f.survivor_role()).is_err()
+        );
+        require_canonical_role(&successor, survivor_slot, f.survivor_role())?;
+        require_canonical_role(&successor, roles(&successor)?.1, f.lost_role())?;
+        // The genuine successor installs on both nodes.
+        install_pair(
+            &handle,
+            &mut replacement,
+            "fixture",
+            &f.certificate,
+            &f.certificate_token,
+            &successor,
+            &live,
+        )?;
+        drop(replacement);
+        drop(handle);
+        drop(f);
+    }
     Ok(())
 }
