@@ -2,7 +2,10 @@
 use super::*;
 pub(super) mod certified;
 pub mod compaction;
-mod loss;
+#[cfg(feature = "experimental-recovery")]
+pub mod loss;
+#[cfg(not(feature = "experimental-recovery"))]
+pub(super) mod loss;
 mod pending;
 mod restores;
 #[cfg(test)]
@@ -42,19 +45,24 @@ pub(super) fn history_format(c: &Connection, format: u32) -> Result<u32> {
     }
 }
 
+/// Durable maintenance format version: 0 when the metadata is absent.
+pub(super) fn maintenance_version(c: &Connection) -> Result<u32> {
+    if present(c)? {
+        Ok(c.query_row(
+            "SELECT version FROM node_maintenance_format WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?)
+    } else {
+        Ok(0)
+    }
+}
+
 pub(super) fn verify_certified(
     c: &Connection,
     trust: Option<&crate::recovery::transition::TrustStore>,
 ) -> Result<()> {
-    let version = if present(c)? {
-        c.query_row(
-            "SELECT version FROM node_maintenance_format WHERE id=1",
-            [],
-            |r| r.get(0),
-        )?
-    } else {
-        0
-    };
+    let version = maintenance_version(c)?;
     let lineage = certified::verify_metadata(c, version, trust)?;
     if version == 3 {
         let trust = trust.ok_or("transition trust required")?;
@@ -112,15 +120,7 @@ fn verify_live_certified(
     authority: Option<&dyn super::CertifiedAuthority>,
     historical: bool,
 ) -> Result<()> {
-    let version = if present(c)? {
-        c.query_row(
-            "SELECT version FROM node_maintenance_format WHERE id=1",
-            [],
-            |r| r.get(0),
-        )?
-    } else {
-        0
-    };
+    let version = maintenance_version(c)?;
     if version != 3 {
         return ensure(authority.is_none(), "unexpected certified authority");
     }
@@ -226,6 +226,7 @@ impl<A: ReplicatedSchema> Node<A> {
     /// reject these files. No data/history is removed by this atomic upgrade.
     pub fn enable_maintenance(&mut self) -> Result<()> {
         self.connection(|c| {
+            loss::require_no_loss_recovery(c)?;
             self.admission(c)?;
             let tx = c.unchecked_transaction()?;
             self.current(&tx, true)?;
@@ -242,6 +243,7 @@ impl<A: ReplicatedSchema> Node<A> {
         pin_key(pin)?;
         self.validate_manifest(manifest)?;
         self.connection(|c| {
+            loss::require_no_loss_recovery(c)?;
             if self.admission(c).is_err() {
                 self.recovery_export_admission(c)?;
             }
@@ -312,6 +314,7 @@ impl<A: ReplicatedSchema> Node<A> {
     /// eligibility report. An unresolved valid tail is reported but never pruned.
     pub fn plan_compaction(&self) -> Result<CompactionPlan> {
         self.connection(|c| {
+            loss::require_no_loss_recovery(c)?;
             self.admission(c)?;
             let tx = c.unchecked_transaction()?;
             let checkpoint = self.current(&tx, false)?.0;

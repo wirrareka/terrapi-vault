@@ -133,6 +133,7 @@ impl<A: ReplicatedSchema> Node<A> {
     pub fn seal_recovery_source(&mut self, plan: &Plan) -> Result<()> {
         ensure(self.role == Role::Secondary, "survivor must be secondary")?;
         self.connection(|c| {
+            maintenance::loss::require_no_loss_recovery(c)?;
             let tx = c.unchecked_transaction()?;
             ensure(
                 self.verified_view_in(&tx)?.is_some(),
@@ -148,6 +149,7 @@ impl<A: ReplicatedSchema> Node<A> {
         })
     }
     pub(super) fn recovery_export_admission(&self, c: &Connection) -> Result<()> {
+        maintenance::loss::require_no_loss_recovery(c)?;
         self.verify_owner(c)?;
         let plan = seal(c)?.ok_or("recovery export requires sealed survivor")?;
         ensure(
@@ -158,6 +160,7 @@ impl<A: ReplicatedSchema> Node<A> {
         Ok(())
     }
     pub fn publish_recovery_snapshot(&mut self) -> Result<snapshot::Manifest> {
+        self.connection(maintenance::loss::require_no_loss_recovery)?;
         self.publish_snapshot_inner(true)
     }
     pub(super) fn export_checkpoint_admission(
@@ -184,6 +187,7 @@ impl<A: ReplicatedSchema> Node<A> {
         member: Id,
     ) -> Result<()> {
         self.connection(|c|{
+            maintenance::loss::require_no_loss_recovery(c)?;
             let tx=c.unchecked_transaction()?;
             let actual=self.inspect_in(&tx,&decision.request().plan,member)?;
             ensure(decision.request().prepared.contains(&actual),"stale installation")?;
@@ -351,6 +355,12 @@ impl<A: ReplicatedSchema> Node<A> {
         }
     }
     pub(super) fn recovery_membership(&self, c: &Connection) -> Result<Option<Id>> {
+        // After a participant-loss install the handshake digest is bound to the
+        // successor membership, so a peer still holding the pre-loss membership
+        // can never be paired with a recovered node.
+        if let Some(record) = maintenance::loss::state(c)? {
+            return Ok(Some(maintenance::loss::membership_digest(&record)?));
+        }
         self.recovery_admission(c)?;
         active(c)?
             .map(|a| digest(&(a.request, a.token_digest, a.grant_id, a.checkpoint)))
@@ -361,6 +371,11 @@ impl<A: ReplicatedSchema> Node<A> {
     }
     pub fn required_recovery_peer(&self) -> Result<Option<Id>> {
         self.connection(|c| {
+            // The successor membership replaces the pre-loss pairing: the lost
+            // member is never an acceptable peer again.
+            if let Some(record) = maintenance::loss::state(c)? {
+                return Ok(Some(maintenance::loss::peer_member(&record)?));
+            }
             self.recovery_admission(c)?;
             Ok(active(c)?.map(|a| {
                 if a.member == a.request.plan.candidate {
@@ -373,6 +388,9 @@ impl<A: ReplicatedSchema> Node<A> {
     }
     pub fn recovery_member_identity(&self) -> Result<Option<Id>> {
         self.connection(|c| {
+            if let Some(record) = maintenance::loss::state(c)? {
+                return Ok(Some(maintenance::loss::local_member(&record)));
+            }
             self.recovery_admission(c)?;
             Ok(active(c)?.map(|a| a.member))
         })
@@ -386,6 +404,7 @@ impl<A: ReplicatedSchema> Node<A> {
             Role::Secondary
         };
         self.connection(|c|{
+            maintenance::loss::require_no_loss_recovery(c)?;
             let tx=c.unchecked_transaction()?;
             let member=&decision.request().prepared[index];
             ensure(self.inspect_in(&tx,&decision.request().plan,member.member)?==*member,"installation changed")?;
@@ -408,6 +427,7 @@ impl<A: ReplicatedSchema> Node<A> {
     #[cfg(feature = "experimental-recovery")]
     fn complete_member(&mut self, request: &DecisionRequest, completion: Id) -> Result<()> {
         self.connection(|c|{
+            maintenance::loss::require_no_loss_recovery(c)?;
             let tx=c.unchecked_transaction()?;
             let a=active(&tx)?.ok_or("inactive member")?;self.validate_active(&tx,&a)?;
             ensure(a.request==*request,"completion request mismatch")?;

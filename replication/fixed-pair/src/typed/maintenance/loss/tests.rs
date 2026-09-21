@@ -131,11 +131,32 @@ impl transition::LossPolicy for Gate {
     // tests never acknowledge a participant.
 }
 
-/// Live certified authority needed to reopen the nodes after finalization.
+/// Live certified authority needed to reopen the nodes after finalization and,
+/// once attached, the participant-loss successor authority.
 struct Live {
     journal: Mutex<transition::Journal>,
+    successor: Mutex<Option<transition::Journal>>,
     trust: transition::TrustStore,
     gate: Arc<Gate>,
+}
+
+impl Live {
+    fn attach_successor(&self, journal: transition::Journal) -> Result<()> {
+        let mut slot = self
+            .successor
+            .lock()
+            .map_err(|_| "test authority poisoned")?;
+        *slot = Some(journal);
+        Ok(())
+    }
+    fn detach_successor(&self) -> Result<()> {
+        let mut slot = self
+            .successor
+            .lock()
+            .map_err(|_| "test authority poisoned")?;
+        *slot = None;
+        Ok(())
+    }
 }
 
 impl crate::typed::CertifiedAuthority for Live {
@@ -156,6 +177,18 @@ impl crate::typed::CertifiedAuthority for Live {
             .lock()
             .map_err(|_| "test authority poisoned")?
             .fetch_completed_revision(request, &self.trust.as_trust(), self.gate.as_ref())
+    }
+    fn fetch_completed_loss_successor(
+        &self,
+        request: &transition::LossSuccessorRequest,
+    ) -> terrapi_vesta_recovery::Result<transition::CompletedLossSuccessorTransition> {
+        let slot = self
+            .successor
+            .lock()
+            .map_err(|_| "test authority poisoned")?;
+        slot.as_ref()
+            .ok_or("participant-loss completion authority missing")?
+            .fetch_completed_loss_successor(request, &self.trust.as_trust(), self.gate.as_ref())
     }
 }
 
@@ -250,13 +283,32 @@ impl Fixture {
         )
     }
     fn replacement(&self) -> Result<Node<StockSchema>> {
-        Node::open(
-            &self.replacement_path,
-            Role::Secondary,
-            self.identity.clone(),
-            "fixture",
-            StockSchema,
-        )
+        self.open_replacement(Role::Secondary)
+    }
+    /// A node with a participant-loss install requires a live authority to
+    /// open; a plain bootstrap node must not be given one.
+    fn open_replacement(&self, role: Role) -> Result<Node<StockSchema>> {
+        let installed =
+            self.replacement_path.exists() && install_state(&self.replacement_path)?.0.is_some();
+        if installed {
+            Node::open_with_completed_transition(
+                &self.replacement_path,
+                role,
+                self.identity.clone(),
+                "fixture",
+                StockSchema,
+                self.trust.clone(),
+                self.live.clone(),
+            )
+        } else {
+            Node::open(
+                &self.replacement_path,
+                role,
+                self.identity.clone(),
+                "fixture",
+                StockSchema,
+            )
+        }
     }
     fn survivor_role(&self) -> Role {
         if self.certificate.participants[0].member == self.loss.survivor.member {
@@ -480,6 +532,7 @@ fn fixture(lost: Role, tail: bool) -> Result<Fixture> {
             scope,
             &trust.as_trust(),
         )?),
+        successor: Mutex::new(None),
         trust: trust.clone(),
         gate: gate.clone(),
     });
@@ -1693,21 +1746,17 @@ fn install_cycle(lost: Role, tail: bool) -> Result<()> {
         Role::Primary => Role::Secondary,
         Role::Secondary => Role::Primary,
     };
+    assert!(f.open_replacement(other).is_err());
+    // A loss-installed node is only openable with a live authority.
     assert!(Node::<StockSchema>::open(
-        &f.replacement_path,
-        other,
-        f.identity.clone(),
-        "fixture",
-        StockSchema,
-    )
-    .is_err());
-    let mut replacement = Node::open(
         &f.replacement_path,
         lost,
         f.identity.clone(),
         "fixture",
         StockSchema,
-    )?;
+    )
+    .is_err());
+    let mut replacement = f.open_replacement(lost)?;
     assert_eq!(replacement.role(), lost);
     every_mutation_is_rejected(&mut replacement)?;
     handle.install_successor("fixture", &successor, &live)?;
@@ -1891,7 +1940,7 @@ fn loss_install_rejects_conflicting_and_partial_state() -> Result<()> {
     // An unexpected recovery_* table blocks the install even on exact retry.
     tamper(
         &survivor_path,
-        "CREATE TABLE recovery_loss_completion(id INTEGER PRIMARY KEY CHECK(id=1),receipt TEXT NOT NULL)",
+        "CREATE TABLE recovery_loss_pending(id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL)",
     )?;
     let handle = it.f.survivor_handle()?;
     let live = authorities(&it.f, &it.successor_journal);
@@ -1900,13 +1949,13 @@ fn loss_install_rejects_conflicting_and_partial_state() -> Result<()> {
         .is_err());
     assert_eq!(install_state(&survivor_path)?, good);
     drop(handle);
-    tamper(&survivor_path, "DROP TABLE recovery_loss_completion")?;
+    tamper(&survivor_path, "DROP TABLE recovery_loss_pending")?;
 
-    // Same for the replacement: a recovery table this slice never writes — a
-    // premature completion receipt — fails closed instead of being ignored.
+    // Same for the replacement: a recovery table this release never writes
+    // fails closed instead of being ignored.
     tamper(
         &replacement_path,
-        "CREATE TABLE recovery_loss_completion(id INTEGER PRIMARY KEY CHECK(id=1),receipt TEXT NOT NULL)",
+        "CREATE TABLE recovery_loss_pending(id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL)",
     )?;
     let mut replacement = it.f.replacement()?;
     assert!(install_replacement(
@@ -1919,7 +1968,7 @@ fn loss_install_rejects_conflicting_and_partial_state() -> Result<()> {
     .is_err());
     assert_eq!(node_install_state(&replacement)?, replacement_good.0);
     drop(replacement);
-    tamper(&replacement_path, "DROP TABLE recovery_loss_completion")?;
+    tamper(&replacement_path, "DROP TABLE recovery_loss_pending")?;
     // A foreign recovery seal is refused even earlier, at the ordinary open.
     tamper(
         &replacement_path,
@@ -2299,13 +2348,7 @@ fn promoted_replacement_rejects_owner_and_record_disagreement() -> Result<()> {
     drop(replacement);
 
     let retry = |role: Role| -> Result<()> {
-        let mut node = Node::open(
-            &f.replacement_path,
-            role,
-            f.identity.clone(),
-            "fixture",
-            StockSchema,
-        )?;
+        let mut node = f.open_replacement(role)?;
         install_replacement(
             &mut node,
             &f.certificate,
@@ -2321,14 +2364,7 @@ fn promoted_replacement_rejects_owner_and_record_disagreement() -> Result<()> {
         &f.replacement_path,
         &format!("UPDATE node_identity SET value='{demoted_owner}'"),
     )?;
-    assert!(Node::<StockSchema>::open(
-        &f.replacement_path,
-        Role::Primary,
-        f.identity.clone(),
-        "fixture",
-        StockSchema
-    )
-    .is_err());
+    assert!(f.open_replacement(Role::Primary).is_err());
     assert!(retry(Role::Secondary).is_err());
     assert_eq!(
         install_state(&f.replacement_path)?,
@@ -2362,6 +2398,471 @@ fn promoted_replacement_rejects_owner_and_record_disagreement() -> Result<()> {
         (Some(record), promoted_owner)
     );
     drop(handle);
+    drop(f);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// S3: acknowledgements, completion and writer admission.
+// ---------------------------------------------------------------------------
+
+const COMPLETION: [u8; 32] = [80; 32];
+
+fn successor_journal_handle(f: &Fixture, name: &str) -> Result<transition::Journal> {
+    transition::Journal::open(
+        &f.dir.path().join(name),
+        "successor-fixture",
+        successor_scope(f),
+        &f.trust.as_trust(),
+    )
+}
+
+fn open_with_authority(f: &Fixture, path: &Path, role: Role) -> Result<Node<StockSchema>> {
+    Node::open_with_completed_transition(
+        path,
+        role,
+        f.identity.clone(),
+        "fixture",
+        StockSchema,
+        f.trust.clone(),
+        f.live.clone(),
+    )
+}
+
+fn capacity_of(node: &Node<StockSchema>) -> Result<(u64, u64)> {
+    node.connection(|c| {
+        c.query_row(
+            "SELECT receipt_count,receipt_bytes FROM receipt_capacity WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(Into::into)
+    })
+}
+
+/// Everything from a decided loss to the first write of the new pair.
+fn recovery_cycle(lost: Role, tail: bool) -> Result<()> {
+    let f = fixture(lost, tail)?;
+    let derived = match lost {
+        Role::Primary => Role::Secondary,
+        Role::Secondary => Role::Primary,
+    };
+    let handle = f.survivor_handle()?;
+    let mut replacement = f.replacement()?;
+    bootstrap_replacement(
+        &handle,
+        &mut replacement,
+        &f.journal,
+        &f.trust,
+        f.gate.as_ref(),
+    )?;
+    let (successor_journal, proof) = successor_proof(&f, "successor-journal")?;
+    let successor = proof.request().clone();
+    let live = authorities(&f, &successor_journal);
+
+    // No install at all: no participant may be acknowledged.
+    assert!(complete_successor(&handle, &replacement, &successor, COMPLETION, &live).is_err());
+    // A fabricated acknowledgement is impossible: the default-deny policy has
+    // no applied-evidence implementation at all.
+    let decision =
+        successor_journal.fetch_loss_successor(&successor, &f.trust.as_trust(), f.gate.as_ref())?;
+    for participant in decision.request().participants.iter() {
+        assert!(successor_journal
+            .acknowledge_loss_successor(
+                &decision,
+                participant,
+                &f.trust.as_trust(),
+                f.gate.as_ref()
+            )
+            .is_err());
+    }
+
+    // Only the survivor installed: still no acknowledgement for either side.
+    handle.install_successor("fixture", &successor, &live)?;
+    assert!(complete_successor(&handle, &replacement, &successor, COMPLETION, &live).is_err());
+    assert_eq!(
+        successor_journal
+            .fetch_loss_successor(&successor, &f.trust.as_trust(), f.gate.as_ref())?
+            .acknowledgements(),
+        [false; 2]
+    );
+
+    install_replacement(
+        &mut replacement,
+        &f.certificate,
+        &f.certificate_token,
+        &successor,
+        &live,
+    )?;
+    f.live
+        .attach_successor(successor_journal_handle(&f, "successor-journal")?)?;
+
+    // Both installed but not yet completed: admission stays closed on both.
+    assert!(replacement.checkpoint().is_err());
+    drop(replacement);
+    drop(handle);
+    let survivor_node = open_with_authority(&f, &f.survivor_path, derived)?;
+    assert!(survivor_node.checkpoint().is_err());
+    assert!(record_completion(&survivor_node).is_err());
+    drop(survivor_node);
+    let handle = f.survivor_handle()?;
+    let replacement = f.open_replacement(lost)?;
+
+    // Complete at the authority. Exact retry converges, a different id does not.
+    complete_successor(&handle, &replacement, &successor, COMPLETION, &live)?;
+    complete_successor(&handle, &replacement, &successor, COMPLETION, &live)?;
+    assert!(complete_successor(&handle, &replacement, &successor, [81; 32], &live).is_err());
+    assert_eq!(
+        successor_journal
+            .fetch_loss_successor(&successor, &f.trust.as_trust(), f.gate.as_ref())?
+            .acknowledgements(),
+        [true; 2]
+    );
+    // Completed at the authority, but no local receipt yet: still closed.
+    assert!(replacement.checkpoint().is_err());
+    drop(replacement);
+    drop(handle);
+
+    // Record local completion, one node at a time.
+    let survivor_node = open_with_authority(&f, &f.survivor_path, derived)?;
+    let replacement_node = open_with_authority(&f, &f.replacement_path, lost)?;
+    record_completion(&survivor_node)?;
+    assert!(survivor_node.checkpoint().is_ok());
+    assert!(replacement_node.checkpoint().is_err());
+    record_completion(&replacement_node)?;
+    record_completion(&replacement_node)?;
+    assert!(replacement_node.checkpoint().is_ok());
+
+    // The successor membership now names the new pair on both sides.
+    assert_eq!(
+        survivor_node.required_recovery_peer()?,
+        Some(f.loss.replacement_member)
+    );
+    assert_eq!(
+        replacement_node.required_recovery_peer()?,
+        Some(f.loss.survivor.member)
+    );
+    assert_eq!(
+        survivor_node.recovery_member_identity()?,
+        Some(f.loss.survivor.member)
+    );
+    assert_eq!(
+        replacement_node.recovery_member_identity()?,
+        Some(f.loss.replacement_member)
+    );
+
+    // First write of the new pair.
+    let (mut primary, mut secondary) = match lost {
+        Role::Primary => (replacement_node, survivor_node),
+        Role::Secondary => (survivor_node, replacement_node),
+    };
+    assert_eq!(primary.role(), Role::Primary);
+    assert_eq!(secondary.role(), Role::Secondary);
+    let before = f.survivor_receipts.len() as u64;
+    assert_eq!(before, f.loss.survivor_cut.sequence);
+    let mut batch = stock_entry().batch;
+    batch.operation_id = "after-participant-loss".into();
+    let result = commit(&mut primary, &mut secondary, batch.clone())?;
+    assert_eq!(result.sequence, before + 1);
+    // Exact retry of the write is a no-op.
+    assert_eq!(
+        commit(&mut primary, &mut secondary, batch.clone())?.sequence,
+        before + 1
+    );
+    // Data, receipts and capacity accounting continue from the survivor cut.
+    assert_eq!(
+        serde_json::to_string(&primary.view()?)?,
+        serde_json::to_string(&secondary.view()?)?
+    );
+    let receipts = receipt_rows(&primary)?;
+    assert_eq!(receipts.len() as u64, before + 1);
+    assert_eq!(receipts[..before as usize], f.survivor_receipts[..]);
+    assert_eq!(receipt_rows(&secondary)?, receipts);
+    assert_eq!(capacity_of(&primary)?, capacity_of(&secondary)?);
+    assert_eq!(capacity_of(&primary)?.0, before + 1);
+    assert!(primary.receipt(&batch.operation_id)?.is_some());
+    assert!(secondary.receipt(&batch.operation_id)?.is_some());
+
+    // Maintenance and compaction stay shut on a loss-recovered pair.
+    for node in [&mut primary, &mut secondary] {
+        assert!(node.plan_compaction().is_err());
+        assert!(node.enable_maintenance().is_err());
+        assert!(node.publish_recovery_snapshot().is_err());
+    }
+
+    // Live revocation closes both nodes again without touching durable state.
+    let durable = (
+        install_state(&f.survivor_path)?,
+        install_state(&f.replacement_path)?,
+    );
+    f.live.detach_successor()?;
+    assert!(primary.checkpoint().is_err());
+    assert!(secondary.checkpoint().is_err());
+    f.live
+        .attach_successor(successor_journal_handle(&f, "successor-journal")?)?;
+    assert!(primary.checkpoint().is_ok());
+    assert!(secondary.checkpoint().is_ok());
+    f.gate.revoke();
+    assert!(primary.checkpoint().is_err());
+    f.gate.allow();
+    assert!(primary.checkpoint().is_ok());
+    assert_eq!(
+        (
+            install_state(&f.survivor_path)?,
+            install_state(&f.replacement_path)?
+        ),
+        durable
+    );
+
+    // The lost member's file never becomes admissible again.
+    assert!(f.open_node(&f.lost_path, f.lost_role()).is_err());
+    assert!(open_with_authority(&f, &f.lost_path, Role::Primary).is_err());
+    assert!(open_with_authority(&f, &f.lost_path, Role::Secondary).is_err());
+
+    // Restart: everything converges and the pair keeps writing.
+    drop(primary);
+    drop(secondary);
+    let survivor_node = open_with_authority(&f, &f.survivor_path, derived)?;
+    let replacement_node = open_with_authority(&f, &f.replacement_path, lost)?;
+    record_completion(&survivor_node)?;
+    record_completion(&replacement_node)?;
+    let (mut primary, mut secondary) = match lost {
+        Role::Primary => (replacement_node, survivor_node),
+        Role::Secondary => (survivor_node, replacement_node),
+    };
+    let mut next = stock_entry().batch;
+    next.operation_id = "after-participant-loss-restart".into();
+    assert_eq!(
+        commit(&mut primary, &mut secondary, next)?.sequence,
+        before + 2
+    );
+    assert_eq!(primary.checkpoint()?, secondary.checkpoint()?);
+    drop(primary);
+    drop(secondary);
+    drop(f);
+    Ok(())
+}
+
+#[test]
+fn recovery_cycle_for_lost_primary_without_tail() -> Result<()> {
+    recovery_cycle(Role::Primary, false)
+}
+
+#[test]
+fn recovery_cycle_for_lost_primary_with_tail() -> Result<()> {
+    recovery_cycle(Role::Primary, true)
+}
+
+#[test]
+fn recovery_cycle_for_lost_secondary_without_tail() -> Result<()> {
+    recovery_cycle(Role::Secondary, false)
+}
+
+#[test]
+fn recovery_cycle_for_lost_secondary_with_tail() -> Result<()> {
+    recovery_cycle(Role::Secondary, true)
+}
+
+/// A local completion receipt without an install record is never evidence of
+/// anything: it closes the node instead of being ignored.
+#[test]
+fn orphan_participant_loss_completion_is_refused() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let identity = stock_entry().batch.identity;
+    let path = dir.path().join("plain");
+    let node = Node::open(
+        &path,
+        Role::Primary,
+        identity.clone(),
+        "fixture",
+        StockSchema,
+    )?;
+    assert!(node.checkpoint().is_ok());
+    drop(node);
+    tamper(
+        &path,
+        "CREATE TABLE recovery_loss_completion(id INTEGER PRIMARY KEY CHECK(id=1),receipt TEXT NOT NULL)",
+    )?;
+    assert!(Node::<StockSchema>::open(
+        &path,
+        Role::Primary,
+        identity.clone(),
+        "fixture",
+        StockSchema
+    )
+    .is_err());
+    tamper(&path, "DROP TABLE recovery_loss_completion")?;
+    let node = Node::<StockSchema>::open(&path, Role::Primary, identity, "fixture", StockSchema)?;
+    assert!(node.checkpoint().is_ok());
+    Ok(())
+}
+
+/// Acknowledgement evidence is read live from both node databases (I7), so a
+/// tampered or missing install on either side refuses the whole ACK.
+#[test]
+fn acknowledgement_requires_both_durable_installs() -> Result<()> {
+    let f = fixture(Role::Secondary, false)?;
+    let handle = f.survivor_handle()?;
+    let mut replacement = f.replacement()?;
+    bootstrap_replacement(
+        &handle,
+        &mut replacement,
+        &f.journal,
+        &f.trust,
+        f.gate.as_ref(),
+    )?;
+    let (successor_journal, proof) = successor_proof(&f, "successor-journal")?;
+    let successor = proof.request().clone();
+    let live = authorities(&f, &successor_journal);
+
+    // Replacement installed, survivor not: still no acknowledgement.
+    install_replacement(
+        &mut replacement,
+        &f.certificate,
+        &f.certificate_token,
+        &successor,
+        &live,
+    )?;
+    assert!(complete_successor(&handle, &replacement, &successor, COMPLETION, &live).is_err());
+    handle.install_successor("fixture", &successor, &live)?;
+
+    // Both installed: the acknowledgement is accepted.
+    complete_successor(&handle, &replacement, &successor, COMPLETION, &live)?;
+    let acknowledged = successor_journal
+        .fetch_loss_successor(&successor, &f.trust.as_trust(), f.gate.as_ref())?
+        .acknowledgements();
+    assert_eq!(acknowledged, [true; 2]);
+
+    // A second, independent successor decision over the same loss cannot be
+    // acknowledged once either install no longer matches it.
+    let (other_journal, other_proof) =
+        successor_proof_with(&f, "successor-journal-other", [90; 32])?;
+    let other = other_proof.request().clone();
+    let other_live = authorities(&f, &other_journal);
+    assert!(complete_successor(&handle, &replacement, &other, [91; 32], &other_live).is_err());
+
+    // Tamper with the replacement's record: the survivor's ACK is refused too.
+    let replacement_path = f.replacement_path.clone();
+    let good = node_install_state(&replacement)?;
+    drop(replacement);
+    tamper(
+        &replacement_path,
+        "UPDATE recovery_loss_active SET record='{\"format\":1}' WHERE id=1",
+    )?;
+    let broken = f.open_replacement(Role::Secondary);
+    assert!(broken.is_err());
+    tamper(
+        &replacement_path,
+        &format!(
+            "UPDATE recovery_loss_active SET record='{}' WHERE id=1",
+            good.0
+                .as_deref()
+                .ok_or("record missing")?
+                .replace('\'', "''")
+        ),
+    )?;
+    let replacement = f.open_replacement(Role::Secondary)?;
+    assert_eq!(node_install_state(&replacement)?, good);
+
+    // Removing the replacement's record entirely refuses any further ACK on a
+    // fresh successor decision, whichever participant is named.
+    drop(replacement);
+    tamper(&replacement_path, "DROP TABLE recovery_loss_active")?;
+    let replacement = f.open_replacement(Role::Secondary)?;
+    let decision =
+        other_journal.fetch_loss_successor(&other, &f.trust.as_trust(), f.gate.as_ref())?;
+    for participant in decision.request().participants.iter() {
+        assert!(other_journal
+            .acknowledge_loss_successor(
+                &decision,
+                participant,
+                &f.trust.as_trust(),
+                f.gate.as_ref()
+            )
+            .is_err());
+    }
+    assert!(complete_successor(&handle, &replacement, &other, [91; 32], &other_live).is_err());
+    drop(replacement);
+    drop(handle);
+    drop(f);
+    Ok(())
+}
+
+/// The lost member's own database never becomes admissible again, and the
+/// pre-loss membership can never be handshaken with a recovered node.
+#[test]
+fn returning_lost_member_and_old_membership_stay_rejected() -> Result<()> {
+    let f = fixture(Role::Primary, false)?;
+    let handle = f.survivor_handle()?;
+    let mut replacement = f.replacement()?;
+    bootstrap_replacement(
+        &handle,
+        &mut replacement,
+        &f.journal,
+        &f.trust,
+        f.gate.as_ref(),
+    )?;
+    let (successor_journal, proof) = successor_proof(&f, "successor-journal")?;
+    let successor = proof.request().clone();
+    let live = authorities(&f, &successor_journal);
+    // The lost member's file is already closed before anything is installed.
+    assert!(f.open_node(&f.lost_path, f.lost_role()).is_err());
+
+    install_pair(
+        &handle,
+        &mut replacement,
+        "fixture",
+        &f.certificate,
+        &f.certificate_token,
+        &successor,
+        &live,
+    )?;
+    f.live
+        .attach_successor(successor_journal_handle(&f, "successor-journal")?)?;
+    complete_successor(&handle, &replacement, &successor, COMPLETION, &live)?;
+    drop(replacement);
+    drop(handle);
+
+    let survivor_node = open_with_authority(&f, &f.survivor_path, Role::Secondary)?;
+    let replacement_node = open_with_authority(&f, &f.replacement_path, Role::Primary)?;
+    record_completion(&survivor_node)?;
+    record_completion(&replacement_node)?;
+
+    // The handshake digest is bound to the successor membership on both sides
+    // and is no longer the pre-loss membership of the certified pair.
+    let survivor_summary = survivor_node.summary()?;
+    let replacement_summary = replacement_node.summary()?;
+    assert_eq!(survivor_summary.membership, replacement_summary.membership);
+    assert_ne!(survivor_summary.membership, Some(f.certificate.membership));
+    assert_eq!(
+        survivor_node.required_recovery_peer()?,
+        Some(f.loss.replacement_member)
+    );
+    assert_eq!(
+        replacement_node.required_recovery_peer()?,
+        Some(f.loss.survivor.member)
+    );
+    assert_ne!(
+        survivor_node.required_recovery_peer()?,
+        Some(f.loss.lost_member)
+    );
+
+    // The lost member is still unopenable, with and without an authority, and
+    // stays that way across a restart.
+    for _ in 0..2 {
+        assert!(Node::<StockSchema>::open(
+            &f.lost_path,
+            Role::Primary,
+            f.identity.clone(),
+            "fixture",
+            StockSchema
+        )
+        .is_err());
+        assert!(open_with_authority(&f, &f.lost_path, Role::Primary).is_err());
+        assert!(open_with_authority(&f, &f.lost_path, Role::Secondary).is_err());
+    }
+    drop(survivor_node);
+    drop(replacement_node);
     drop(f);
     Ok(())
 }

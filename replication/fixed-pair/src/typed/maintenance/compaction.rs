@@ -230,6 +230,7 @@ impl<A: ReplicatedSchema> Node<A> {
             "stale compaction plan",
         )?;
         self.connection(|c| {
+            super::loss::require_no_loss_recovery(c)?;
             self.admission(c)?;
             ensure(present(c)?,"enable maintenance before compaction")?;
             let tx=c.unchecked_transaction()?;

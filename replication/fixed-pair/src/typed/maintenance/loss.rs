@@ -26,18 +26,28 @@ const SURVIVOR_RECOVERY_TABLES: &[&str] = &[
     "recovery_cycles",
     "recovery_delivery",
     "recovery_loss_active",
+    "recovery_loss_completion",
     "recovery_seal",
 ];
 /// A bootstrap replacement has no recovery history of its own.
-const REPLACEMENT_RECOVERY_TABLES: &[&str] = &["recovery_loss_active"];
+const REPLACEMENT_RECOVERY_TABLES: &[&str] = &["recovery_loss_active", "recovery_loss_completion"];
+/// Singleton local completion receipt. Only its presence *together with* a live
+/// completed-successor proof can reopen ordinary admission (I6).
+const COMPLETION_TABLE: &str = "recovery_loss_completion";
+const COMPLETION_DDL: &str = "CREATE TABLE IF NOT EXISTS recovery_loss_completion(\
+     id INTEGER PRIMARY KEY CHECK(id=1),receipt TEXT NOT NULL)";
+/// The single error every closed participant-loss path reports.
+pub(super) const CLOSED: &str = "participant-loss recovery not complete; data admission closed";
+/// Entry points this release keeps shut on a loss-recovered node.
+pub(super) const RETIRED: &str = "closed after participant-loss recovery in this release";
 
 /// The live authorities every loss entry point must consult before and after
 /// its durable step (I2). Borrowed, so nothing is cached across a call.
-pub(crate) struct Authorities<'a, P: transition::LossPolicy> {
-    pub(crate) source: &'a transition::Journal,
-    pub(crate) successor: &'a transition::Journal,
-    pub(crate) trust: &'a transition::TrustStore,
-    pub(crate) policy: &'a P,
+pub struct Authorities<'a, P: transition::LossPolicy> {
+    pub source: &'a transition::Journal,
+    pub successor: &'a transition::Journal,
+    pub trust: &'a transition::TrustStore,
+    pub policy: &'a P,
 }
 
 /// Everything `validate` derives from signed evidence. The survivor role is a
@@ -52,7 +62,7 @@ pub(super) struct Evidence {
 /// Written once per node, compared byte-for-byte on retry, never repaired.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct Installed {
+pub(crate) struct Installed {
     format: u32,
     loss: transition::LossRequest,
     loss_certificate: [u8; 32],
@@ -75,7 +85,7 @@ struct Installed {
 /// and exposes only the exact loss-bound frozen publication. The installer
 /// opens a second, read-write connection to the same file for the duration of
 /// one transaction; that connection is never stored here (I3).
-pub(crate) struct LossSurvivorHandle<A: ReplicatedSchema> {
+pub struct LossSurvivorHandle<A: ReplicatedSchema> {
     db: Vesta,
     adapter: A,
     initial: String,
@@ -93,7 +103,7 @@ pub(crate) struct LossSurvivorHandle<A: ReplicatedSchema> {
 }
 
 impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
-    pub(crate) fn open_existing(
+    pub fn open_existing(
         path: impl AsRef<Path>,
         identity: Identity<SchemaId>,
         passphrase: &str,
@@ -144,7 +154,7 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
         })
     }
 
-    pub(crate) fn manifest(
+    pub fn manifest(
         &self,
         journal: &crate::recovery::transition::Journal,
         trust: &crate::recovery::transition::TrustStore,
@@ -154,7 +164,7 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
         Ok(self.manifest.clone())
     }
 
-    pub(crate) fn page(
+    pub fn page(
         &self,
         position: u64,
         journal: &crate::recovery::transition::Journal,
@@ -278,7 +288,7 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
     /// handed to a caller-supplied closure; it is dropped before this returns.
     /// The node lock taken by `open_existing` is held throughout, so there is
     /// no unlock/relock gap between validation and the durable write.
-    pub(crate) fn install_successor<P: transition::LossPolicy>(
+    pub fn install_successor<P: transition::LossPolicy>(
         &self,
         passphrase: &str,
         successor: &transition::LossSuccessorRequest,
@@ -565,7 +575,7 @@ fn replacement_role(
 /// replacement, which takes over the lost member's role. It depends only on
 /// signed data, this node and the journals: in production the survivor is a
 /// different machine and is not reachable here.
-pub(crate) fn install_replacement<A: ReplicatedSchema, P: transition::LossPolicy>(
+pub fn install_replacement<A: ReplicatedSchema, P: transition::LossPolicy>(
     replacement: &mut Node<A>,
     certificate: &transition::Request,
     certificate_token: &str,
@@ -733,7 +743,7 @@ pub(crate) fn install_replacement<A: ReplicatedSchema, P: transition::LossPolicy
 /// Local bridge for a co-located pair: survivor first, then replacement.
 /// In production the two installs run on their own machines against their own
 /// journals; neither depends on the other's object.
-pub(crate) fn install_pair<A: ReplicatedSchema, P: transition::LossPolicy>(
+pub fn install_pair<A: ReplicatedSchema, P: transition::LossPolicy>(
     survivor: &LossSurvivorHandle<A>,
     replacement: &mut Node<A>,
     passphrase: &str,
@@ -761,7 +771,7 @@ pub(crate) fn install_pair<A: ReplicatedSchema, P: transition::LossPolicy>(
 /// current one, so a tail committed after the certified cut is transferred and
 /// never silently dropped. The signed `replacement_generation` is retained
 /// through the restore because the successor membership is signed against it.
-pub(crate) fn bootstrap_replacement<A: ReplicatedSchema>(
+pub fn bootstrap_replacement<A: ReplicatedSchema>(
     survivor: &LossSurvivorHandle<A>,
     replacement: &mut Node<A>,
     journal: &crate::recovery::transition::Journal,
@@ -804,7 +814,7 @@ pub(crate) fn bootstrap_replacement<A: ReplicatedSchema>(
 /// Read-only precondition for the future atomic local membership install.
 /// The opaque proof is intentionally consumed only as installation authority;
 /// it is not a completed writer capability and this function performs no ACK.
-pub(crate) fn validate_successor_installation<A: ReplicatedSchema>(
+pub fn validate_successor_installation<A: ReplicatedSchema>(
     survivor: &LossSurvivorHandle<A>,
     replacement: &Node<A>,
     proof: &crate::recovery::transition::CommittedLossSuccessorTransition,
@@ -970,4 +980,406 @@ pub(super) fn validate<A: ReplicatedSchema>(
 
 fn id<T: Serialize>(value: &T) -> Result<[u8; 32]> {
     Ok(Sha256::digest(serde_json::to_vec(value)?).into())
+}
+
+// ---------------------------------------------------------------------------
+// S3: applied evidence, acknowledgements, completion and writer admission.
+// ---------------------------------------------------------------------------
+
+/// `(format, successor id, successor token digest, successor certificate id,
+/// completion)`. It is local evidence only: admission still needs the live
+/// completed-successor proof to equal it.
+type CompletionReceipt = (u32, [u8; 32], [u8; 32], [u8; 32], [u8; 32]);
+
+fn completion_receipt(record: &Installed, completion: [u8; 32]) -> Result<String> {
+    ensure(completion != [0; 32], "zero participant-loss completion")?;
+    Ok(serde_json::to_string(&(
+        1u32,
+        record.successor.id,
+        record.successor_token_digest,
+        record.successor_certificate,
+        completion,
+    ))?)
+}
+
+fn read_completion(c: &Connection) -> Result<Option<String>> {
+    if !table_exists(c, COMPLETION_TABLE)? {
+        return Ok(None);
+    }
+    let rows: Vec<(u32, String)> = c
+        .prepare("SELECT id,receipt FROM recovery_loss_completion ORDER BY id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    ensure(
+        rows.len() == 1 && rows[0].0 == 1 && rows[0].1.len() <= INSTALL_LIMIT,
+        "participant-loss completion row mismatch",
+    )?;
+    let json = rows.into_iter().next().ok_or("completion row")?.1;
+    let receipt: CompletionReceipt = serde_json::from_str(&json)?;
+    ensure(
+        receipt.0 == 1 && receipt.4 != [0; 32],
+        "participant-loss completion shape",
+    )?;
+    Ok(Some(json))
+}
+
+/// The durable participant-loss state of a node, with the orphan check both
+/// ways. `None` means this is an ordinary node and every caller must behave
+/// exactly as it did before participant-loss recovery existed.
+pub(crate) fn state(c: &Connection) -> Result<Option<Installed>> {
+    let record = read_install(c)?.map(|(_, record)| record);
+    ensure(
+        record.is_some() || !table_exists(c, COMPLETION_TABLE)?,
+        "orphan participant-loss completion",
+    )?;
+    Ok(record)
+}
+
+/// Index of this node inside the successor membership, from the record alone.
+fn successor_index(record: &Installed) -> Result<usize> {
+    let mut matches = record
+        .successor
+        .participants
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.member == record.member && p.generation == record.generation);
+    let index = matches
+        .next()
+        .ok_or("participant-loss member not in successor")?
+        .0;
+    ensure(
+        matches.next().is_none(),
+        "participant-loss member ambiguous",
+    )?;
+    Ok(index)
+}
+
+/// The install record really describes this open node: the owner row, the role
+/// it was installed with and the admission generation all have to agree.
+fn validate_installed(
+    c: &Connection,
+    identity: &Identity<SchemaId>,
+    role: Role,
+    record: &Installed,
+) -> Result<()> {
+    let index = successor_index(record)?;
+    ensure(
+        record.format == 1
+            && record.installed_role == role
+            && owner_row(c)? == serde_json::to_string(&(identity, role))?
+            && checkpoint::generation(c)? == record.generation
+            && record.successor.participants[index].member == record.member
+            && record.survivor_cut == record.loss.survivor_cut
+            && record.publication == record.loss.survivor_publication
+            && successor_binds(&record.successor, &record.loss),
+        "participant-loss install record mismatch",
+    )
+}
+
+/// The other member of the successor membership. After an install this — not
+/// the pre-loss `recovery_active` peer — is the only peer that may be admitted.
+pub(crate) fn peer_member(record: &Installed) -> Result<[u8; 32]> {
+    Ok(record.successor.participants[1 - successor_index(record)?].member)
+}
+
+/// Local member identity under the successor membership.
+pub(crate) fn local_member(record: &Installed) -> [u8; 32] {
+    record.member
+}
+
+/// Handshake digest bound to the successor membership, so a peer still holding
+/// the pre-loss membership can never be paired with a recovered node.
+pub(crate) fn membership_digest(record: &Installed) -> Result<[u8; 32]> {
+    id(&(
+        1u32,
+        record.successor.membership,
+        record.successor.id,
+        record.successor_token_digest,
+        record.successor_certificate,
+    ))
+}
+
+/// Open-time certificate handling for a node whose successor membership is
+/// installed. The pre-loss chain is history, never a live head, and a live
+/// authority is required whatever the maintenance format says.
+pub(crate) fn verify_certified_history(
+    c: &Connection,
+    authority: Option<&dyn crate::typed::CertifiedAuthority>,
+) -> Result<()> {
+    let authority = authority.ok_or(CLOSED)?;
+    if super::maintenance_version(c)? == 3 {
+        super::verify_historical_certified(c, Some(authority))?;
+    }
+    Ok(())
+}
+
+/// Ordinary data admission for a node with an installed successor membership.
+/// It needs the local completion receipt *and* a live completed-successor proof
+/// that equals it exactly. An install-only decision can never satisfy this.
+pub(crate) fn admission(
+    c: &Connection,
+    identity: &Identity<SchemaId>,
+    role: Role,
+    authority: Option<&dyn crate::typed::CertifiedAuthority>,
+) -> Result<()> {
+    let Some(record) = state(c)? else {
+        return Ok(());
+    };
+    validate_installed(c, identity, role, &record)?;
+    let receipt = read_completion(c)?.ok_or(CLOSED)?;
+    let completed = authority
+        .ok_or(CLOSED)?
+        .fetch_completed_loss_successor(&record.successor)?;
+    ensure(
+        completed.request() == &record.successor
+            && completed.token_digest() == record.successor_token_digest
+            && completed.certificate_id() == record.successor_certificate
+            && receipt == completion_receipt(&record, completed.completion())?,
+        CLOSED,
+    )
+}
+
+/// Closing gate for entry points this release does not support after a
+/// participant-loss recovery. It only ever refuses.
+pub(crate) fn require_no_loss_recovery(c: &Connection) -> Result<()> {
+    ensure(state(c)?.is_none(), RETIRED)
+}
+
+/// Durable local completion evidence, written on the ordinary `Node` (the
+/// survivor's read-write install handle is dropped before this runs). Exact
+/// retry converges; a different completion is a conflict, never a repair.
+pub fn record_completion<A: ReplicatedSchema>(node: &Node<A>) -> Result<()> {
+    node.connection(|c| {
+        let tx = Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
+        let record = state(&tx)?.ok_or("participant-loss recovery is not installed")?;
+        node.verify_owner_as(&tx, record.installed_role)?;
+        ensure(
+            node.role == record.installed_role,
+            "participant-loss role mismatch",
+        )?;
+        validate_installed(&tx, &node.identity, node.role, &record)?;
+        let authority = node
+            .certified_authority
+            .as_deref()
+            .ok_or("participant-loss completion authority missing")?;
+        let completed = authority.fetch_completed_loss_successor(&record.successor)?;
+        ensure(
+            completed.request() == &record.successor
+                && completed.token_digest() == record.successor_token_digest
+                && completed.certificate_id() == record.successor_certificate,
+            "participant-loss completion proof mismatch",
+        )?;
+        let receipt = completion_receipt(&record, completed.completion())?;
+        ensure(
+            receipt.len() <= INSTALL_LIMIT,
+            "participant-loss completion too large",
+        )?;
+        // Read before creating the table: a table that exists with no row is a
+        // partial state, not an empty slot, and `read_completion` refuses it.
+        if let Some(old) = read_completion(&tx)? {
+            ensure(old == receipt, "participant-loss completion conflict")?;
+            tx.rollback()?;
+            return Ok(());
+        }
+        tx.execute_batch(COMPLETION_DDL)?;
+        ensure(
+            tx.execute(
+                "INSERT INTO recovery_loss_completion VALUES(1,?1)",
+                [&receipt],
+            )? == 1,
+            "participant-loss completion write failed",
+        )?;
+        ensure(
+            read_completion(&tx)?.as_deref() == Some(receipt.as_str()),
+            "participant-loss completion post-state mismatch",
+        )?;
+        // The receipt must actually open this node against the live authority,
+        // inside the same transaction that wrote it.
+        admission(&tx, &node.identity, node.role, Some(authority))?;
+        tx.commit()?;
+        Ok(())
+    })
+}
+
+/// Live read of the replacement's durable install, repeating the state checks
+/// `install_replacement` made. Used only as acknowledgement evidence (I7).
+fn replacement_installed<A: ReplicatedSchema>(node: &Node<A>) -> Result<Installed> {
+    node.connection(|c| {
+        let record = state(c)?.ok_or("participant-loss replacement install missing")?;
+        ensure(
+            node.role == record.installed_role && record.previous_role == Role::Secondary,
+            "participant-loss replacement role mismatch",
+        )?;
+        node.verify_owner_as(c, record.installed_role)?;
+        validate_installed(c, &node.identity, record.installed_role, &record)?;
+        ensure_recovery_tables(c, REPLACEMENT_RECOVERY_TABLES)?;
+        capacity::verify_schema(c)?;
+        capacity::verify_accounting(c)?;
+        let base = checkpoint::base_for::<SchemaId>(c)?.ok_or("loss replacement base missing")?;
+        let current =
+            checkpoint::current_for(c, &node.adapter, &node.identity, &node.initial, true)?.0;
+        let manifest_json: String = c.query_row(
+            "SELECT manifest FROM node_restore_complete WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure(
+            manifest_json.len() <= 8192,
+            "loss replacement manifest limit",
+        )?;
+        let manifest = snapshot::Manifest::decode(manifest_json.as_bytes())?;
+        ensure(
+            base.sequence == record.survivor_cut.sequence
+                && id(&base)? == record.survivor_cut.digest
+                && current == base
+                && manifest.checkpoint == base
+                && id(&manifest)? == record.publication,
+            "loss replacement state mismatch",
+        )?;
+        Ok(record)
+    })
+}
+
+impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
+    /// Live read of the survivor's durable install through the retained
+    /// read-only connection, re-running the full evidence validation.
+    fn installed(&self, trust: &transition::TrustStore) -> Result<Installed> {
+        self.db.with_connection(|c| {
+            Ok((|| -> Result<Installed> {
+                let evidence = validate::<A>(
+                    c,
+                    &self.adapter,
+                    &self.identity,
+                    &self.contract,
+                    &self.initial,
+                    trust,
+                    &self.request,
+                )?;
+                ensure(
+                    evidence.role == self.role && evidence.manifest == self.manifest,
+                    "loss survivor evidence changed",
+                )?;
+                let record = state(c)?.ok_or("participant-loss survivor install missing")?;
+                ensure(
+                    record.previous_role == self.role,
+                    "participant-loss survivor role mismatch",
+                )?;
+                validate_installed(c, &self.identity, self.role, &record)?;
+                ensure_recovery_tables(c, SURVIVOR_RECOVERY_TABLES)?;
+                Ok(record)
+            })())
+        })?
+    }
+}
+
+/// I7: fixed-pair acknowledges a participant only after live-reading **both**
+/// durable installs from the actual node databases. Every other decision is
+/// delegated to the external policy unchanged.
+struct InstalledParticipants<'a, A: ReplicatedSchema, P: transition::LossPolicy> {
+    survivor: &'a LossSurvivorHandle<A>,
+    replacement: &'a Node<A>,
+    trust: &'a transition::TrustStore,
+    policy: &'a P,
+}
+
+impl<A: ReplicatedSchema, P: transition::LossPolicy> transition::LossPolicy
+    for InstalledParticipants<'_, A, P>
+{
+    fn continuity_and_fencing(
+        &self,
+        scope: &transition::JournalScope,
+        request: &transition::LossRequest,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        self.policy.continuity_and_fencing(scope, request)
+    }
+    fn survivor_prepared(
+        &self,
+        scope: &transition::JournalScope,
+        request: &transition::LossRequest,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        self.policy.survivor_prepared(scope, request)
+    }
+    fn loss_successor_continuity(
+        &self,
+        scope: &transition::JournalScope,
+        request: &transition::LossSuccessorRequest,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        self.policy.loss_successor_continuity(scope, request)
+    }
+    fn loss_successor_applied(
+        &self,
+        _source_scope: &transition::JournalScope,
+        loss: &transition::LossRequest,
+        successor: &transition::LossSuccessorRequest,
+        participant: &transition::Participant,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        // Both installs must be durable, whichever participant is acknowledged.
+        let survivor = self.survivor.installed(self.trust)?;
+        let replacement = replacement_installed(self.replacement)?;
+        let [first, second] = &successor.participants;
+        ensure(
+            survivor.loss == *loss
+                && replacement.loss == *loss
+                && survivor.successor == *successor
+                && replacement.successor == *successor
+                && survivor.member == first.member
+                && survivor.generation == first.generation
+                && replacement.member == second.member
+                && replacement.generation == second.generation
+                && (participant == first || participant == second),
+            "participant-loss installation evidence missing",
+        )
+    }
+}
+
+/// Local bridge from two durable installs to a completed successor membership:
+/// acknowledge the survivor, then the replacement, then complete. Every step is
+/// idempotent and converges on retry; a different completion id is refused.
+pub fn complete_successor<A: ReplicatedSchema, P: transition::LossPolicy>(
+    survivor: &LossSurvivorHandle<A>,
+    replacement: &Node<A>,
+    successor: &transition::LossSuccessorRequest,
+    completion: [u8; 32],
+    authorities: &Authorities<'_, P>,
+) -> Result<()> {
+    ensure(completion != [0; 32], "zero participant-loss completion")?;
+    let trust = authorities.trust;
+    let journal = authorities.successor;
+    let decided = journal.fetch_loss_successor(successor, &trust.as_trust(), authorities.policy)?;
+    if decided.acknowledgements() != [true; 2] {
+        // No acknowledgement without live proof of both durable installs.
+        let evidence = InstalledParticipants {
+            survivor,
+            replacement,
+            trust,
+            policy: authorities.policy,
+        };
+        let decision = journal.fetch_loss_successor(successor, &trust.as_trust(), &evidence)?;
+        for participant in decision.request().participants.iter() {
+            journal.acknowledge_loss_successor(
+                &decision,
+                participant,
+                &trust.as_trust(),
+                &evidence,
+            )?;
+        }
+    }
+    let decision =
+        journal.fetch_loss_successor(successor, &trust.as_trust(), authorities.policy)?;
+    ensure(
+        decision.acknowledgements() == [true; 2],
+        "participant-loss acknowledgements incomplete",
+    )?;
+    journal.complete_loss_successor(
+        &decision,
+        completion,
+        &trust.as_trust(),
+        authorities.policy,
+    )?;
+    let completed =
+        journal.fetch_completed_loss_successor(successor, &trust.as_trust(), authorities.policy)?;
+    ensure(
+        completed.request() == successor && completed.completion() == completion,
+        "participant-loss completion conflict",
+    )
 }

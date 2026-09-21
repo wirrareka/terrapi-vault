@@ -46,6 +46,18 @@ pub trait CertifiedAuthority: Send + Sync {
         &self,
         request: &crate::recovery::transition::Request,
     ) -> terrapi_vesta_recovery::Result<crate::recovery::transition::HistoricalCompletedTransition>;
+
+    /// Live writer authority for a completed participant-loss successor
+    /// membership. The default denies, so an authority that knows nothing about
+    /// participant loss keeps every loss-recovered node closed for ever. An
+    /// install-only `CommittedLossSuccessorTransition` can never be returned.
+    fn fetch_completed_loss_successor(
+        &self,
+        _request: &crate::recovery::transition::LossSuccessorRequest,
+    ) -> terrapi_vesta_recovery::Result<crate::recovery::transition::CompletedLossSuccessorTransition>
+    {
+        Err("participant-loss completion authority missing".into())
+    }
 }
 
 pub struct Node<A: ReplicatedSchema> {
@@ -204,6 +216,16 @@ impl<A: ReplicatedSchema> Node<A> {
         self.verify_owner_as(c, self.role)
     }
     fn verify_current_certified(&self, c: &Connection) -> Result<()> {
+        // A node whose participant-loss successor membership is installed can
+        // never present its pre-loss certificate as a live head again: the
+        // source authority reports it superseded. It is checked as history,
+        // and a live authority is required whatever the maintenance format is.
+        if maintenance::loss::state(c)?.is_some() {
+            return maintenance::loss::verify_certified_history(
+                c,
+                self.certified_authority.as_deref(),
+            );
+        }
         maintenance::verify_current_certified(c, self.certified_authority.as_deref())
     }
     fn verify_owner_as(&self, c: &Connection, role: Role) -> Result<()> {
@@ -244,16 +266,15 @@ impl<A: ReplicatedSchema> Node<A> {
         sql_snapshot::verify_binding(c, &self.adapter, &snapshot::scope(&self.identity))
     }
     fn admission(&self, c: &Connection) -> Result<()> {
-        // A durably installed participant-loss successor membership closes
-        // ordinary admission on both nodes. This gate only ever closes: it
-        // grants nothing, and the completed-authority check replaces it later.
-        ensure(
-            !c.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='recovery_loss_active')",
-                [],
-                |r| r.get::<_, bool>(0),
-            )?,
-            "participant-loss recovery not complete; data admission closed",
+        // With a participant-loss successor membership installed, ordinary
+        // admission needs the durable local completion receipt *and* a live
+        // completed-successor proof equal to it. Without one it is a no-op and
+        // every other check below is exactly what it always was.
+        maintenance::loss::admission(
+            c,
+            &self.identity,
+            self.role,
+            self.certified_authority.as_deref(),
         )?;
         self.verify_owner(c)?;
         self.verify_current_certified(c)?;

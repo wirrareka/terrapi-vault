@@ -92,6 +92,7 @@ pub(crate) fn prepare_pair<A: ReplicatedSchema>(
     let mut existing = [false; 2];
     for (i, n) in [p, s].into_iter().enumerate() {
         existing[i]=n.connection(|c|{
+            super::loss::require_no_loss_recovery(c)?;
             let present:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='node_pending_certified_maintenance')",[],|r|r.get(0))?;
             if !present { return Ok(false); }
             validate_pending(c,&n.adapter,&contract,&initial,n.identity(),n.role(),request,trust,n.certified_authority.as_deref(),Some(&prepared))?;
