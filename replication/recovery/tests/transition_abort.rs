@@ -737,6 +737,9 @@ fn loss_for(f: &Cycle, source: &Request, revision: u64) -> LossRequest {
         replacement_member: [24; 32],
         replacement_generation: [25; 32],
         fencing_ref: [26; 32],
+        source_kind: None,
+        abandoned_request: None,
+        supersedes: None,
     }
 }
 

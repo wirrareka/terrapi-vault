@@ -2303,6 +2303,9 @@ mod tests {
             replacement_member: [106; 32],
             replacement_generation: [107; 32],
             fencing_ref: [108; 32],
+            source_kind: None,
+            abandoned_request: None,
+            supersedes: None,
         };
         loss_request.validate()?;
         reopened_secondary.connection(|c| {

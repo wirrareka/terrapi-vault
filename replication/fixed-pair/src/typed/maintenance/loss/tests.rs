@@ -622,6 +622,9 @@ fn fixture(lost: Role, tail: bool) -> Result<Fixture> {
         replacement_member: [47; 32],
         replacement_generation,
         fencing_ref: [48; 32],
+        source_kind: None,
+        abandoned_request: None,
+        supersedes: None,
     };
     loss.validate()?;
     ensure(
@@ -1068,6 +1071,7 @@ fn successor_request(f: &Fixture) -> transition::LossSuccessorRequest {
                 publication: f.loss.survivor_publication,
             },
         ],
+        survivor_index: None,
     }
 }
 
