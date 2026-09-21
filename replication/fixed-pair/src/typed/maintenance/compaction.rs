@@ -216,6 +216,7 @@ impl<A: ReplicatedSchema> Node<A> {
     }
     fn prepare_compaction(&mut self, plan: &PairPlan) -> Result<()> {
         plan.validate()?;
+        self.connection(super::loss::require_no_loss_recovery)?;
         if let Some(old) = self.compaction_progress()? {
             if old.plan == *plan {
                 return Ok(());
@@ -249,6 +250,7 @@ impl<A: ReplicatedSchema> Node<A> {
     }
     fn compaction_step(&mut self, plan: &PairPlan, target: Phase) -> Result<()> {
         self.connection(|c| {
+            super::loss::require_no_loss_recovery(c)?;
             self.verify_owner(c)?;
             let tx=c.unchecked_transaction()?;
             let mut r=state(&tx)?.ok_or("compaction not prepared")?;

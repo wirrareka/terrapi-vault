@@ -11,6 +11,7 @@ impl<A: ReplicatedSchema> Node<A> {
             "snapshot cancellation requires secondary",
         )?;
         self.connection(|c| {
+            super::loss::require_no_loss_recovery(c)?;
             self.verify_owner(c)?;
             self.recovery_admission(c)?;
             compaction::require_idle(c)?;

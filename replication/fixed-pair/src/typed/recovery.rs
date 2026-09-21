@@ -354,11 +354,30 @@ impl<A: ReplicatedSchema> Node<A> {
             _ => Err("recovery not complete; data admission closed".into()),
         }
     }
+    /// Participant-loss state that has passed both the pre-loss recovery
+    /// admission and the full loss admission. Membership and peer identity are
+    /// derived from it only once the recovery is genuinely complete.
+    fn loss_admitted(&self, c: &Connection) -> Result<Option<maintenance::loss::Installed>> {
+        let Some(record) = maintenance::loss::state(c)? else {
+            return Ok(None);
+        };
+        self.recovery_admission(c)?;
+        maintenance::loss::admission(
+            c,
+            &self.identity,
+            self.role,
+            self.certified_authority.as_deref(),
+        )?;
+        Ok(Some(record))
+    }
+
     pub(super) fn recovery_membership(&self, c: &Connection) -> Result<Option<Id>> {
         // After a participant-loss install the handshake digest is bound to the
         // successor membership, so a peer still holding the pre-loss membership
-        // can never be paired with a recovered node.
-        if let Some(record) = maintenance::loss::state(c)? {
+        // can never be paired with a recovered node. The pre-loss recovery state
+        // must still be valid and the loss recovery must be fully admitted, so
+        // this stays gated exactly as strictly as it was before.
+        if let Some(record) = self.loss_admitted(c)? {
             return Ok(Some(maintenance::loss::membership_digest(&record)?));
         }
         self.recovery_admission(c)?;
@@ -373,7 +392,7 @@ impl<A: ReplicatedSchema> Node<A> {
         self.connection(|c| {
             // The successor membership replaces the pre-loss pairing: the lost
             // member is never an acceptable peer again.
-            if let Some(record) = maintenance::loss::state(c)? {
+            if let Some(record) = self.loss_admitted(c)? {
                 return Ok(Some(maintenance::loss::peer_member(&record)?));
             }
             self.recovery_admission(c)?;
@@ -388,7 +407,7 @@ impl<A: ReplicatedSchema> Node<A> {
     }
     pub fn recovery_member_identity(&self) -> Result<Option<Id>> {
         self.connection(|c| {
-            if let Some(record) = maintenance::loss::state(c)? {
+            if let Some(record) = self.loss_admitted(c)? {
                 return Ok(Some(maintenance::loss::local_member(&record)));
             }
             self.recovery_admission(c)?;

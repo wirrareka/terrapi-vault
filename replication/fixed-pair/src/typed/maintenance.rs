@@ -289,6 +289,7 @@ impl<A: ReplicatedSchema> Node<A> {
         pin_key(pin)?;
         self.validate_manifest(manifest)?;
         self.connection(|c| {
+            loss::require_no_loss_recovery(c)?;
             // Metadata cleanup may be needed after a survivor is sealed. It
             // never grants data access, writer admission or recovery authority.
             self.verify_owner(c)?;

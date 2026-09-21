@@ -301,12 +301,13 @@ impl Fixture {
                 self.live.clone(),
             )
         } else {
-            Node::open(
+            Node::open_with_transition_trust(
                 &self.replacement_path,
                 role,
                 self.identity.clone(),
                 "fixture",
                 StockSchema,
+                self.trust.clone(),
             )
         }
     }
@@ -378,7 +379,6 @@ fn authorities<'a>(
     Authorities {
         source: &f.journal,
         successor: successor_journal,
-        trust: &f.trust,
         policy: f.gate.as_ref(),
     }
 }
@@ -690,39 +690,24 @@ fn evidence_and_bootstrap(lost: Role, tail: bool) -> Result<()> {
     let metadata = std::fs::metadata(&f.survivor_path)?;
     assert_eq!(handle.file, (metadata.dev(), metadata.ino()));
     assert_eq!(
-        handle.manifest(&f.journal, &f.trust, f.gate.as_ref())?,
+        handle.manifest(&f.journal, f.gate.as_ref())?,
         f.survivor_manifest
     );
     assert!(handle
-        .page(
-            f.survivor_manifest.pages,
-            &f.journal,
-            &f.trust,
-            f.gate.as_ref()
-        )
+        .page(f.survivor_manifest.pages, &f.journal, f.gate.as_ref())
         .is_err());
-    assert!(handle
-        .page(u64::MAX, &f.journal, &f.trust, f.gate.as_ref())
-        .is_err());
+    assert!(handle.page(u64::MAX, &f.journal, f.gate.as_ref()).is_err());
     // Every page of the loss-bound publication is exportable for either role.
     for position in 0..f.survivor_manifest.pages {
         assert_eq!(
-            handle
-                .page(position, &f.journal, &f.trust, f.gate.as_ref())?
-                .position,
+            handle.page(position, &f.journal, f.gate.as_ref())?.position,
             position
         );
     }
     assert!(f.survivor_manifest.pages > 0);
 
     let mut replacement = f.replacement()?;
-    let checkpoint = bootstrap_replacement(
-        &handle,
-        &mut replacement,
-        &f.journal,
-        &f.trust,
-        f.gate.as_ref(),
-    )?;
+    let checkpoint = bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
     assert_eq!(cut(&checkpoint)?, f.loss.survivor_cut);
     assert_eq!(checkpoint, f.survivor_checkpoint);
     assert_eq!(
@@ -748,13 +733,7 @@ fn evidence_and_bootstrap(lost: Role, tail: bool) -> Result<()> {
     );
     // Exact retry over a completed restore: same checkpoint, no mutation.
     assert_eq!(
-        bootstrap_replacement(
-            &handle,
-            &mut replacement,
-            &f.journal,
-            &f.trust,
-            f.gate.as_ref()
-        )?,
+        bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?,
         checkpoint
     );
     assert_eq!(node_state(&replacement)?, (receipts, capacity));
@@ -874,7 +853,7 @@ fn loss_evidence_rejects_every_role_and_identity_mismatch() -> Result<()> {
     assert_eq!(f.derive_role_at(&survivor, &f.loss)?, Role::Secondary);
     // Role swap attempt: the same signed decision against the lost node derives
     // Secondary there too, which its Primary owner row refuses.
-    assert!(f.derive_role_at(&lost, &f.loss).is_err());
+    assert_err_contains(f.derive_role_at(&lost, &f.loss), "owner mismatch");
     // And the real capability refuses to open on the lost node at all.
     assert!(LossSurvivorHandle::<StockSchema>::open_existing(
         &lost,
@@ -894,29 +873,42 @@ fn loss_evidence_rejects_every_role_and_identity_mismatch() -> Result<()> {
     swapped.lost_generation = f.loss.survivor.generation;
     swapped.survivor.member = f.loss.lost_member;
     swapped.survivor.generation = f.loss.lost_generation;
-    assert!(f.derive_role_at(&survivor, &swapped).is_err());
+    assert_err_contains(f.derive_role_at(&survivor, &swapped), "owner mismatch");
 
     let mut wrong_survivor_generation = f.loss.clone();
     wrong_survivor_generation.survivor.generation = [51; 32];
-    assert!(f
-        .derive_role_at(&survivor, &wrong_survivor_generation)
-        .is_err());
+    assert_err_contains(
+        f.derive_role_at(&survivor, &wrong_survivor_generation),
+        "loss survivor not certified",
+    );
 
     let mut wrong_lost_generation = f.loss.clone();
     wrong_lost_generation.lost_generation = [52; 32];
-    assert!(f.derive_role_at(&survivor, &wrong_lost_generation).is_err());
+    assert_err_contains(
+        f.derive_role_at(&survivor, &wrong_lost_generation),
+        "loss lost participant mismatch",
+    );
 
     let mut unknown_lost = f.loss.clone();
     unknown_lost.lost_member = [53; 32];
-    assert!(f.derive_role_at(&survivor, &unknown_lost).is_err());
+    assert_err_contains(
+        f.derive_role_at(&survivor, &unknown_lost),
+        "loss lost participant mismatch",
+    );
 
     let mut unknown_survivor = f.loss.clone();
     unknown_survivor.survivor.member = [54; 32];
-    assert!(f.derive_role_at(&survivor, &unknown_survivor).is_err());
+    assert_err_contains(
+        f.derive_role_at(&survivor, &unknown_survivor),
+        "loss survivor not certified",
+    );
 
     let mut reused_membership = f.loss.clone();
     reused_membership.replacement_membership = f.loss.membership;
-    assert!(f.derive_role_at(&survivor, &reused_membership).is_err());
+    assert_err_contains(
+        f.derive_role_at(&survivor, &reused_membership),
+        "loss membership reused",
+    );
 
     let mut stale_cut = f.loss.clone();
     stale_cut.source_cut.sequence += 1;
@@ -969,26 +961,17 @@ fn loss_evidence_rejects_every_role_and_identity_mismatch() -> Result<()> {
 fn loss_export_fails_closed_on_revocation_at_every_boundary() -> Result<()> {
     let f = fixture(Role::Secondary, false)?;
     f.gate.revoke();
-    assert!(f.survivor_handle().is_err());
+    assert_err_contains(f.survivor_handle(), "test fencing revoked");
     f.gate.allow();
     let handle = f.survivor_handle()?;
-    let pages = handle
-        .manifest(&f.journal, &f.trust, f.gate.as_ref())?
-        .pages;
+    let pages = handle.manifest(&f.journal, f.gate.as_ref())?.pages;
     assert!(pages > 0);
 
     // Revoked between pages: the manifest call passes, the first page does not.
     // The partial transfer leaves staged pages but no completed restore.
     let mut replacement = f.replacement()?;
     f.gate.revoke_after(1);
-    assert!(bootstrap_replacement(
-        &handle,
-        &mut replacement,
-        &f.journal,
-        &f.trust,
-        f.gate.as_ref()
-    )
-    .is_err());
+    assert!(bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref()).is_err());
     assert!(replacement.connection(|c| Ok(c.query_row(
         "SELECT NOT EXISTS(SELECT 1 FROM node_restore_complete) AND EXISTS(SELECT 1 FROM node_restore)",
         [],
@@ -1004,14 +987,7 @@ fn loss_export_fails_closed_on_revocation_at_every_boundary() -> Result<()> {
     // manifest call and every page pass, the closing fencing check does not.
     f.gate.revoke_after(pages + 1);
     let before = f.gate.fencing_calls();
-    assert!(bootstrap_replacement(
-        &handle,
-        &mut replacement,
-        &f.journal,
-        &f.trust,
-        f.gate.as_ref()
-    )
-    .is_err());
+    assert!(bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref()).is_err());
     assert_eq!(f.gate.fencing_calls() - before, pages + 2);
     // The restore itself did land, so the failure really was the last check.
     assert_eq!(
@@ -1027,13 +1003,7 @@ fn loss_export_fails_closed_on_revocation_at_every_boundary() -> Result<()> {
     // restore instead of repairing it.
     f.gate.allow();
     let receipts = receipt_rows(&replacement)?;
-    let checkpoint = bootstrap_replacement(
-        &handle,
-        &mut replacement,
-        &f.journal,
-        &f.trust,
-        f.gate.as_ref(),
-    )?;
+    let checkpoint = bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
     assert_eq!(cut(&checkpoint)?, f.loss.survivor_cut);
     assert_eq!(receipt_rows(&replacement)?, receipts);
     assert_eq!(
@@ -1181,13 +1151,8 @@ fn successor_installation_binds_survivor_replacement_and_parent_loss() -> Result
         let f = fixture(lost, true)?;
         let handle = f.survivor_handle()?;
         let mut replacement = f.replacement()?;
-        let checkpoint = bootstrap_replacement(
-            &handle,
-            &mut replacement,
-            &f.journal,
-            &f.trust,
-            f.gate.as_ref(),
-        )?;
+        let checkpoint =
+            bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
         assert_eq!(cut(&checkpoint)?, f.loss.survivor_cut);
         let (journal, proof) = successor_proof(&f, "successor-journal")?;
         prepared.push((f, handle, replacement, journal, proof));
@@ -1206,14 +1171,7 @@ fn successor_installation_binds_survivor_replacement_and_parent_loss() -> Result
             replacement.connection(checkpoint::base_for::<SchemaId>)?,
         );
         // Positive: the read-only precondition holds for the real pairing.
-        validate_successor_installation(
-            handle,
-            replacement,
-            proof,
-            &f.journal,
-            &f.trust,
-            f.gate.as_ref(),
-        )?;
+        validate_successor_installation(handle, replacement, proof, &f.journal, f.gate.as_ref())?;
         // It is verification only: nothing was written and nothing acknowledged.
         assert_eq!(
             (
@@ -1246,15 +1204,10 @@ fn successor_installation_binds_survivor_replacement_and_parent_loss() -> Result
             )?;
             Ok(())
         })?;
-        let manifest = handle.manifest(&f.journal, &f.trust, f.gate.as_ref())?;
+        let manifest = handle.manifest(&f.journal, f.gate.as_ref())?;
         rotated.begin_snapshot(&manifest)?;
         for position in 0..manifest.pages {
-            rotated.receive_snapshot(&handle.page(
-                position,
-                &f.journal,
-                &f.trust,
-                f.gate.as_ref(),
-            )?)?;
+            rotated.receive_snapshot(&handle.page(position, &f.journal, f.gate.as_ref())?)?;
         }
         rotated.finish_snapshot(&manifest)?;
         assert_ne!(
@@ -1266,7 +1219,6 @@ fn successor_installation_binds_survivor_replacement_and_parent_loss() -> Result
             &rotated,
             proof,
             &f.journal,
-            &f.trust,
             f.gate.as_ref()
         )
         .is_err());
@@ -1285,7 +1237,6 @@ fn successor_installation_binds_survivor_replacement_and_parent_loss() -> Result
             &other,
             proof,
             &f.journal,
-            &f.trust,
             f.gate.as_ref()
         )
         .is_err());
@@ -1299,7 +1250,6 @@ fn successor_installation_binds_survivor_replacement_and_parent_loss() -> Result
             replacement,
             foreign_proof,
             &f.journal,
-            &f.trust,
             f.gate.as_ref()
         )
         .is_err());
@@ -1311,19 +1261,11 @@ fn successor_installation_binds_survivor_replacement_and_parent_loss() -> Result
             replacement,
             proof,
             &f.journal,
-            &f.trust,
             f.gate.as_ref()
         )
         .is_err());
         f.gate.allow();
-        validate_successor_installation(
-            handle,
-            replacement,
-            proof,
-            &f.journal,
-            &f.trust,
-            f.gate.as_ref(),
-        )?;
+        validate_successor_installation(handle, replacement, proof, &f.journal, f.gate.as_ref())?;
     }
     drop(prepared);
     Ok(())
@@ -1343,14 +1285,10 @@ fn loss_bootstrap_rejects_wrong_replacement_role_generation_and_state() -> Resul
         "fixture",
         StockSchema,
     )?;
-    assert!(bootstrap_replacement(
-        &handle,
-        &mut wrong_role,
-        &f.journal,
-        &f.trust,
-        f.gate.as_ref()
-    )
-    .is_err());
+    assert_err_contains(
+        bootstrap_replacement(&handle, &mut wrong_role, &f.journal, f.gate.as_ref()),
+        "loss replacement owner mismatch",
+    );
     assert_eq!(wrong_role.checkpoint()?.sequence, 0);
     drop(wrong_role);
 
@@ -1366,14 +1304,10 @@ fn loss_bootstrap_rejects_wrong_replacement_role_generation_and_state() -> Resul
         wrong_generation.connection(checkpoint::generation)?,
         f.loss.replacement_generation
     );
-    assert!(bootstrap_replacement(
-        &handle,
-        &mut wrong_generation,
-        &f.journal,
-        &f.trust,
-        f.gate.as_ref()
-    )
-    .is_err());
+    assert_err_contains(
+        bootstrap_replacement(&handle, &mut wrong_generation, &f.journal, f.gate.as_ref()),
+        "loss replacement generation mismatch",
+    );
     assert_eq!(wrong_generation.checkpoint()?.sequence, 0);
 
     // Non-empty replacement carrying the signed replacement generation: the
@@ -1410,9 +1344,7 @@ fn loss_bootstrap_rejects_wrong_replacement_role_generation_and_state() -> Resul
         f.loss.replacement_generation
     );
     let before = receipt_rows(&os)?;
-    assert!(
-        bootstrap_replacement(&handle, &mut os, &f.journal, &f.trust, f.gate.as_ref()).is_err()
-    );
+    assert!(bootstrap_replacement(&handle, &mut os, &f.journal, f.gate.as_ref()).is_err());
     assert_eq!(receipt_rows(&os)?, before);
     assert!(os.connection(|c| Ok(c.query_row(
         "SELECT NOT EXISTS(SELECT 1 FROM node_restore) AND NOT EXISTS(SELECT 1 FROM node_restore_complete)",
@@ -1430,10 +1362,7 @@ fn loss_bootstrap_rejects_wrong_replacement_role_generation_and_state() -> Resul
         "fixture",
         StockSchema,
     )?;
-    assert!(
-        bootstrap_replacement(&handle, &mut foreign, &f.journal, &f.trust, f.gate.as_ref())
-            .is_err()
-    );
+    assert!(bootstrap_replacement(&handle, &mut foreign, &f.journal, f.gate.as_ref()).is_err());
     drop(foreign);
     drop(os);
     drop(wrong_generation);
@@ -1527,7 +1456,7 @@ fn every_mutation_is_rejected(node: &mut Node<StockSchema>) -> Result<()> {
     ensure(node.prepare(batch.clone()).is_err(), "prepare admitted")?;
     ensure(node.decide(&batch.operation_id).is_err(), "decide admitted")?;
     ensure(node.abort(&batch.operation_id).is_err(), "abort admitted")?;
-    ensure(node.checkpoint().is_err(), "checkpoint admitted")?;
+    assert_err_contains(node.checkpoint(), "data admission closed");
     ensure(node.verified_view().is_err(), "verified view admitted")?;
     ensure(node.summary().is_err(), "summary admitted")?;
     ensure(node.journal_head().is_err(), "journal head admitted")?;
@@ -1602,24 +1531,11 @@ fn install_cycle(lost: Role, tail: bool) -> Result<()> {
     let handle = f.survivor_handle()?;
     assert_eq!(handle.role, derived);
     let mut replacement = f.replacement()?;
-    bootstrap_replacement(
-        &handle,
-        &mut replacement,
-        &f.journal,
-        &f.trust,
-        f.gate.as_ref(),
-    )?;
+    bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
     let (successor_journal, proof) = successor_proof(&f, "successor-journal")?;
     let successor = proof.request().clone();
     let live = authorities(&f, &successor_journal);
-    validate_successor_installation(
-        &handle,
-        &replacement,
-        &proof,
-        &f.journal,
-        &f.trust,
-        f.gate.as_ref(),
-    )?;
+    validate_successor_installation(&handle, &replacement, &proof, &f.journal, f.gate.as_ref())?;
 
     // Before any install both nodes are ordinary: the replacement is admitted.
     assert!(replacement.checkpoint().is_ok());
@@ -1652,19 +1568,13 @@ fn install_cycle(lost: Role, tail: bool) -> Result<()> {
     // Historical validation is exactly the regression a promotion would break:
     // export, page read and `validate` all stay green on the installed survivor.
     assert_eq!(
-        handle.manifest(&f.journal, &f.trust, f.gate.as_ref())?,
+        handle.manifest(&f.journal, f.gate.as_ref())?,
         f.survivor_manifest
     );
-    handle.page(0, &f.journal, &f.trust, f.gate.as_ref())?;
+    handle.page(0, &f.journal, f.gate.as_ref())?;
     assert_eq!(f.derive_role_at(&f.survivor_path, &f.loss)?, derived);
     assert_eq!(
-        bootstrap_replacement(
-            &handle,
-            &mut replacement,
-            &f.journal,
-            &f.trust,
-            f.gate.as_ref()
-        )?,
+        bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?,
         f.survivor_checkpoint
     );
 
@@ -1714,14 +1624,7 @@ fn install_cycle(lost: Role, tail: bool) -> Result<()> {
 
     // A bootstrap retry on an installed replacement fails closed without
     // mutating anything (a promoted one is no longer a bootstrap Secondary).
-    assert!(bootstrap_replacement(
-        &handle,
-        &mut replacement,
-        &f.journal,
-        &f.trust,
-        f.gate.as_ref()
-    )
-    .is_err());
+    assert!(bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref()).is_err());
     assert_eq!(replacement_state(&replacement)?, after);
 
     // Both nodes are now closed to ordinary traffic and stay closed.
@@ -1809,13 +1712,7 @@ fn installable(tail: bool) -> Result<Installable> {
     let f = fixture(Role::Secondary, tail)?;
     let handle = f.survivor_handle()?;
     let mut replacement = f.replacement()?;
-    bootstrap_replacement(
-        &handle,
-        &mut replacement,
-        &f.journal,
-        &f.trust,
-        f.gate.as_ref(),
-    )?;
+    bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
     let (successor_journal, proof) = successor_proof(&f, "successor-journal")?;
     let successor = proof.request().clone();
     Ok(Installable {
@@ -1863,10 +1760,11 @@ fn loss_install_rejects_conflicting_and_partial_state() -> Result<()> {
     assert!(good.0.is_some());
 
     // Different successor request: conflict, record untouched.
-    assert!(it
-        .handle
-        .install_successor("fixture", &other, &authorities(&it.f, &other_journal))
-        .is_err());
+    assert_err_contains(
+        it.handle
+            .install_successor("fixture", &other, &authorities(&it.f, &other_journal)),
+        "loss install conflict",
+    );
     assert_eq!(install_state(&it.f.survivor_path)?, good);
 
     it.install_replacement_now()?;
@@ -2027,15 +1925,12 @@ fn loss_replacement_install_rejects_wrong_bindings() -> Result<()> {
         )?;
         Ok(())
     })?;
-    let manifest = it
-        .handle
-        .manifest(&it.f.journal, &it.f.trust, it.f.gate.as_ref())?;
+    let manifest = it.handle.manifest(&it.f.journal, it.f.gate.as_ref())?;
     rotated.begin_snapshot(&manifest)?;
     for position in 0..manifest.pages {
         rotated.receive_snapshot(&it.handle.page(
             position,
             &it.f.journal,
-            &it.f.trust,
             it.f.gate.as_ref(),
         )?)?;
     }
@@ -2116,6 +2011,24 @@ fn loss_install_rejects_path_swap_under_the_lock() -> Result<()> {
     std::fs::remove_file(meta_of(&survivor))?;
     std::fs::rename(&aside, &survivor)?;
     std::fs::rename(meta_of(&aside), meta_of(&survivor))?;
+
+    // A byte-identical copy of the survivor itself is still a different file.
+    // No content check could tell it apart; only the recorded (device, inode)
+    // does, and the retained read-only connection still points at the original.
+    let twin = it.f.dir.path().join("survivor-twin");
+    std::fs::copy(&survivor, &twin)?;
+    std::fs::copy(meta_of(&survivor), meta_of(&twin))?;
+    std::fs::rename(&survivor, &aside)?;
+    std::fs::rename(meta_of(&survivor), meta_of(&aside))?;
+    std::fs::rename(&twin, &survivor)?;
+    std::fs::rename(meta_of(&twin), meta_of(&survivor))?;
+    assert_err_contains(it.install_survivor(), "loss survivor file replaced");
+    std::fs::remove_file(&survivor)?;
+    std::fs::remove_file(meta_of(&survivor))?;
+    std::fs::rename(&aside, &survivor)?;
+    std::fs::rename(meta_of(&aside), meta_of(&survivor))?;
+    // The original, still the file the handle validated, gained nothing.
+    assert_eq!(install_state(&survivor)?.0, None);
 
     // The same handle, still holding the same lock, installs once the real file
     // is back in place.
@@ -2323,13 +2236,7 @@ fn promoted_replacement_rejects_owner_and_record_disagreement() -> Result<()> {
     let f = fixture(Role::Primary, false)?;
     let handle = f.survivor_handle()?;
     let mut replacement = f.replacement()?;
-    bootstrap_replacement(
-        &handle,
-        &mut replacement,
-        &f.journal,
-        &f.trust,
-        f.gate.as_ref(),
-    )?;
+    bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
     let (successor_journal, proof) = successor_proof(&f, "successor-journal")?;
     let successor = proof.request().clone();
     let live = authorities(&f, &successor_journal);
@@ -2449,13 +2356,7 @@ fn recovery_cycle(lost: Role, tail: bool) -> Result<()> {
     };
     let handle = f.survivor_handle()?;
     let mut replacement = f.replacement()?;
-    bootstrap_replacement(
-        &handle,
-        &mut replacement,
-        &f.journal,
-        &f.trust,
-        f.gate.as_ref(),
-    )?;
+    bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
     let (successor_journal, proof) = successor_proof(&f, "successor-journal")?;
     let successor = proof.request().clone();
     let live = authorities(&f, &successor_journal);
@@ -2704,13 +2605,7 @@ fn acknowledgement_requires_both_durable_installs() -> Result<()> {
     let f = fixture(Role::Secondary, false)?;
     let handle = f.survivor_handle()?;
     let mut replacement = f.replacement()?;
-    bootstrap_replacement(
-        &handle,
-        &mut replacement,
-        &f.journal,
-        &f.trust,
-        f.gate.as_ref(),
-    )?;
+    bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
     let (successor_journal, proof) = successor_proof(&f, "successor-journal")?;
     let successor = proof.request().clone();
     let live = authorities(&f, &successor_journal);
@@ -2795,13 +2690,7 @@ fn returning_lost_member_and_old_membership_stay_rejected() -> Result<()> {
     let f = fixture(Role::Primary, false)?;
     let handle = f.survivor_handle()?;
     let mut replacement = f.replacement()?;
-    bootstrap_replacement(
-        &handle,
-        &mut replacement,
-        &f.journal,
-        &f.trust,
-        f.gate.as_ref(),
-    )?;
+    bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
     let (successor_journal, proof) = successor_proof(&f, "successor-journal")?;
     let successor = proof.request().clone();
     let live = authorities(&f, &successor_journal);
@@ -2861,6 +2750,951 @@ fn returning_lost_member_and_old_membership_stay_rejected() -> Result<()> {
         assert!(open_with_authority(&f, &f.lost_path, Role::Primary).is_err());
         assert!(open_with_authority(&f, &f.lost_path, Role::Secondary).is_err());
     }
+    drop(survivor_node);
+    drop(replacement_node);
+    drop(f);
+    Ok(())
+}
+
+/// Acknowledgement evidence is bound to the source journal scope the successor
+/// journal records as its parent, on both nodes.
+#[test]
+fn acknowledgement_binds_the_source_journal_scope() -> Result<()> {
+    let f = fixture(Role::Secondary, false)?;
+    let mut handle = f.survivor_handle()?;
+    let mut replacement = f.replacement()?;
+    bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
+    let (successor_journal, proof) = successor_proof(&f, "successor-journal")?;
+    let successor = proof.request().clone();
+    let live = authorities(&f, &successor_journal);
+    install_pair(
+        &handle,
+        &mut replacement,
+        "fixture",
+        &f.certificate,
+        &f.certificate_token,
+        &successor,
+        &live,
+    )?;
+
+    let survivor_path = f.survivor_path.clone();
+    let replacement_path = f.replacement_path.clone();
+    let good_survivor = install_state(&survivor_path)?;
+    let good_replacement = node_install_state(&replacement)?;
+
+    // Rewrite one record so it claims a different source journal region. It
+    // still decodes and still binds to this loss and successor, so only the
+    // source-scope check can catch it.
+    let restamped = |json: &str| -> Result<String> {
+        let mut record: serde_json::Value = serde_json::from_str(json)?;
+        record["source_scope"]["region"] = serde_json::Value::from("elsewhere");
+        Ok(serde_json::to_string(&record)?)
+    };
+
+    for (path, good) in [
+        (&survivor_path, &good_survivor.0),
+        (&replacement_path, &good_replacement.0),
+    ] {
+        let original = good.as_deref().ok_or("install record missing")?;
+        drop(replacement);
+        drop(handle);
+        tamper(
+            path,
+            &format!(
+                "UPDATE recovery_loss_active SET record='{}' WHERE id=1",
+                restamped(original)?.replace('\'', "''")
+            ),
+        )?;
+        let handle_again = f.survivor_handle()?;
+        let replacement_again = f.open_replacement(Role::Secondary)?;
+        assert!(complete_successor(
+            &handle_again,
+            &replacement_again,
+            &successor,
+            COMPLETION,
+            &live
+        )
+        .is_err());
+        assert_eq!(
+            successor_journal
+                .fetch_loss_successor(&successor, &f.trust.as_trust(), f.gate.as_ref())?
+                .acknowledgements(),
+            [false; 2]
+        );
+        drop(replacement_again);
+        drop(handle_again);
+        tamper(
+            path,
+            &format!(
+                "UPDATE recovery_loss_active SET record='{}' WHERE id=1",
+                original.replace('\'', "''")
+            ),
+        )?;
+        handle = f.survivor_handle()?;
+        replacement = f.open_replacement(Role::Secondary)?;
+    }
+
+    // Restored: the genuine records acknowledge.
+    assert_eq!(install_state(&survivor_path)?, good_survivor);
+    assert_eq!(node_install_state(&replacement)?, good_replacement);
+    complete_successor(&handle, &replacement, &successor, COMPLETION, &live)?;
+    assert_eq!(
+        successor_journal
+            .fetch_loss_successor(&successor, &f.trust.as_trust(), f.gate.as_ref())?
+            .acknowledgements(),
+        [true; 2]
+    );
+    drop(replacement);
+    drop(handle);
+    drop(f);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// S4: crash/retry matrix. A child process replays the whole flow from the top,
+// performs one more step and then dies without running any destructor. The
+// parent reopens everything from disk, proves nothing is half-applied, and the
+// next child proves every earlier step is an exact idempotent no-op.
+// ---------------------------------------------------------------------------
+
+/// Everything a fresh process needs to rebuild the flow from disk.
+#[derive(Serialize, Deserialize)]
+struct CrashFixture {
+    identity: Identity<SchemaId>,
+    profile: crate::recovery::grant::Profile,
+    keys: Vec<(String, Vec<u8>)>,
+    max_lifetime: u64,
+    certificate: transition::Request,
+    certificate_token: String,
+    successor: transition::LossSuccessorRequest,
+    source_scope: transition::JournalScope,
+    successor_scope: transition::JournalScope,
+    lost: Role,
+    survivor: std::path::PathBuf,
+    lost_path: std::path::PathBuf,
+    replacement: std::path::PathBuf,
+    source_journal: std::path::PathBuf,
+    successor_journal: std::path::PathBuf,
+    completion: [u8; 32],
+}
+
+impl CrashFixture {
+    fn trust(&self) -> transition::TrustStore {
+        transition::TrustStore {
+            profile: self.profile.clone(),
+            keys: self.keys.clone(),
+            max_lifetime: self.max_lifetime,
+        }
+    }
+    fn survivor_role(&self) -> Role {
+        match self.lost {
+            Role::Primary => Role::Secondary,
+            Role::Secondary => Role::Primary,
+        }
+    }
+    fn read(dir: &Path) -> Result<Self> {
+        Ok(serde_json::from_slice(&std::fs::read(
+            dir.join("crash-fixture.json"),
+        )?)?)
+    }
+}
+
+/// Journals, authority and policy rebuilt from disk in either process.
+struct CrashWorld {
+    fixture: CrashFixture,
+    trust: transition::TrustStore,
+    source: transition::Journal,
+    successor: transition::Journal,
+    gate: Arc<Gate>,
+    live: Arc<Live>,
+}
+
+impl CrashWorld {
+    fn open(dir: &Path) -> Result<Self> {
+        let fixture = CrashFixture::read(dir)?;
+        let trust = fixture.trust();
+        let gate = Gate::new();
+        let source = transition::Journal::open(
+            &fixture.source_journal,
+            "journal-fixture",
+            fixture.source_scope.clone(),
+            &trust.as_trust(),
+        )?;
+        let live = Arc::new(Live {
+            journal: Mutex::new(transition::Journal::open(
+                &fixture.source_journal,
+                "journal-fixture",
+                fixture.source_scope.clone(),
+                &trust.as_trust(),
+            )?),
+            successor: Mutex::new(Some(transition::Journal::open(
+                &fixture.successor_journal,
+                "successor-fixture",
+                fixture.successor_scope.clone(),
+                &trust.as_trust(),
+            )?)),
+            trust: trust.clone(),
+            gate: gate.clone(),
+        });
+        let successor = transition::Journal::open(
+            &fixture.successor_journal,
+            "successor-fixture",
+            fixture.successor_scope.clone(),
+            &trust.as_trust(),
+        )?;
+        Ok(Self {
+            fixture,
+            trust,
+            source,
+            successor,
+            gate,
+            live,
+        })
+    }
+    fn authorities(&self) -> Authorities<'_, Gate> {
+        Authorities {
+            source: &self.source,
+            successor: &self.successor,
+            policy: self.gate.as_ref(),
+        }
+    }
+    fn handle(&self) -> Result<LossSurvivorHandle<StockSchema>> {
+        LossSurvivorHandle::open_existing(
+            &self.fixture.survivor,
+            self.fixture.identity.clone(),
+            "fixture",
+            StockSchema,
+            &self.trust,
+            &self.source,
+            self.gate.as_ref(),
+        )
+    }
+    fn open_node(&self, path: &Path, role: Role) -> Result<Node<StockSchema>> {
+        let installed = install_state(path)?.0.is_some();
+        if installed {
+            Node::open_with_completed_transition(
+                path,
+                role,
+                self.fixture.identity.clone(),
+                "fixture",
+                StockSchema,
+                self.trust.clone(),
+                self.live.clone(),
+            )
+        } else {
+            Node::open_with_transition_trust(
+                path,
+                role,
+                self.fixture.identity.clone(),
+                "fixture",
+                StockSchema,
+                self.trust.clone(),
+            )
+        }
+    }
+    fn replacement_role(&self, installed: bool) -> Role {
+        if installed {
+            self.fixture.lost
+        } else {
+            Role::Secondary
+        }
+    }
+    fn replacement(&self) -> Result<Node<StockSchema>> {
+        let installed = install_state(&self.fixture.replacement)?.0.is_some();
+        self.open_node(&self.fixture.replacement, self.replacement_role(installed))
+    }
+    fn acknowledgements(&self) -> Result<[bool; 2]> {
+        Ok(self
+            .successor
+            .fetch_loss_successor(
+                &self.fixture.successor,
+                &self.trust.as_trust(),
+                self.gate.as_ref(),
+            )?
+            .acknowledgements())
+    }
+}
+
+/// Steps of the whole operator flow. Replaying a prefix must always be an
+/// exact no-op; `stop` is the step after which the child dies.
+const STEP_BOOTSTRAP_PARTIAL: u32 = 1;
+const STEP_BOOTSTRAP: u32 = 2;
+const STEP_SURVIVOR_INSTALL: u32 = 3;
+const STEP_REPLACEMENT_INSTALL: u32 = 4;
+const STEP_FIRST_ACK: u32 = 5;
+const STEP_SECOND_ACK: u32 = 6;
+const STEP_AUTHORITY_COMPLETION: u32 = 7;
+const STEP_FIRST_RECEIPT: u32 = 8;
+const STEP_LAST: u32 = STEP_FIRST_RECEIPT;
+
+/// Replay the flow from the top and stop after `stop`. Every step before it is
+/// re-executed and must converge without changing anything.
+fn replay(world: &CrashWorld, stop: u32) -> Result<()> {
+    let f = &world.fixture;
+    let handle = world.handle()?;
+    let installed = install_state(&f.replacement)?.0.is_some();
+    let mut replacement = world.replacement()?;
+    if installed {
+        // Bootstrap is an ordinary admitted operation, so it is closed once the
+        // successor membership is installed. Replaying it must fail, not repair.
+        ensure(
+            bootstrap_replacement(
+                &handle,
+                &mut replacement,
+                &world.source,
+                world.gate.as_ref(),
+            )
+            .is_err(),
+            "bootstrap admitted after install",
+        )?;
+    } else {
+        if stop == STEP_BOOTSTRAP_PARTIAL {
+            // Partial transfer: begin and deliver one page only.
+            let manifest = handle.manifest(&world.source, world.gate.as_ref())?;
+            let next = replacement.begin_snapshot(&manifest)?;
+            if next < manifest.pages {
+                let page = handle.page(next, &world.source, world.gate.as_ref())?;
+                replacement.receive_snapshot(&page)?;
+            }
+            return Ok(());
+        }
+        bootstrap_replacement(
+            &handle,
+            &mut replacement,
+            &world.source,
+            world.gate.as_ref(),
+        )?;
+        if stop == STEP_BOOTSTRAP {
+            return Ok(());
+        }
+    }
+    let live = world.authorities();
+    handle.install_successor("fixture", &f.successor, &live)?;
+    if stop == STEP_SURVIVOR_INSTALL {
+        return Ok(());
+    }
+    install_replacement(
+        &mut replacement,
+        &f.certificate,
+        &f.certificate_token,
+        &f.successor,
+        &live,
+    )?;
+    if stop == STEP_REPLACEMENT_INSTALL {
+        return Ok(());
+    }
+    // The replacement object must be reopened under its installed role.
+    drop(replacement);
+    let replacement = world.replacement()?;
+    if world.acknowledgements()? != [true; 2] {
+        let evidence = InstalledParticipants {
+            survivor: &handle,
+            replacement: &replacement,
+            policy: world.gate.as_ref(),
+        };
+        let decision = world.successor.fetch_loss_successor(
+            &f.successor,
+            &world.trust.as_trust(),
+            &evidence,
+        )?;
+        for (index, participant) in decision.request().participants.iter().enumerate() {
+            if decision.acknowledgements()[index] {
+                continue;
+            }
+            world.successor.acknowledge_loss_successor(
+                &decision,
+                participant,
+                &world.trust.as_trust(),
+                &evidence,
+            )?;
+            if (index == 0 && stop == STEP_FIRST_ACK) || (index == 1 && stop == STEP_SECOND_ACK) {
+                return Ok(());
+            }
+        }
+    }
+    if stop <= STEP_SECOND_ACK {
+        return Ok(());
+    }
+    complete_successor(&handle, &replacement, &f.successor, f.completion, &live)?;
+    if stop == STEP_AUTHORITY_COMPLETION {
+        return Ok(());
+    }
+    drop(replacement);
+    drop(handle);
+    let survivor_node = world.open_node(&f.survivor, f.survivor_role())?;
+    record_completion(&survivor_node)?;
+    if stop == STEP_FIRST_RECEIPT {
+        return Ok(());
+    }
+    let replacement_node = world.replacement()?;
+    record_completion(&replacement_node)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "subprocess fixture; invoked by the participant-loss crash matrix"]
+fn participant_loss_crash_child() -> Result<()> {
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("VESTA_LOSS_CRASH_DIR").ok_or("parent fixture required")?,
+    );
+    let stop: u32 = std::env::var("VESTA_LOSS_CRASH_STEP")?.parse()?;
+    let world = CrashWorld::open(&dir)?;
+    replay(&world, stop)?;
+    // No destructors, no clean SQLite close, no success response to the caller.
+    std::process::exit(73)
+}
+
+/// Build a certified pair, decide the loss and the successor, and persist
+/// everything a fresh process needs to rebuild the flow.
+fn crash_fixture(lost: Role, tail: bool) -> Result<(Fixture, transition::Journal, CrashWorld)> {
+    let f = fixture(lost, tail)?;
+    let (successor_journal, proof) = successor_proof(&f, "successor-journal")?;
+    let record = CrashFixture {
+        identity: f.identity.clone(),
+        profile: f.trust.profile.clone(),
+        keys: f.trust.keys.clone(),
+        max_lifetime: f.trust.max_lifetime,
+        certificate: f.certificate.clone(),
+        certificate_token: f.certificate_token.clone(),
+        successor: proof.request().clone(),
+        source_scope: proof.source_scope().clone(),
+        successor_scope: successor_scope(&f),
+        lost,
+        survivor: f.survivor_path.clone(),
+        lost_path: f.lost_path.clone(),
+        replacement: f.replacement_path.clone(),
+        source_journal: f.dir.path().join("loss-journal"),
+        successor_journal: f.dir.path().join("successor-journal"),
+        completion: COMPLETION,
+    };
+    std::fs::write(
+        f.dir.path().join("crash-fixture.json"),
+        serde_json::to_vec(&record)?,
+    )?;
+    let world = CrashWorld::open(f.dir.path())?;
+    Ok((f, successor_journal, world))
+}
+
+fn crash_at(dir: &Path, step: u32) -> Result<()> {
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "typed::maintenance::loss::tests::participant_loss_crash_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("VESTA_LOSS_CRASH_DIR", dir)
+        .env("VESTA_LOSS_CRASH_STEP", step.to_string())
+        .status()?;
+    ensure(
+        status.code() == Some(73),
+        &format!("participant-loss crash child failed at step {step}"),
+    )
+}
+
+/// State every crash point must leave behind, checked from disk only.
+fn assert_crash_state(world: &CrashWorld, step: u32) -> Result<()> {
+    let f = &world.fixture;
+    let survivor = install_state(&f.survivor)?;
+    let replacement = install_state(&f.replacement)?;
+    // A record is either absent or complete; presence follows the step exactly.
+    assert_eq!(
+        survivor.0.is_some(),
+        step >= STEP_SURVIVOR_INSTALL,
+        "survivor record at step {step}"
+    );
+    assert_eq!(
+        replacement.0.is_some(),
+        step >= STEP_REPLACEMENT_INSTALL,
+        "replacement record at step {step}"
+    );
+    // Owner rows follow the installed roles and nothing else.
+    assert_eq!(owner_role(&survivor.1)?, f.survivor_role());
+    assert_eq!(
+        owner_role(&replacement.1)?,
+        world.replacement_role(replacement.0.is_some())
+    );
+    // Acknowledgement flags match the step exactly.
+    let expected_acks = match step {
+        s if s < STEP_FIRST_ACK => [false, false],
+        STEP_FIRST_ACK => [true, false],
+        _ => [true, true],
+    };
+    assert_eq!(
+        world.acknowledgements()?,
+        expected_acks,
+        "acks at step {step}"
+    );
+    // The authority only has a completion once it was asked for one.
+    let completed = world.successor.fetch_completed_loss_successor(
+        &f.successor,
+        &world.trust.as_trust(),
+        world.gate.as_ref(),
+    );
+    assert_eq!(
+        completed.is_ok(),
+        step >= STEP_AUTHORITY_COMPLETION,
+        "authority completion at step {step}"
+    );
+    // The survivor is unopenable until its install replaces the superseded
+    // certificate head, and closed until it records completion.
+    let survivor_open = world.open_node(&f.survivor, f.survivor_role());
+    assert_eq!(
+        survivor_open.is_ok(),
+        step >= STEP_SURVIVOR_INSTALL,
+        "survivor open at step {step}"
+    );
+    if let Ok(node) = survivor_open {
+        assert_eq!(
+            node.checkpoint().is_ok(),
+            step >= STEP_FIRST_RECEIPT,
+            "survivor admission at step {step}"
+        );
+        drop(node);
+    }
+    // The replacement is an ordinary bootstrap node until it is installed, and
+    // closed from then until it records completion, which this walk never
+    // reaches. A partial transfer is not admitted either.
+    let replacement_node = world.replacement()?;
+    assert_eq!(
+        replacement_node.checkpoint().is_ok(),
+        (STEP_BOOTSTRAP..STEP_REPLACEMENT_INSTALL).contains(&step),
+        "replacement admission at step {step}"
+    );
+    drop(replacement_node);
+    // The lost member never becomes openable again.
+    for role in [Role::Primary, Role::Secondary] {
+        assert!(
+            Node::<StockSchema>::open(
+                &f.lost_path,
+                role,
+                f.identity.clone(),
+                "fixture",
+                StockSchema
+            )
+            .is_err(),
+            "lost member opened at step {step}"
+        );
+        assert!(
+            world.open_node(&f.lost_path, role).is_err(),
+            "lost member opened with authority at step {step}"
+        );
+    }
+    Ok(())
+}
+
+/// A different successor request or completion id is refused at every point.
+fn assert_wrong_inputs_refused(f: &Fixture, world: &CrashWorld, step: u32) -> Result<()> {
+    let other = successor_request_with(f, [99; 32]);
+    assert!(
+        world
+            .successor
+            .fetch_loss_successor(&other, &world.trust.as_trust(), world.gate.as_ref())
+            .is_err(),
+        "foreign successor accepted at step {step}"
+    );
+    if step >= STEP_AUTHORITY_COMPLETION {
+        let handle = world.handle()?;
+        let replacement = world.replacement()?;
+        assert!(
+            complete_successor(
+                &handle,
+                &replacement,
+                &world.fixture.successor,
+                [98; 32],
+                &world.authorities()
+            )
+            .is_err(),
+            "conflicting completion accepted at step {step}"
+        );
+    }
+    Ok(())
+}
+
+/// Every boundary of the operator flow, crashed and resumed. Each child replays
+/// the whole flow from the top, so every earlier step is proved idempotent.
+fn crash_matrix(lost: Role, tail: bool) -> Result<()> {
+    let (f, successor_journal, world) = crash_fixture(lost, tail)?;
+    let dir = f.dir.path().to_path_buf();
+    drop(world);
+
+    let mut survivor_record: Option<String> = None;
+    let mut replacement_record: Option<String> = None;
+    for step in STEP_BOOTSTRAP_PARTIAL..=STEP_LAST {
+        crash_at(&dir, step)?;
+        let world = CrashWorld::open(&dir)?;
+        let survivor = install_state(&f.survivor_path)?.0;
+        let replacement = install_state(&f.replacement_path)?.0;
+        // Durable records never change once written.
+        if let Some(previous) = &survivor_record {
+            assert_eq!(survivor.as_deref(), Some(previous.as_str()));
+        }
+        if let Some(previous) = &replacement_record {
+            assert_eq!(replacement.as_deref(), Some(previous.as_str()));
+        }
+        survivor_record = survivor.or(survivor_record);
+        replacement_record = replacement.or(replacement_record);
+        assert_crash_state(&world, step)?;
+        assert_wrong_inputs_refused(&f, &world, step)?;
+        drop(world);
+    }
+
+    // Resume: the whole flow replays as a no-op and the new pair writes.
+    let world = CrashWorld::open(&dir)?;
+    replay(&world, u32::MAX)?;
+    assert_eq!(install_state(&f.survivor_path)?.0, survivor_record);
+    assert_eq!(install_state(&f.replacement_path)?.0, replacement_record);
+    let survivor_node = world.open_node(&f.survivor_path, f.survivor_role())?;
+    let replacement_node = world.replacement()?;
+    let (mut primary, mut secondary) = match lost {
+        Role::Primary => (replacement_node, survivor_node),
+        Role::Secondary => (survivor_node, replacement_node),
+    };
+    let before = f.loss.survivor_cut.sequence;
+    let mut batch = stock_entry().batch;
+    batch.operation_id = "after-crash-matrix".into();
+    assert_eq!(
+        commit(&mut primary, &mut secondary, batch)?.sequence,
+        before + 1
+    );
+    let receipts = receipt_rows(&primary)?;
+    assert_eq!(receipts.len() as u64, before + 1);
+    assert_eq!(receipts[..before as usize], f.survivor_receipts[..]);
+    assert_eq!(receipt_rows(&secondary)?, receipts);
+    drop(primary);
+    drop(secondary);
+    drop(world);
+    drop(successor_journal);
+    drop(f);
+    Ok(())
+}
+
+#[test]
+fn crash_matrix_for_lost_primary_without_tail() -> Result<()> {
+    crash_matrix(Role::Primary, false)
+}
+
+#[test]
+fn crash_matrix_for_lost_primary_with_tail() -> Result<()> {
+    crash_matrix(Role::Primary, true)
+}
+
+#[test]
+fn crash_matrix_for_lost_secondary_without_tail() -> Result<()> {
+    crash_matrix(Role::Secondary, false)
+}
+
+#[test]
+fn crash_matrix_for_lost_secondary_with_tail() -> Result<()> {
+    crash_matrix(Role::Secondary, true)
+}
+
+/// Security-relevant negatives assert the exact reason, so a test cannot pass
+/// because something unrelated happened to fail first.
+#[track_caller]
+fn assert_err_contains<T>(outcome: Result<T>, expected: &str) {
+    match outcome {
+        Ok(_) => panic!("expected an error containing {expected:?}"),
+        Err(e) => {
+            let text = e.to_string();
+            assert!(
+                text.contains(expected),
+                "expected {expected:?}, got {text:?}"
+            );
+        }
+    }
+}
+
+/// F2: verification uses the trust store each node and handle was opened with,
+/// never one handed in with the call.
+#[test]
+fn install_requires_the_node_and_handle_trust_store() -> Result<()> {
+    let f = fixture(Role::Secondary, false)?;
+    let handle = f.survivor_handle()?;
+    let mut replacement = f.replacement()?;
+    bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
+    let (successor_journal, proof) = successor_proof(&f, "successor-journal")?;
+    let successor = proof.request().clone();
+    let live = authorities(&f, &successor_journal);
+    handle.install_successor("fixture", &successor, &live)?;
+    drop(replacement);
+
+    // A replacement configured with no transition trust at all.
+    let mut untrusted = Node::open(
+        &f.replacement_path,
+        Role::Secondary,
+        f.identity.clone(),
+        "fixture",
+        StockSchema,
+    )?;
+    assert_err_contains(
+        install_replacement(
+            &mut untrusted,
+            &f.certificate,
+            &f.certificate_token,
+            &successor,
+            &live,
+        ),
+        "requires transition trust",
+    );
+    assert_eq!(node_install_state(&untrusted)?.0, None);
+    drop(untrusted);
+
+    // A replacement configured with a trust store that does not know the signer.
+    let foreign = transition::TrustStore {
+        profile: f.trust.profile.clone(),
+        keys: Vec::new(),
+        max_lifetime: f.trust.max_lifetime,
+    };
+    let mut wrong = Node::open_with_transition_trust(
+        &f.replacement_path,
+        Role::Secondary,
+        f.identity.clone(),
+        "fixture",
+        StockSchema,
+        foreign.clone(),
+    )?;
+    assert!(install_replacement(
+        &mut wrong,
+        &f.certificate,
+        &f.certificate_token,
+        &successor,
+        &live,
+    )
+    .is_err());
+    assert_eq!(node_install_state(&wrong)?.0, None);
+    drop(wrong);
+
+    // A handle opened under a foreign trust store cannot even validate.
+    drop(handle);
+    assert!(LossSurvivorHandle::<StockSchema>::open_existing(
+        &f.survivor_path,
+        f.identity.clone(),
+        "fixture",
+        StockSchema,
+        &foreign,
+        &f.journal,
+        f.gate.as_ref(),
+    )
+    .is_err());
+
+    // The genuine configuration still installs.
+    let handle = f.survivor_handle()?;
+    let mut replacement = f.replacement()?;
+    install_replacement(
+        &mut replacement,
+        &f.certificate,
+        &f.certificate_token,
+        &successor,
+        &live,
+    )?;
+    assert!(node_install_state(&replacement)?.0.is_some());
+    drop(replacement);
+    drop(handle);
+    Ok(())
+}
+
+/// F4: an in-flight compaction or pending certified maintenance must be
+/// resolved before the irreversible install, not discovered afterwards.
+#[test]
+fn survivor_install_requires_maintenance_idle() -> Result<()> {
+    let f = fixture(Role::Secondary, false)?;
+    let survivor_path = f.survivor_path.clone();
+    let plan_json: String = {
+        let db = Vesta::open_read_only_with_passphrase(&survivor_path, "fixture")?;
+        db.with_connection(|c| {
+            c.query_row(
+                "SELECT plan FROM node_compaction_history ORDER BY sequence DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+        })?
+    };
+    let progress = compaction::Progress {
+        plan: serde_json::from_str(&plan_json)?,
+        phase: compaction::Phase::Prepared,
+    };
+    tamper(
+        &survivor_path,
+        &format!(
+            "CREATE TABLE IF NOT EXISTS node_compaction(id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL,digest TEXT NOT NULL);
+             INSERT INTO node_compaction VALUES(1,'{}','{}');",
+            serde_json::to_string(&progress)?.replace('\'', "''"),
+            hash(&progress)?
+        ),
+    )?;
+    // Either reason is fail-closed: the point is that an unfinished compaction
+    // record stops the install before it becomes irreversible.
+    assert_err_contains(f.survivor_handle(), "compaction");
+    tamper(&survivor_path, "DROP TABLE node_compaction")?;
+    f.survivor_handle()?;
+
+    tamper(
+        &survivor_path,
+        "CREATE TABLE node_pending_certified_maintenance(id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL)",
+    )?;
+    assert_err_contains(f.survivor_handle(), "pending certified maintenance");
+    tamper(
+        &survivor_path,
+        "DROP TABLE node_pending_certified_maintenance",
+    )?;
+    f.survivor_handle()?;
+    Ok(())
+}
+
+/// F7: a view carrying a participant-loss table name is never evidence.
+#[test]
+fn shadowed_participant_loss_table_is_refused() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let identity = stock_entry().batch.identity;
+    let path = dir.path().join("plain");
+    let node = Node::open(
+        &path,
+        Role::Primary,
+        identity.clone(),
+        "fixture",
+        StockSchema,
+    )?;
+    assert!(node.checkpoint().is_ok());
+    drop(node);
+    tamper(
+        &path,
+        "CREATE VIEW recovery_loss_active AS SELECT 1 AS id, '{}' AS record",
+    )?;
+    assert_err_contains(
+        Node::<StockSchema>::open(
+            &path,
+            Role::Primary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+        ),
+        "shadowed",
+    );
+    tamper(&path, "DROP VIEW recovery_loss_active")?;
+    tamper(
+        &path,
+        "CREATE VIEW recovery_loss_completion AS SELECT 1 AS id, '[]' AS receipt",
+    )?;
+    assert_err_contains(
+        Node::<StockSchema>::open(
+            &path,
+            Role::Primary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+        ),
+        "shadowed",
+    );
+    tamper(&path, "DROP VIEW recovery_loss_completion")?;
+    Node::<StockSchema>::open(&path, Role::Primary, identity, "fixture", StockSchema)?;
+    Ok(())
+}
+
+/// Copy a whole encrypted database, including its metadata and any write-ahead
+/// log, over another path.
+fn swap_database(from: &Path, to: &Path) -> Result<()> {
+    let with = |path: &Path, suffix: &str| -> PathBuf {
+        let mut raw = path.as_os_str().to_owned();
+        raw.push(suffix);
+        PathBuf::from(raw)
+    };
+    for suffix in ["", "-wal", "-shm"] {
+        let target = with(to, suffix);
+        if target.exists() {
+            std::fs::remove_file(&target)?;
+        }
+        let source = with(from, suffix);
+        if source.exists() {
+            std::fs::copy(&source, &target)?;
+        }
+    }
+    std::fs::copy(meta_of(from), meta_of(to))?;
+    Ok(())
+}
+
+/// Adversarial: one node installed, the other rolled back to a copy of itself
+/// taken before the bootstrap, and an old successor journal replayed after the
+/// completion. Nothing may be granted in either case.
+#[test]
+fn stale_peer_copy_and_replayed_successor_journal_grant_nothing() -> Result<()> {
+    let f = fixture(Role::Secondary, false)?;
+    let replacement_path = f.replacement_path.clone();
+    let stale = f.dir.path().join("replacement-before-bootstrap");
+    swap_database(&replacement_path, &stale)?;
+
+    let handle = f.survivor_handle()?;
+    let mut replacement = f.replacement()?;
+    bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
+    let (successor_journal, proof) = successor_proof(&f, "successor-journal")?;
+    let successor = proof.request().clone();
+    let live = authorities(&f, &successor_journal);
+    handle.install_successor("fixture", &successor, &live)?;
+    drop(replacement);
+
+    // Roll the replacement back to its pre-bootstrap state: the survivor is
+    // installed, the replacement is empty again. Nothing may be acknowledged.
+    swap_database(&stale, &replacement_path)?;
+    let rolled_back = f.replacement()?;
+    assert!(complete_successor(&handle, &rolled_back, &successor, COMPLETION, &live).is_err());
+    assert_eq!(
+        successor_journal
+            .fetch_loss_successor(&successor, &f.trust.as_trust(), f.gate.as_ref())?
+            .acknowledgements(),
+        [false; 2]
+    );
+    drop(rolled_back);
+    drop(handle);
+
+    // The rolled-back copy still carries the signed generation, so the ordinary
+    // flow simply runs again on it and finishes for real.
+    let handle = f.survivor_handle()?;
+    let mut replacement = f.replacement()?;
+    bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
+    install_replacement(
+        &mut replacement,
+        &f.certificate,
+        &f.certificate_token,
+        &successor,
+        &live,
+    )?;
+    let journal_path = f.dir.path().join("successor-journal");
+    let before_second_ack = f.dir.path().join("successor-journal-old");
+    // Snapshot the authority before either acknowledgement.
+    swap_database(&journal_path, &before_second_ack)?;
+    complete_successor(&handle, &replacement, &successor, COMPLETION, &live)?;
+    drop(replacement);
+    drop(handle);
+
+    f.live
+        .attach_successor(successor_journal_handle(&f, "successor-journal")?)?;
+    let survivor_node = open_with_authority(&f, &f.survivor_path, Role::Primary)?;
+    let replacement_node = open_with_authority(&f, &f.replacement_path, Role::Secondary)?;
+    record_completion(&survivor_node)?;
+    record_completion(&replacement_node)?;
+    assert!(survivor_node.checkpoint().is_ok());
+    assert!(replacement_node.checkpoint().is_ok());
+
+    // Replay the pre-acknowledgement journal over the live one. Admission
+    // follows the live authority, so both nodes close again immediately.
+    drop(survivor_node);
+    drop(replacement_node);
+    f.live.detach_successor()?;
+    swap_database(&before_second_ack, &journal_path)?;
+    f.live
+        .attach_successor(successor_journal_handle(&f, "successor-journal")?)?;
+    let survivor_node = open_with_authority(&f, &f.survivor_path, Role::Primary)?;
+    let replacement_node = open_with_authority(&f, &f.replacement_path, Role::Secondary)?;
+    // The live authority no longer has the acknowledgements, so admission
+    // closes on both nodes even though their local receipts are still durable.
+    assert_err_contains(survivor_node.checkpoint(), "acknowledgements incomplete");
+    assert_err_contains(replacement_node.checkpoint(), "acknowledgements incomplete");
+    // Nor can the rolled-back authority be talked into a fresh completion for a
+    // membership whose local receipts already exist.
+    assert_err_contains(
+        record_completion(&survivor_node),
+        "acknowledgements incomplete",
+    );
     drop(survivor_node);
     drop(replacement_node);
     drop(f);

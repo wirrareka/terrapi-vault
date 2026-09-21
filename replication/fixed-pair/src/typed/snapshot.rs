@@ -593,11 +593,18 @@ impl<A: ReplicatedSchema> Node<A> {
     /// successor membership is signed against exactly this generation; a random
     /// one would make that signed installation contract unsatisfiable. Never
     /// `pub`: no application caller may choose an admission generation.
+    ///
+    /// Uniqueness is not weakened. The value is not chosen by the caller of the
+    /// recovery: the bootstrap pre-check requires the still-empty replacement to
+    /// already carry it, and that value was produced by `fresh_generation` when
+    /// the file was created, exactly as in the ordinary flow. This entry only
+    /// preserves it across the restore instead of rolling it again.
     pub(super) fn finish_snapshot_retaining_generation(
         &mut self,
         manifest: &Manifest,
         generation: [u8; 32],
     ) -> Result<Prefix> {
+        ensure(generation != [0; 32], "zero admission generation")?;
         self.finish_snapshot_installing(manifest, Some(generation))
     }
     fn finish_snapshot_installing(

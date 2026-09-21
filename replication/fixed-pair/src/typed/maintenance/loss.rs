@@ -3,6 +3,7 @@
 use super::*;
 use crate::recovery::transition;
 use sha2::{Digest, Sha256};
+#[cfg(any(test, feature = "experimental-recovery"))]
 use std::{
     fs::OpenOptions,
     os::unix::fs::MetadataExt,
@@ -15,9 +16,11 @@ mod tests;
 /// Singleton install marker. It is inert evidence of a decided successor
 /// membership; it never opens admission (I6) and is only ever written once.
 const INSTALL_TABLE: &str = "recovery_loss_active";
-const INSTALL_DDL: &str = "CREATE TABLE IF NOT EXISTS recovery_loss_active(\
+#[cfg(any(test, feature = "experimental-recovery"))]
+const INSTALL_DDL: &str = "CREATE TABLE IF NOT EXISTS main.recovery_loss_active(\
      id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL)";
 const INSTALL_LIMIT: usize = 64 * 1024;
+#[cfg(any(test, feature = "experimental-recovery"))]
 /// Recovery metadata a certified survivor legitimately carries: its membership
 /// came from a completed recovery. Anything else under `recovery_` fails closed.
 const SURVIVOR_RECOVERY_TABLES: &[&str] = &[
@@ -29,27 +32,30 @@ const SURVIVOR_RECOVERY_TABLES: &[&str] = &[
     "recovery_loss_completion",
     "recovery_seal",
 ];
+#[cfg(any(test, feature = "experimental-recovery"))]
 /// A bootstrap replacement has no recovery history of its own.
 const REPLACEMENT_RECOVERY_TABLES: &[&str] = &["recovery_loss_active", "recovery_loss_completion"];
 /// Singleton local completion receipt. Only its presence *together with* a live
 /// completed-successor proof can reopen ordinary admission (I6).
 const COMPLETION_TABLE: &str = "recovery_loss_completion";
-const COMPLETION_DDL: &str = "CREATE TABLE IF NOT EXISTS recovery_loss_completion(\
+#[cfg(any(test, feature = "experimental-recovery"))]
+const COMPLETION_DDL: &str = "CREATE TABLE IF NOT EXISTS main.recovery_loss_completion(\
      id INTEGER PRIMARY KEY CHECK(id=1),receipt TEXT NOT NULL)";
 /// The single error every closed participant-loss path reports.
 pub(super) const CLOSED: &str = "participant-loss recovery not complete; data admission closed";
 /// Entry points this release keeps shut on a loss-recovered node.
 pub(super) const RETIRED: &str = "closed after participant-loss recovery in this release";
 
+#[cfg(any(test, feature = "experimental-recovery"))]
 /// The live authorities every loss entry point must consult before and after
 /// its durable step (I2). Borrowed, so nothing is cached across a call.
 pub struct Authorities<'a, P: transition::LossPolicy> {
     pub source: &'a transition::Journal,
     pub successor: &'a transition::Journal,
-    pub trust: &'a transition::TrustStore,
     pub policy: &'a P,
 }
 
+#[cfg(any(test, feature = "experimental-recovery"))]
 /// Everything `validate` derives from signed evidence. The survivor role is a
 /// result, never a parameter: it exists only inside this module and is rebuilt
 /// from the durable certificate on every validation.
@@ -81,6 +87,7 @@ pub(crate) struct Installed {
     publication: [u8; 32],
 }
 
+#[cfg(any(test, feature = "experimental-recovery"))]
 /// Restricted capability: it owns the normal node lock, opens SQLite read-only,
 /// and exposes only the exact loss-bound frozen publication. The installer
 /// opens a second, read-write connection to the same file for the duration of
@@ -89,6 +96,9 @@ pub struct LossSurvivorHandle<A: ReplicatedSchema> {
     db: Vesta,
     adapter: A,
     initial: String,
+    /// Bound once at `open_existing`. Every later verification uses this store
+    /// and never one supplied per call.
+    trust: transition::TrustStore,
     identity: Identity<SchemaId>,
     /// Derived by [`validate`] from the signed loss decision and the certificate.
     role: Role,
@@ -102,6 +112,7 @@ pub struct LossSurvivorHandle<A: ReplicatedSchema> {
     _lock: std::fs::File,
 }
 
+#[cfg(any(test, feature = "experimental-recovery"))]
 impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
     pub fn open_existing(
         path: impl AsRef<Path>,
@@ -143,6 +154,7 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
             db,
             adapter,
             initial,
+            trust: trust.clone(),
             identity,
             role: evidence.role,
             contract,
@@ -157,10 +169,9 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
     pub fn manifest(
         &self,
         journal: &crate::recovery::transition::Journal,
-        trust: &crate::recovery::transition::TrustStore,
         policy: &impl crate::recovery::transition::LossPolicy,
     ) -> Result<snapshot::Manifest> {
-        self.revalidate(journal, trust, policy)?;
+        self.revalidate(journal, policy)?;
         Ok(self.manifest.clone())
     }
 
@@ -168,10 +179,9 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
         &self,
         position: u64,
         journal: &crate::recovery::transition::Journal,
-        trust: &crate::recovery::transition::TrustStore,
         policy: &impl crate::recovery::transition::LossPolicy,
     ) -> Result<snapshot::Page> {
-        self.revalidate(journal, trust, policy)?;
+        self.revalidate(journal, policy)?;
         ensure(position < self.manifest.pages, "loss page out of range")?;
         self.db.with_connection(|c| {
             Ok((|| -> Result<snapshot::Page> {
@@ -193,10 +203,9 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
     fn revalidate(
         &self,
         journal: &crate::recovery::transition::Journal,
-        trust: &crate::recovery::transition::TrustStore,
         policy: &impl crate::recovery::transition::LossPolicy,
     ) -> Result<()> {
-        let loss = journal.fetch_loss(&trust.as_trust(), policy)?;
+        let loss = journal.fetch_loss(&self.trust.as_trust(), policy)?;
         ensure(loss.request() == &self.request, "loss decision changed")?;
         self.db.with_connection(|c| {
             Ok((|| -> Result<()> {
@@ -205,7 +214,7 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
                 // durably installed — the role that record commits it to.
                 let owner = survivor_owner_role(c, &self.request, self.role)?;
                 let identities: Vec<String> = c
-                    .prepare("SELECT value FROM node_identity")?
+                    .prepare("SELECT value FROM main.node_identity")?
                     .query_map([], |r| r.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
                 ensure(
@@ -236,8 +245,8 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
         successor: &transition::LossSuccessorRequest,
         authorities: &Authorities<'_, P>,
     ) -> Result<Installed> {
-        let trust = authorities.trust;
-        self.revalidate(authorities.source, trust, authorities.policy)?;
+        let trust = &self.trust;
+        self.revalidate(authorities.source, authorities.policy)?;
         let loss = authorities
             .source
             .fetch_loss(&trust.as_trust(), authorities.policy)?;
@@ -294,7 +303,7 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
         successor: &transition::LossSuccessorRequest,
         authorities: &Authorities<'_, P>,
     ) -> Result<()> {
-        let trust = authorities.trust;
+        let trust = &self.trust;
         let policy = authorities.policy;
         let source_journal = authorities.source;
         let successor_journal = authorities.successor;
@@ -354,7 +363,10 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
                 }
                 tx.execute_batch(INSTALL_DDL)?;
                 ensure(
-                    tx.execute("INSERT INTO recovery_loss_active VALUES(1,?1)", [&expected])? == 1,
+                    tx.execute(
+                        "INSERT INTO main.recovery_loss_active VALUES(1,?1)",
+                        [&expected],
+                    )? == 1,
                     "loss install write failed",
                 )?;
                 let after = validate::<A>(
@@ -398,24 +410,31 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
         })?;
         drop(rw);
         outcome?;
-        // Full revalidation through the retained read-only connection, then a
-        // live authority check on both journals.
-        let evidence = self.db.with_connection(|c| {
-            Ok(validate::<A>(
-                c,
-                &self.adapter,
-                &self.identity,
-                &self.contract,
-                &self.initial,
-                trust,
-                &self.request,
-            ))
+        // Full revalidation through the retained read-only connection. That
+        // connection still points at the inode validated at `open_existing`, so
+        // requiring the exact record bytes here also catches a database swapped
+        // in around the read-write open: the write would have landed elsewhere.
+        let (evidence, durable) = self.db.with_connection(|c| {
+            Ok((|| -> Result<(Evidence, Option<String>)> {
+                let evidence = validate::<A>(
+                    c,
+                    &self.adapter,
+                    &self.identity,
+                    &self.contract,
+                    &self.initial,
+                    trust,
+                    &self.request,
+                )?;
+                Ok((evidence, read_install(c)?.map(|(json, _)| json)))
+            })())
         })??;
         ensure(
-            evidence.role == self.role && evidence.manifest == self.manifest,
+            evidence.role == self.role
+                && evidence.manifest == self.manifest
+                && durable.as_deref() == Some(expected.as_str()),
             "loss install revalidation mismatch",
         )?;
-        self.revalidate(source_journal, trust, policy)?;
+        self.revalidate(source_journal, policy)?;
         successor_journal.fetch_loss_successor(successor, &trust.as_trust(), policy)?;
         Ok(())
     }
@@ -423,35 +442,75 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
 
 fn owner_row(c: &Connection) -> Result<String> {
     let identities: Vec<String> = c
-        .prepare("SELECT value FROM node_identity")?
+        .prepare("SELECT value FROM main.node_identity")?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     ensure(identities.len() == 1, "loss owner row mismatch")?;
     Ok(identities.into_iter().next().ok_or("loss owner row")?)
 }
 
+/// Schema lookups are always qualified to `main`, so a TEMP object can never
+/// shadow a participant-loss table.
 fn table_exists(c: &Connection, name: &str) -> Result<bool> {
     Ok(c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+        "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name=?1)",
         [name],
         |r| r.get(0),
     )?)
 }
 
+/// Bounded singleton read: the row count and the largest record are measured
+/// before any record is materialised.
+fn singleton(c: &Connection, table: &str, column: &str, limit: usize) -> Result<Option<String>> {
+    if !table_exists(c, table)? {
+        return Ok(None);
+    }
+    let (rows, longest): (u64, u64) = c.query_row(
+        &format!(
+            "SELECT count(*),coalesce(max(length(CAST({column} AS BLOB))),0) FROM main.{table}"
+        ),
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    ensure(
+        rows == 1 && longest <= limit as u64,
+        "participant-loss singleton mismatch",
+    )?;
+    let (id, value): (u32, String) = c.query_row(
+        &format!("SELECT id,{column} FROM main.{table} LIMIT 2"),
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    ensure(id == 1, "participant-loss singleton mismatch")?;
+    Ok(Some(value))
+}
+
+/// The `recovery_*` tables this node kind may legitimately carry: the survivor
+/// is participant 0 of the successor membership, the replacement participant 1.
+#[cfg(any(test, feature = "experimental-recovery"))]
+fn recovery_tables_for(record: &Installed) -> Result<&'static [&'static str]> {
+    Ok(if successor_index(record)? == 0 {
+        SURVIVOR_RECOVERY_TABLES
+    } else {
+        REPLACEMENT_RECOVERY_TABLES
+    })
+}
+
+#[cfg(any(test, feature = "experimental-recovery"))]
 /// Only the recovery metadata this kind of node is allowed to carry may exist.
 /// An unexpected `recovery_*` table — including a completion record this slice
 /// never writes — fails closed instead of being ignored.
 fn ensure_recovery_tables(c: &Connection, allowed: &[&str]) -> Result<()> {
-    let present: Vec<String> = c
+    let present: Vec<(String, String)> = c
         .prepare(
-            "SELECT name FROM sqlite_schema WHERE type='table' \
-             AND name LIKE 'recovery\\_%' ESCAPE '\\' ORDER BY name",
+            "SELECT type,name FROM main.sqlite_schema \
+             WHERE name LIKE 'recovery\\_%' ESCAPE '\\' ORDER BY type,name",
         )?
-        .query_map([], |r| r.get(0))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    for name in present {
+    for (kind, name) in present {
         ensure(
-            allowed.contains(&name.as_str()),
+            kind == "table" && allowed.contains(&name.as_str()),
             "unexpected recovery state",
         )?;
     }
@@ -461,18 +520,9 @@ fn ensure_recovery_tables(c: &Connection, allowed: &[&str]) -> Result<()> {
 /// The singleton install record, with the size and shape caps of I9. More than
 /// one row, a wrong id or an oversized record is a conflict, never a repair.
 fn read_install(c: &Connection) -> Result<Option<(String, Installed)>> {
-    if !table_exists(c, INSTALL_TABLE)? {
+    let Some(json) = singleton(c, INSTALL_TABLE, "record", INSTALL_LIMIT)? else {
         return Ok(None);
-    }
-    let rows: Vec<(u32, String)> = c
-        .prepare("SELECT id,record FROM recovery_loss_active ORDER BY id")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    ensure(
-        rows.len() == 1 && rows[0].0 == 1 && rows[0].1.len() <= INSTALL_LIMIT,
-        "loss install row mismatch",
-    )?;
-    let json = rows.into_iter().next().ok_or("loss install row")?.1;
+    };
     let record: Installed = serde_json::from_str(&json)?;
     ensure(record.format == 1, "loss install format")?;
     Ok(Some((json, record)))
@@ -500,6 +550,7 @@ fn successor_binds(
         && successor.participants[1].generation == loss.replacement_generation
 }
 
+#[cfg(any(test, feature = "experimental-recovery"))]
 /// Installation-aware owner expectation for a survivor file. The pre-loss role
 /// always comes from signed evidence (I1) and is never an input; a durable
 /// install may additionally have promoted the owner row, and only then must the
@@ -528,6 +579,7 @@ fn survivor_owner_role(
     Ok(record.installed_role)
 }
 
+#[cfg(any(test, feature = "experimental-recovery"))]
 /// The role the replacement inherits, derived from the signed source
 /// certificate named by the signed loss decision. The certificate is pinned by
 /// `source_certificate` + `source_token_digest`, so a caller cannot substitute
@@ -571,6 +623,7 @@ fn replacement_role(
     })
 }
 
+#[cfg(any(test, feature = "experimental-recovery"))]
 /// Durable installation of the same signed successor membership on the
 /// replacement, which takes over the lost member's role. It depends only on
 /// signed data, this node and the journals: in production the survivor is a
@@ -582,7 +635,13 @@ pub fn install_replacement<A: ReplicatedSchema, P: transition::LossPolicy>(
     successor: &transition::LossSuccessorRequest,
     authorities: &Authorities<'_, P>,
 ) -> Result<()> {
-    let trust = authorities.trust;
+    // The replacement verifies under the trust store it was configured with,
+    // never one handed in with the call.
+    let trust = replacement
+        .transition_trust
+        .clone()
+        .ok_or("participant-loss replacement requires transition trust")?;
+    let trust = &trust;
     let policy = authorities.policy;
     let loss = authorities.source.fetch_loss(&trust.as_trust(), policy)?;
     let proof = authorities
@@ -674,7 +733,10 @@ pub fn install_replacement<A: ReplicatedSchema, P: transition::LossPolicy>(
         }
         tx.execute_batch(INSTALL_DDL)?;
         ensure(
-            tx.execute("INSERT INTO recovery_loss_active VALUES(1,?1)", [&expected])? == 1,
+            tx.execute(
+                "INSERT INTO main.recovery_loss_active VALUES(1,?1)",
+                [&expected],
+            )? == 1,
             "loss install write failed",
         )?;
         if installed_role != Role::Secondary {
@@ -740,6 +802,7 @@ pub fn install_replacement<A: ReplicatedSchema, P: transition::LossPolicy>(
     Ok(())
 }
 
+#[cfg(any(test, feature = "experimental-recovery"))]
 /// Local bridge for a co-located pair: survivor first, then replacement.
 /// In production the two installs run on their own machines against their own
 /// journals; neither depends on the other's object.
@@ -762,6 +825,7 @@ pub fn install_pair<A: ReplicatedSchema, P: transition::LossPolicy>(
     )
 }
 
+#[cfg(any(test, feature = "experimental-recovery"))]
 /// Idempotently transfer the exact loss-bound publication into an empty
 /// replacement. The replacement stays a normal non-primary bootstrap node;
 /// this function neither installs membership nor grants admission.
@@ -775,7 +839,6 @@ pub fn bootstrap_replacement<A: ReplicatedSchema>(
     survivor: &LossSurvivorHandle<A>,
     replacement: &mut Node<A>,
     journal: &crate::recovery::transition::Journal,
-    trust: &crate::recovery::transition::TrustStore,
     policy: &impl crate::recovery::transition::LossPolicy,
 ) -> Result<Prefix> {
     ensure(
@@ -787,10 +850,10 @@ pub fn bootstrap_replacement<A: ReplicatedSchema>(
         generation == survivor.request.replacement_generation,
         "loss replacement generation mismatch",
     )?;
-    let manifest = survivor.manifest(journal, trust, policy)?;
+    let manifest = survivor.manifest(journal, policy)?;
     let mut next = replacement.begin_snapshot(&manifest)?;
     while next < manifest.pages {
-        let page = survivor.page(next, journal, trust, policy)?;
+        let page = survivor.page(next, journal, policy)?;
         next = replacement.receive_snapshot(&page)?;
     }
     let checkpoint = replacement
@@ -807,10 +870,11 @@ pub fn bootstrap_replacement<A: ReplicatedSchema>(
     )?;
     // One final live fencing check after the durable restore, so a successful
     // return cannot race authority revocation at the last page boundary.
-    survivor.revalidate(journal, trust, policy)?;
+    survivor.revalidate(journal, policy)?;
     Ok(checkpoint)
 }
 
+#[cfg(any(test, feature = "experimental-recovery"))]
 /// Read-only precondition for the future atomic local membership install.
 /// The opaque proof is intentionally consumed only as installation authority;
 /// it is not a completed writer capability and this function performs no ACK.
@@ -819,10 +883,9 @@ pub fn validate_successor_installation<A: ReplicatedSchema>(
     replacement: &Node<A>,
     proof: &crate::recovery::transition::CommittedLossSuccessorTransition,
     source_journal: &crate::recovery::transition::Journal,
-    trust: &crate::recovery::transition::TrustStore,
     policy: &impl crate::recovery::transition::LossPolicy,
 ) -> Result<()> {
-    survivor.revalidate(source_journal, trust, policy)?;
+    survivor.revalidate(source_journal, policy)?;
     let request = proof.request();
     let loss = proof.loss_request();
     ensure(
@@ -867,6 +930,7 @@ pub fn validate_successor_installation<A: ReplicatedSchema>(
     })
 }
 
+#[cfg(any(test, feature = "experimental-recovery"))]
 pub(super) fn validate<A: ReplicatedSchema>(
     c: &Connection,
     adapter: &A,
@@ -877,7 +941,7 @@ pub(super) fn validate<A: ReplicatedSchema>(
     loss: &crate::recovery::transition::LossRequest,
 ) -> Result<Evidence> {
     let identities: Vec<String> = c
-        .prepare("SELECT value FROM node_identity")?
+        .prepare("SELECT value FROM main.node_identity")?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     // The owner row is compared once the role has been derived from signed
@@ -894,6 +958,15 @@ pub(super) fn validate<A: ReplicatedSchema>(
     let history = history_format(c, runtime[0].0)?;
     recovery::verify_history(c, history)?;
     verify_certified(c, Some(trust))?;
+    // An in-flight compaction or a pending certified maintenance transaction
+    // would be wedged for ever once the loss gates close, so it must be
+    // resolved *before* the irreversible install, not discovered afterwards.
+    compaction::require_idle(c)?;
+    ensure(
+        !table_exists(c, "node_pending_certified_maintenance")?
+            && !table_exists(c, "node_pending_certified_progress")?,
+        "loss survivor has pending certified maintenance",
+    )?;
     capacity::verify_schema(c)?;
     capacity::verify_accounting(c)?;
     schema_contract::verify(c, adapter, contract)?;
@@ -1003,18 +1076,9 @@ fn completion_receipt(record: &Installed, completion: [u8; 32]) -> Result<String
 }
 
 fn read_completion(c: &Connection) -> Result<Option<String>> {
-    if !table_exists(c, COMPLETION_TABLE)? {
+    let Some(json) = singleton(c, COMPLETION_TABLE, "receipt", INSTALL_LIMIT)? else {
         return Ok(None);
-    }
-    let rows: Vec<(u32, String)> = c
-        .prepare("SELECT id,receipt FROM recovery_loss_completion ORDER BY id")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    ensure(
-        rows.len() == 1 && rows[0].0 == 1 && rows[0].1.len() <= INSTALL_LIMIT,
-        "participant-loss completion row mismatch",
-    )?;
-    let json = rows.into_iter().next().ok_or("completion row")?.1;
+    };
     let receipt: CompletionReceipt = serde_json::from_str(&json)?;
     ensure(
         receipt.0 == 1 && receipt.4 != [0; 32],
@@ -1027,6 +1091,15 @@ fn read_completion(c: &Connection) -> Result<Option<String>> {
 /// ways. `None` means this is an ordinary node and every caller must behave
 /// exactly as it did before participant-loss recovery existed.
 pub(crate) fn state(c: &Connection) -> Result<Option<Installed>> {
+    // A view, trigger or index carrying a participant-loss table name is never
+    // acceptable evidence, whatever it would return.
+    let shadows: u64 = c.query_row(
+        "SELECT count(*) FROM main.sqlite_schema \
+         WHERE type<>'table' AND name IN ('recovery_loss_active','recovery_loss_completion')",
+        [],
+        |r| r.get(0),
+    )?;
+    ensure(shadows == 0, "participant-loss table shadowed")?;
     let record = read_install(c)?.map(|(_, record)| record);
     ensure(
         record.is_some() || !table_exists(c, COMPLETION_TABLE)?,
@@ -1145,10 +1218,15 @@ pub(crate) fn require_no_loss_recovery(c: &Connection) -> Result<()> {
     ensure(state(c)?.is_none(), RETIRED)
 }
 
+#[cfg(any(test, feature = "experimental-recovery"))]
 /// Durable local completion evidence, written on the ordinary `Node` (the
 /// survivor's read-write install handle is dropped before this runs). Exact
 /// retry converges; a different completion is a conflict, never a repair.
 pub fn record_completion<A: ReplicatedSchema>(node: &Node<A>) -> Result<()> {
+    ensure(
+        node.transition_trust.is_some(),
+        "participant-loss completion requires transition trust",
+    )?;
     node.connection(|c| {
         let tx = Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
         let record = state(&tx)?.ok_or("participant-loss recovery is not installed")?;
@@ -1158,6 +1236,7 @@ pub fn record_completion<A: ReplicatedSchema>(node: &Node<A>) -> Result<()> {
             "participant-loss role mismatch",
         )?;
         validate_installed(&tx, &node.identity, node.role, &record)?;
+        ensure_recovery_tables(&tx, recovery_tables_for(&record)?)?;
         let authority = node
             .certified_authority
             .as_deref()
@@ -1184,7 +1263,7 @@ pub fn record_completion<A: ReplicatedSchema>(node: &Node<A>) -> Result<()> {
         tx.execute_batch(COMPLETION_DDL)?;
         ensure(
             tx.execute(
-                "INSERT INTO recovery_loss_completion VALUES(1,?1)",
+                "INSERT INTO main.recovery_loss_completion VALUES(1,?1)",
                 [&receipt],
             )? == 1,
             "participant-loss completion write failed",
@@ -1201,11 +1280,23 @@ pub fn record_completion<A: ReplicatedSchema>(node: &Node<A>) -> Result<()> {
     })
 }
 
+#[cfg(any(test, feature = "experimental-recovery"))]
 /// Live read of the replacement's durable install, repeating the state checks
 /// `install_replacement` made. Used only as acknowledgement evidence (I7).
-fn replacement_installed<A: ReplicatedSchema>(node: &Node<A>) -> Result<Installed> {
+fn replacement_installed<A: ReplicatedSchema>(
+    node: &Node<A>,
+    source_scope: &transition::JournalScope,
+) -> Result<Installed> {
+    ensure(
+        node.transition_trust.is_some(),
+        "participant-loss evidence requires transition trust",
+    )?;
     node.connection(|c| {
         let record = state(c)?.ok_or("participant-loss replacement install missing")?;
+        ensure(
+            record.source_scope == *source_scope,
+            "participant-loss source scope mismatch",
+        )?;
         ensure(
             node.role == record.installed_role && record.previous_role == Role::Secondary,
             "participant-loss replacement role mismatch",
@@ -1240,10 +1331,12 @@ fn replacement_installed<A: ReplicatedSchema>(node: &Node<A>) -> Result<Installe
     })
 }
 
+#[cfg(any(test, feature = "experimental-recovery"))]
 impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
     /// Live read of the survivor's durable install through the retained
     /// read-only connection, re-running the full evidence validation.
-    fn installed(&self, trust: &transition::TrustStore) -> Result<Installed> {
+    fn installed(&self, source_scope: &transition::JournalScope) -> Result<Installed> {
+        let trust = &self.trust;
         self.db.with_connection(|c| {
             Ok((|| -> Result<Installed> {
                 let evidence = validate::<A>(
@@ -1261,6 +1354,10 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
                 )?;
                 let record = state(c)?.ok_or("participant-loss survivor install missing")?;
                 ensure(
+                    record.source_scope == *source_scope,
+                    "participant-loss source scope mismatch",
+                )?;
+                ensure(
                     record.previous_role == self.role,
                     "participant-loss survivor role mismatch",
                 )?;
@@ -1272,16 +1369,17 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
     }
 }
 
+#[cfg(any(test, feature = "experimental-recovery"))]
 /// I7: fixed-pair acknowledges a participant only after live-reading **both**
 /// durable installs from the actual node databases. Every other decision is
 /// delegated to the external policy unchanged.
 struct InstalledParticipants<'a, A: ReplicatedSchema, P: transition::LossPolicy> {
     survivor: &'a LossSurvivorHandle<A>,
     replacement: &'a Node<A>,
-    trust: &'a transition::TrustStore,
     policy: &'a P,
 }
 
+#[cfg(any(test, feature = "experimental-recovery"))]
 impl<A: ReplicatedSchema, P: transition::LossPolicy> transition::LossPolicy
     for InstalledParticipants<'_, A, P>
 {
@@ -1308,14 +1406,16 @@ impl<A: ReplicatedSchema, P: transition::LossPolicy> transition::LossPolicy
     }
     fn loss_successor_applied(
         &self,
-        _source_scope: &transition::JournalScope,
+        source_scope: &transition::JournalScope,
         loss: &transition::LossRequest,
         successor: &transition::LossSuccessorRequest,
         participant: &transition::Participant,
     ) -> terrapi_vesta_recovery::Result<()> {
-        // Both installs must be durable, whichever participant is acknowledged.
-        let survivor = self.survivor.installed(self.trust)?;
-        let replacement = replacement_installed(self.replacement)?;
+        // Both installs must be durable, whichever participant is acknowledged,
+        // and both must have been installed under exactly the source journal
+        // scope this successor journal records as its parent.
+        let survivor = self.survivor.installed(source_scope)?;
+        let replacement = replacement_installed(self.replacement, source_scope)?;
         let [first, second] = &successor.participants;
         ensure(
             survivor.loss == *loss
@@ -1332,6 +1432,7 @@ impl<A: ReplicatedSchema, P: transition::LossPolicy> transition::LossPolicy
     }
 }
 
+#[cfg(any(test, feature = "experimental-recovery"))]
 /// Local bridge from two durable installs to a completed successor membership:
 /// acknowledge the survivor, then the replacement, then complete. Every step is
 /// idempotent and converges on retry; a different completion id is refused.
@@ -1343,7 +1444,12 @@ pub fn complete_successor<A: ReplicatedSchema, P: transition::LossPolicy>(
     authorities: &Authorities<'_, P>,
 ) -> Result<()> {
     ensure(completion != [0; 32], "zero participant-loss completion")?;
-    let trust = authorities.trust;
+    // Both nodes must have been configured with the same trust store.
+    ensure(
+        replacement.transition_trust.as_ref() == Some(&survivor.trust),
+        "participant-loss trust mismatch",
+    )?;
+    let trust = &survivor.trust;
     let journal = authorities.successor;
     let decided = journal.fetch_loss_successor(successor, &trust.as_trust(), authorities.policy)?;
     if decided.acknowledgements() != [true; 2] {
@@ -1351,7 +1457,6 @@ pub fn complete_successor<A: ReplicatedSchema, P: transition::LossPolicy>(
         let evidence = InstalledParticipants {
             survivor,
             replacement,
-            trust,
             policy: authorities.policy,
         };
         let decision = journal.fetch_loss_successor(successor, &trust.as_trust(), &evidence)?;
