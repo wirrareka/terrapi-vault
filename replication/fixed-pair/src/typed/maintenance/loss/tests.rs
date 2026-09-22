@@ -203,11 +203,11 @@ fn sign_loss(
     key: &EcdsaKeyPair,
     request: &transition::LossRequest,
     trust: &transition::TrustStore,
+    certificate_id: [u8; 32],
 ) -> Result<String> {
     let header = B64.encode(serde_json::to_vec(&serde_json::json!({
         "alg": "ES256", "kid": "fixture", "typ": transition::LOSS_TOKEN_TYPE
     }))?);
-    let certificate_id = [49u8; 32];
     let claims = B64.encode(serde_json::to_vec(&serde_json::json!({
         "version": 1,
         "iss": trust.profile.issuer,
@@ -361,6 +361,15 @@ fn authorities<'a>(
         successor: successor_journal,
         policy: f.gate.as_ref(),
     }
+}
+
+/// The signed document that founded an ordinary certified pair.
+fn founding(f: &Fixture) -> Founding {
+    Founding::Certificate(f.certificate.clone(), f.certificate_token.clone())
+}
+
+fn crash_founding(f: &CrashFixture) -> Founding {
+    Founding::Certificate(f.certificate.clone(), f.certificate_token.clone())
 }
 
 fn receipt_rows(node: &Node<StockSchema>) -> Result<Vec<String>> {
@@ -568,7 +577,7 @@ fn fixture(lost: Role, tail: bool) -> Result<Fixture> {
     };
     drop(p);
     drop(s);
-    let loss_token = sign_loss(&key, &loss, &trust)?;
+    let loss_token = sign_loss(&key, &loss, &trust, [49; 32])?;
     let committed = journal.decide_loss(
         loss.clone(),
         &loss_token,
@@ -951,16 +960,23 @@ fn loss_export_fails_closed_on_revocation_at_every_boundary() -> Result<()> {
 }
 
 fn successor_scope(f: &Fixture) -> transition::JournalScope {
+    successor_scope_of(f, &f.loss)
+}
+
+/// Scope of the successor journal a given loss decision founds. Every loss in
+/// a lineage founds its own journal, so this is shared by first and later
+/// losses alike.
+fn successor_scope_of(f: &Fixture, loss: &transition::LossRequest) -> transition::JournalScope {
     transition::JournalScope {
-        install: f.loss.install.clone(),
-        region: f.loss.region.clone(),
+        install: loss.install.clone(),
+        region: loss.region.clone(),
         profile: f.trust.profile.clone(),
-        scope: f.loss.scope,
-        schema: f.loss.schema,
-        membership: f.loss.replacement_membership,
-        source_anchor: f.loss.source_cut.clone(),
-        authority_id: f.loss.authority_id,
-        initial_revision: f.loss.revision + 1,
+        scope: loss.scope,
+        schema: loss.schema,
+        membership: loss.replacement_membership,
+        source_anchor: loss.source_cut.clone(),
+        authority_id: loss.authority_id,
+        initial_revision: loss.revision + 1,
     }
 }
 
@@ -985,52 +1001,62 @@ fn successor_request_v1(f: &Fixture) -> transition::LossSuccessorRequest {
 }
 
 fn successor_request_of(f: &Fixture, format: u32) -> transition::LossSuccessorRequest {
+    successor_for(
+        &f.loss,
+        f.loss_certificate_id,
+        f.loss_token_digest,
+        f.survivor_role(),
+        format,
+        [60; 32],
+    )
+}
+
+/// The successor membership a signed loss decision implies, for either format
+/// and whichever role survived. The survivor keeps its pre-loss role and the
+/// replacement takes the lost one, so the canonical `[primary, secondary]`
+/// order of a format-2 request follows directly from the surviving role.
+/// Format 1 always orders `[survivor, replacement]` and names no role at all.
+fn successor_for(
+    loss: &transition::LossRequest,
+    parent_certificate: [u8; 32],
+    parent_token_digest: [u8; 32],
+    survivor_role: Role,
+    format: u32,
+    id: [u8; 32],
+) -> transition::LossSuccessorRequest {
     let replacement = transition::Participant {
-        member: f.loss.replacement_member,
-        generation: f.loss.replacement_generation,
-        old_base: Some(f.loss.survivor_cut.clone()),
-        target: f.loss.survivor_cut.clone(),
-        plan: f.loss.survivor.plan,
-        publication: f.loss.survivor_publication,
+        member: loss.replacement_member,
+        generation: loss.replacement_generation,
+        old_base: Some(loss.survivor_cut.clone()),
+        target: loss.survivor_cut.clone(),
+        plan: loss.survivor.plan,
+        publication: loss.survivor_publication,
     };
-    // Format 1 always orders `[survivor, replacement]`. Format 2 uses the
-    // canonical `[primary, secondary]` order: the survivor keeps its pre-loss
-    // role and the replacement takes the lost one, so the order follows
-    // directly from which role was lost.
-    let survivor_index = u8::from(format == 2 && f.survivor_role() == Role::Secondary);
+    let survivor_index = u8::from(format == 2 && survivor_role == Role::Secondary);
     let participants = if survivor_index == 0 {
-        [f.loss.survivor.clone(), replacement]
+        [loss.survivor.clone(), replacement]
     } else {
-        [replacement, f.loss.survivor.clone()]
+        [replacement, loss.survivor.clone()]
     };
     transition::LossSuccessorRequest {
         format,
-        survivor_index: (format == 2).then_some(survivor_index),
+        id,
+        authority_id: loss.authority_id,
+        revision: loss.revision + 1,
+        install: loss.install.clone(),
+        region: loss.region.clone(),
+        scope: loss.scope,
+        schema: loss.schema,
+        membership: loss.replacement_membership,
+        source_certificate: loss.source_certificate,
+        source_token_digest: loss.source_token_digest,
+        source_cut: loss.source_cut.clone(),
+        parent_loss_certificate: parent_certificate,
+        parent_loss_token_digest: parent_token_digest,
+        survivor_cut: loss.survivor_cut.clone(),
+        survivor_publication: loss.survivor_publication,
         participants,
-        ..successor_skeleton(f)
-    }
-}
-
-fn successor_skeleton(f: &Fixture) -> transition::LossSuccessorRequest {
-    transition::LossSuccessorRequest {
-        format: 1,
-        id: [60; 32],
-        authority_id: f.loss.authority_id,
-        revision: f.loss.revision + 1,
-        install: f.loss.install.clone(),
-        region: f.loss.region.clone(),
-        scope: f.loss.scope,
-        schema: f.loss.schema,
-        membership: f.loss.replacement_membership,
-        source_certificate: f.loss.source_certificate,
-        source_token_digest: f.loss.source_token_digest,
-        source_cut: f.loss.source_cut.clone(),
-        parent_loss_certificate: f.loss_certificate_id,
-        parent_loss_token_digest: f.loss_token_digest,
-        survivor_cut: f.loss.survivor_cut.clone(),
-        survivor_publication: f.loss.survivor_publication,
-        participants: [f.loss.survivor.clone(), f.loss.survivor.clone()],
-        survivor_index: None,
+        survivor_index: (format == 2).then_some(survivor_index),
     }
 }
 
@@ -1038,11 +1064,11 @@ fn sign_successor(
     key: &EcdsaKeyPair,
     request: &transition::LossSuccessorRequest,
     trust: &transition::TrustStore,
+    certificate_id: [u8; 32],
 ) -> Result<String> {
     let header = B64.encode(serde_json::to_vec(&serde_json::json!({
         "alg": "ES256", "kid": "fixture", "typ": transition::LOSS_SUCCESSOR_TOKEN_TYPE
     }))?);
-    let certificate_id = [61u8; 32];
     let claims = B64.encode(serde_json::to_vec(&serde_json::json!({
         "version": 1,
         "iss": trust.profile.issuer,
@@ -1081,7 +1107,7 @@ fn successor_proof_with(
     transition::CommittedLossSuccessorTransition,
 )> {
     let request = successor_request_with(f, id);
-    let token = sign_successor(&f.signer, &request, &f.trust)?;
+    let token = sign_successor(&f.signer, &request, &f.trust, [61; 32])?;
     let journal = transition::Journal::create_loss_successor(
         &f.dir.path().join(name),
         "successor-fixture",
@@ -1510,7 +1536,15 @@ fn install_cycle(lost: Role, tail: bool) -> Result<()> {
 
     let (json, owner) = install_state(&f.survivor_path)?;
     let record = decode_install(json.as_deref().ok_or("survivor install record missing")?)?;
-    assert_eq!(record.format, 1);
+    // A new install is always format 2: it stores the issued successor token,
+    // so a later loss can authenticate this recovery by signature.
+    assert_eq!(record.format, 2);
+    let stored_token = record
+        .successor_token
+        .clone()
+        .ok_or("stored successor token missing")?;
+    assert_eq!(stored_token, proof.token());
+    assert_eq!(sha(&stored_token), proof.token_digest());
     assert_eq!(record.loss, f.loss);
     assert_eq!(record.loss_certificate, f.loss_certificate_id);
     assert_eq!(record.loss_token_digest, f.loss_token_digest);
@@ -1550,13 +1584,7 @@ fn install_cycle(lost: Role, tail: bool) -> Result<()> {
 
     // Replacement install: it inherits the lost member's role.
     let replacement_before = replacement_state(&replacement)?;
-    install_replacement(
-        &mut replacement,
-        &f.certificate,
-        &f.certificate_token,
-        &successor,
-        &live,
-    )?;
+    install_replacement(&mut replacement, &founding(&f), &successor, &live)?;
     assert_eq!(replacement.role(), lost);
     let (rjson, rowner) = node_install_state(&replacement)?;
     let rrecord = decode_install(rjson.as_deref().ok_or("replacement record missing")?)?;
@@ -1576,13 +1604,7 @@ fn install_cycle(lost: Role, tail: bool) -> Result<()> {
 
     // Exact retry of the replacement install, on the still-open handle.
     let after = replacement_state(&replacement)?;
-    install_replacement(
-        &mut replacement,
-        &f.certificate,
-        &f.certificate_token,
-        &successor,
-        &live,
-    )?;
+    install_replacement(&mut replacement, &founding(&f), &successor, &live)?;
     assert_eq!(replacement_state(&replacement)?, after);
 
     // A bootstrap retry on an installed replacement fails closed without
@@ -1626,13 +1648,7 @@ fn install_cycle(lost: Role, tail: bool) -> Result<()> {
     assert_eq!(replacement.role(), lost);
     every_mutation_is_rejected(&mut replacement)?;
     handle.install_successor("fixture", &successor, &live)?;
-    install_replacement(
-        &mut replacement,
-        &f.certificate,
-        &f.certificate_token,
-        &successor,
-        &live,
-    )?;
+    install_replacement(&mut replacement, &founding(&f), &successor, &live)?;
     assert_eq!(install_state(&f.survivor_path)?, (json, owner));
     assert_eq!(replacement_state(&replacement)?, after);
     drop(replacement);
@@ -1699,8 +1715,7 @@ impl Installable {
         let live = authorities(&self.f, &self.successor_journal);
         install_replacement(
             &mut self.replacement,
-            &self.f.certificate,
-            &self.f.certificate_token,
+            &founding(&self.f),
             &self.successor,
             &live,
         )
@@ -1737,8 +1752,7 @@ fn loss_install_rejects_conflicting_and_partial_state() -> Result<()> {
     let other_live = authorities(&it.f, &other_journal);
     assert!(install_replacement(
         &mut it.replacement,
-        &certificate,
-        &certificate_token,
+        &Founding::Certificate(certificate, certificate_token),
         &other,
         &other_live,
     )
@@ -1819,14 +1833,9 @@ fn loss_install_rejects_conflicting_and_partial_state() -> Result<()> {
         "CREATE TABLE recovery_loss_pending(id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL)",
     )?;
     let mut replacement = it.f.replacement()?;
-    assert!(install_replacement(
-        &mut replacement,
-        &it.f.certificate,
-        &it.f.certificate_token,
-        &it.successor,
-        &live,
-    )
-    .is_err());
+    assert!(
+        install_replacement(&mut replacement, &founding(&it.f), &it.successor, &live,).is_err()
+    );
     assert_eq!(node_install_state(&replacement)?, replacement_good.0);
     drop(replacement);
     tamper(&replacement_path, "DROP TABLE recovery_loss_pending")?;
@@ -1861,14 +1870,7 @@ fn loss_replacement_install_rejects_wrong_bindings() -> Result<()> {
         StockSchema,
     )?;
     let live = authorities(&it.f, &it.successor_journal);
-    assert!(install_replacement(
-        &mut empty,
-        &it.f.certificate,
-        &it.f.certificate_token,
-        &it.successor,
-        &live,
-    )
-    .is_err());
+    assert!(install_replacement(&mut empty, &founding(&it.f), &it.successor, &live,).is_err());
     assert_eq!(node_install_state(&empty)?.0, None);
     drop(empty);
 
@@ -1898,14 +1900,7 @@ fn loss_replacement_install_rejects_wrong_bindings() -> Result<()> {
         )?)?;
     }
     rotated.finish_snapshot(&manifest)?;
-    assert!(install_replacement(
-        &mut rotated,
-        &it.f.certificate,
-        &it.f.certificate_token,
-        &it.successor,
-        &live,
-    )
-    .is_err());
+    assert!(install_replacement(&mut rotated, &founding(&it.f), &it.successor, &live,).is_err());
     assert_eq!(node_install_state(&rotated)?.0, None);
     drop(rotated);
 
@@ -1915,8 +1910,7 @@ fn loss_replacement_install_rejects_wrong_bindings() -> Result<()> {
     assert_ne!(other_proof.loss_request(), &it.f.loss);
     assert!(install_replacement(
         &mut it.replacement,
-        &it.f.certificate,
-        &it.f.certificate_token,
+        &founding(&it.f),
         other_proof.request(),
         &live,
     )
@@ -2131,7 +2125,12 @@ fn loss_replacement_role_requires_the_signed_source_certificate() -> Result<()> 
                    certificate: &transition::Request,
                    token: &str|
      -> Result<()> {
-        install_replacement(node, certificate, token, &it.successor, &live)
+        install_replacement(
+            node,
+            &Founding::Certificate(certificate.clone(), token.into()),
+            &it.successor,
+            &live,
+        )
     };
 
     // A certificate from a different membership.
@@ -2204,13 +2203,7 @@ fn promoted_replacement_rejects_owner_and_record_disagreement() -> Result<()> {
     let successor = proof.request().clone();
     let live = authorities(&f, &successor_journal);
     handle.install_successor("fixture", &successor, &live)?;
-    install_replacement(
-        &mut replacement,
-        &f.certificate,
-        &f.certificate_token,
-        &successor,
-        &live,
-    )?;
+    install_replacement(&mut replacement, &founding(&f), &successor, &live)?;
     assert_eq!(replacement.role(), Role::Primary);
     let (record, promoted_owner) = node_install_state(&replacement)?;
     let record = record.ok_or("replacement record missing")?;
@@ -2219,13 +2212,7 @@ fn promoted_replacement_rejects_owner_and_record_disagreement() -> Result<()> {
 
     let retry = |role: Role| -> Result<()> {
         let mut node = f.open_replacement(role)?;
-        install_replacement(
-            &mut node,
-            &f.certificate,
-            &f.certificate_token,
-            &successor,
-            &live,
-        )
+        install_replacement(&mut node, &founding(&f), &successor, &live)
     };
 
     // Record present, owner row demoted: the node opens as Secondary but the
@@ -2349,13 +2336,7 @@ fn recovery_cycle(lost: Role, tail: bool) -> Result<()> {
         [false; 2]
     );
 
-    install_replacement(
-        &mut replacement,
-        &f.certificate,
-        &f.certificate_token,
-        &successor,
-        &live,
-    )?;
+    install_replacement(&mut replacement, &founding(&f), &successor, &live)?;
     f.live
         .attach_successor(successor_journal_handle(&f, "successor-journal")?)?;
 
@@ -2593,13 +2574,7 @@ fn acknowledgement_requires_both_durable_installs() -> Result<()> {
     let live = authorities(&f, &successor_journal);
 
     // Replacement installed, survivor not: still no acknowledgement.
-    install_replacement(
-        &mut replacement,
-        &f.certificate,
-        &f.certificate_token,
-        &successor,
-        &live,
-    )?;
+    install_replacement(&mut replacement, &founding(&f), &successor, &live)?;
     assert!(complete_successor(&handle, &replacement, &successor, &live).is_err());
     handle.install_successor("fixture", &successor, &live)?;
 
@@ -2683,8 +2658,7 @@ fn returning_lost_member_and_old_membership_stay_rejected() -> Result<()> {
         &handle,
         &mut replacement,
         "fixture",
-        &f.certificate,
-        &f.certificate_token,
+        &founding(&f),
         &successor,
         &live,
     )?;
@@ -2753,8 +2727,7 @@ fn acknowledgement_binds_the_source_journal_scope() -> Result<()> {
         &handle,
         &mut replacement,
         "fixture",
-        &f.certificate,
-        &f.certificate_token,
+        &founding(&f),
         &successor,
         &live,
     )?;
@@ -3047,13 +3020,7 @@ fn replay(world: &CrashWorld, stop: u32) -> Result<()> {
     if stop == STEP_SURVIVOR_INSTALL {
         return Ok(());
     }
-    install_replacement(
-        &mut replacement,
-        &f.certificate,
-        &f.certificate_token,
-        &f.successor,
-        &live,
-    )?;
+    install_replacement(&mut replacement, &crash_founding(f), &f.successor, &live)?;
     if stop == STEP_REPLACEMENT_INSTALL {
         return Ok(());
     }
@@ -3413,13 +3380,7 @@ fn install_requires_the_node_and_handle_trust_store() -> Result<()> {
         StockSchema,
     )?;
     assert_err_contains(
-        install_replacement(
-            &mut untrusted,
-            &f.certificate,
-            &f.certificate_token,
-            &successor,
-            &live,
-        ),
+        install_replacement(&mut untrusted, &founding(&f), &successor, &live),
         "requires transition trust",
     );
     assert_eq!(node_install_state(&untrusted)?.0, None);
@@ -3439,14 +3400,7 @@ fn install_requires_the_node_and_handle_trust_store() -> Result<()> {
         StockSchema,
         foreign.clone(),
     )?;
-    assert!(install_replacement(
-        &mut wrong,
-        &f.certificate,
-        &f.certificate_token,
-        &successor,
-        &live,
-    )
-    .is_err());
+    assert!(install_replacement(&mut wrong, &founding(&f), &successor, &live,).is_err());
     assert_eq!(node_install_state(&wrong)?.0, None);
     drop(wrong);
 
@@ -3466,13 +3420,7 @@ fn install_requires_the_node_and_handle_trust_store() -> Result<()> {
     // The genuine configuration still installs.
     let handle = f.survivor_handle()?;
     let mut replacement = f.replacement()?;
-    install_replacement(
-        &mut replacement,
-        &f.certificate,
-        &f.certificate_token,
-        &successor,
-        &live,
-    )?;
+    install_replacement(&mut replacement, &founding(&f), &successor, &live)?;
     assert!(node_install_state(&replacement)?.0.is_some());
     drop(replacement);
     drop(handle);
@@ -3636,13 +3584,7 @@ fn stale_peer_copy_and_replayed_successor_journal_grant_nothing() -> Result<()> 
     let handle = f.survivor_handle()?;
     let mut replacement = f.replacement()?;
     bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
-    install_replacement(
-        &mut replacement,
-        &f.certificate,
-        &f.certificate_token,
-        &successor,
-        &live,
-    )?;
+    install_replacement(&mut replacement, &founding(&f), &successor, &live)?;
     let journal_path = f.dir.path().join("successor-journal");
     let before_second_ack = f.dir.path().join("successor-journal-old");
     // Snapshot the authority before either acknowledgement.
@@ -3701,7 +3643,7 @@ fn format_one_successor_still_completes_a_recovery() -> Result<()> {
     assert_eq!(request.survivor_index, None);
     assert_eq!(request.survivor()?.member, f.loss.survivor.member);
     assert_eq!(request.replacement()?.member, f.loss.replacement_member);
-    let token = sign_successor(&f.signer, &request, &f.trust)?;
+    let token = sign_successor(&f.signer, &request, &f.trust, [61; 32])?;
     let journal = transition::Journal::create_loss_successor(
         &f.dir.path().join("successor-v1"),
         "successor-fixture",
@@ -3722,8 +3664,7 @@ fn format_one_successor_still_completes_a_recovery() -> Result<()> {
         &handle,
         &mut replacement,
         "fixture",
-        &f.certificate,
-        &f.certificate_token,
+        &founding(&f),
         &request,
         &live,
     )?;
@@ -3743,6 +3684,30 @@ fn format_one_successor_still_completes_a_recovery() -> Result<()> {
     assert_eq!(
         commit(&mut primary, &mut secondary, batch)?.sequence,
         f.loss.survivor_cut.sequence + 1
+    );
+    // But that pair is a dead end for a further loss: a format-1 successor
+    // names no role, so nothing could prove which of its two participants
+    // survived. The install record still carries the issued token, so the
+    // refusal is about the successor's format and nothing else.
+    let record = decode_install(
+        install_state(&f.survivor_path)?
+            .0
+            .as_deref()
+            .ok_or("survivor record missing")?,
+    )?;
+    assert_eq!(record.format, 2);
+    assert_eq!(record.successor.format, 1);
+    assert!(record.successor_token.is_some());
+    assert_err_contains(
+        f.derive_role_at(
+            &f.survivor_path,
+            &transition::LossRequest {
+                format: 2,
+                source_kind: Some(transition::SourceKind::LossSuccessor),
+                ..f.loss.clone()
+            },
+        ),
+        "format-1 loss recovery cannot take a second loss",
     );
     drop(primary);
     drop(secondary);
@@ -3803,8 +3768,7 @@ fn format_two_successor_binds_the_canonical_participant_order() -> Result<()> {
             &handle,
             &mut replacement,
             "fixture",
-            &f.certificate,
-            &f.certificate_token,
+            &founding(&f),
             &successor,
             &live,
         )?;
@@ -3812,5 +3776,1480 @@ fn format_two_successor_binds_the_canonical_participant_order() -> Result<()> {
         drop(handle);
         drop(f);
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// S9: a second participant loss on a pair that already survived one.
+//
+// The provenance of the second loss is the pair's own completed format-2
+// successor, not a compaction certificate. The survivor authenticates it from
+// its durable install record — request, certificate id, token digest *and* the
+// stored token, re-verified by signature under the handle's own trust store —
+// and the replacement from the signed document the operator supplies. Neither
+// side is ever told a role.
+// ---------------------------------------------------------------------------
+
+/// Which member of the recovered pair is lost the second time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Losing {
+    /// The member that survived the first loss dies now.
+    FirstSurvivor,
+    /// The member that replaced the first lost one dies now.
+    FirstReplacement,
+}
+
+/// The completed recovery a further loss is founded on.
+struct FirstRecovery {
+    journal: transition::Journal,
+    successor: transition::LossSuccessorRequest,
+    token: String,
+    certificate: [u8; 32],
+}
+
+/// Ids a loss in a lineage may never share with an earlier one.
+struct Ids {
+    loss: [u8; 32],
+    certificate: [u8; 32],
+    membership: [u8; 32],
+    member: [u8; 32],
+    fencing: [u8; 32],
+    successor: [u8; 32],
+    successor_certificate: [u8; 32],
+}
+
+const SECOND_IDS: Ids = Ids {
+    loss: [65; 32],
+    certificate: [66; 32],
+    membership: [67; 32],
+    member: [68; 32],
+    fencing: [69; 32],
+    successor: [82; 32],
+    successor_certificate: [83; 32],
+};
+
+const THIRD_IDS: Ids = Ids {
+    loss: [84; 32],
+    certificate: [85; 32],
+    membership: [86; 32],
+    member: [87; 32],
+    fencing: [88; 32],
+    successor: [89; 32],
+    successor_certificate: [91; 32],
+};
+
+fn sha(value: &str) -> [u8; 32] {
+    Sha256::digest(value.as_bytes()).into()
+}
+
+/// Raw append-only cycle history of a node, read outside every guard.
+fn cycle_rows(path: &Path) -> Result<Vec<(u64, String, String)>> {
+    let db = Vesta::open_read_only_with_passphrase(path, "fixture")?;
+    db.with_connection(|c| {
+        Ok((|| -> Result<Vec<(u64, String, String)>> {
+            if !table_exists(c, CYCLES_TABLE)? {
+                return Ok(Vec::new());
+            }
+            Ok(c.prepare(
+                "SELECT revision,record,digest FROM recovery_loss_cycles ORDER BY revision",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+        })())
+    })?
+}
+
+/// Raw local completion receipt of a node, read outside every guard.
+fn completion_row(path: &Path) -> Result<Option<String>> {
+    let db = Vesta::open_read_only_with_passphrase(path, "fixture")?;
+    db.with_connection(|c| {
+        Ok((|| -> Result<Option<String>> {
+            if !table_exists(c, COMPLETION_TABLE)? {
+                return Ok(None);
+            }
+            Ok(c.query_row(
+                "SELECT receipt FROM recovery_loss_completion WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })())
+    })?
+}
+
+fn base_of(path: &Path) -> Result<Prefix> {
+    let db = Vesta::open_read_only_with_passphrase(path, "fixture")?;
+    db.with_connection(|c| {
+        Ok((|| -> Result<Prefix> {
+            checkpoint::base_for::<SchemaId>(c)?.ok_or_else(|| "base missing".into())
+        })())
+    })?
+}
+
+fn write_install(path: &Path, record: &str) -> Result<()> {
+    tamper(
+        path,
+        &format!(
+            "UPDATE recovery_loss_active SET record='{}' WHERE id=1",
+            record.replace('\'', "''")
+        ),
+    )
+}
+
+fn write_completion(path: &Path, receipt: &str) -> Result<()> {
+    tamper(
+        path,
+        &format!(
+            "UPDATE recovery_loss_completion SET receipt='{}' WHERE id=1",
+            receipt.replace('\'', "''")
+        ),
+    )
+}
+
+/// Drive one whole loss recovery to two writing nodes, and hand back exactly
+/// what a further loss needs to be founded on.
+fn recover_once(f: &Fixture) -> Result<FirstRecovery> {
+    let handle = f.survivor_handle()?;
+    let mut replacement = f.replacement()?;
+    bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
+    let (journal, proof) = successor_proof(f, "successor-journal")?;
+    let successor = proof.request().clone();
+    let token = proof.token().to_owned();
+    let certificate = proof.certificate_id();
+    let live = authorities(f, &journal);
+    install_pair(
+        &handle,
+        &mut replacement,
+        "fixture",
+        &founding(f),
+        &successor,
+        &live,
+    )?;
+    f.live
+        .attach_successor(successor_journal_handle(f, "successor-journal")?)?;
+    complete_successor(&handle, &replacement, &successor, &live)?;
+    drop(replacement);
+    drop(handle);
+    for (path, role) in [
+        (&f.survivor_path, f.survivor_role()),
+        (&f.replacement_path, f.lost_role()),
+    ] {
+        let node = open_with_authority(f, path, role)?;
+        record_completion(&node)?;
+        ensure(node.checkpoint().is_ok(), "recovered node is not admitted")?;
+        drop(node);
+    }
+    Ok(FirstRecovery {
+        journal,
+        successor,
+        token,
+        certificate,
+    })
+}
+
+/// A recovered pair that has just lost another participant.
+struct Second {
+    f: Fixture,
+    /// The completed recovery this loss retires; its journal is the *source*
+    /// journal of this loss.
+    first: FirstRecovery,
+    loss: transition::LossRequest,
+    certificate_id: [u8; 32],
+    token_digest: [u8; 32],
+    successor_id: [u8; 32],
+    successor_certificate: [u8; 32],
+    survivor_path: PathBuf,
+    lost_path: PathBuf,
+    replacement_path: PathBuf,
+    survivor_role: Role,
+    lost_role: Role,
+    survivor_checkpoint: Prefix,
+    survivor_manifest: snapshot::Manifest,
+    survivor_view: String,
+    survivor_receipts: Vec<String>,
+    survivor_capacity: (u64, u64),
+}
+
+impl Second {
+    /// The signed document that founded this pair: its previous recovery's
+    /// completed successor, exactly as the authority issued it.
+    fn founding(&self) -> Founding {
+        Founding::Successor(self.first.successor.clone(), self.first.token.clone())
+    }
+    fn handle(&self) -> Result<LossSurvivorHandle<StockSchema>> {
+        LossSurvivorHandle::open_existing(
+            &self.survivor_path,
+            self.f.identity.clone(),
+            "fixture",
+            StockSchema,
+            &self.f.trust,
+            &self.first.journal,
+            self.f.gate.as_ref(),
+        )
+    }
+    fn replacement(&self) -> Result<Node<StockSchema>> {
+        let installed = install_state(&self.replacement_path)?.0.is_some();
+        let role = if installed {
+            self.lost_role
+        } else {
+            Role::Secondary
+        };
+        if installed {
+            Node::open_with_completed_transition(
+                &self.replacement_path,
+                role,
+                self.f.identity.clone(),
+                "fixture",
+                StockSchema,
+                self.f.trust.clone(),
+                self.f.live.clone(),
+            )
+        } else {
+            Node::open_with_transition_trust(
+                &self.replacement_path,
+                role,
+                self.f.identity.clone(),
+                "fixture",
+                StockSchema,
+                self.f.trust.clone(),
+            )
+        }
+    }
+    fn open(&self, path: &Path, role: Role) -> Result<Node<StockSchema>> {
+        open_with_authority(&self.f, path, role)
+    }
+    /// The successor membership this loss implies.
+    fn successor(&self) -> transition::LossSuccessorRequest {
+        successor_for(
+            &self.loss,
+            self.certificate_id,
+            self.token_digest,
+            self.survivor_role,
+            2,
+            self.successor_id,
+        )
+    }
+    /// Decide it in a fresh successor journal founded on the previous one.
+    fn decide(
+        &self,
+        name: &str,
+        request: &transition::LossSuccessorRequest,
+    ) -> Result<transition::Journal> {
+        let token = sign_successor(
+            &self.f.signer,
+            request,
+            &self.f.trust,
+            self.successor_certificate,
+        )?;
+        let journal = transition::Journal::create_loss_successor(
+            &self.f.dir.path().join(name),
+            "successor-fixture",
+            successor_scope_of(&self.f, &self.loss),
+            &self.first.journal,
+            &self.f.trust.as_trust(),
+            self.f.gate.as_ref(),
+        )?;
+        journal.decide_loss_successor(
+            request.clone(),
+            &token,
+            15,
+            &self.f.trust.as_trust(),
+            self.f.gate.as_ref(),
+        )?;
+        Ok(journal)
+    }
+    fn journal(&self, name: &str) -> Result<transition::Journal> {
+        transition::Journal::open(
+            &self.f.dir.path().join(name),
+            "successor-fixture",
+            successor_scope_of(&self.f, &self.loss),
+            &self.f.trust.as_trust(),
+        )
+    }
+    /// Point the live authority at this loss's successor journal.
+    fn arm(&self, name: &str) -> Result<()> {
+        self.f.live.attach_successor(self.journal(name)?)
+    }
+    fn live<'a>(&'a self, journal: &'a transition::Journal) -> Authorities<'a, Gate> {
+        Authorities {
+            source: &self.first.journal,
+            successor: journal,
+            policy: self.f.gate.as_ref(),
+        }
+    }
+}
+
+/// Where the next loss of a lineage falls, and the ids it must use.
+struct Next<'a> {
+    survivor_path: PathBuf,
+    survivor_role: Role,
+    lost_path: PathBuf,
+    replacement_path: PathBuf,
+    ids: Ids,
+    tail: Option<&'a str>,
+}
+
+/// Decide the next loss of a lineage: optionally commit a tail with the pair
+/// that is still whole, freeze the survivor's publication at its current
+/// checkpoint, and record the decision in the founding recovery's own journal.
+fn decide_next_loss(f: Fixture, first: FirstRecovery, next: Next<'_>) -> Result<Second> {
+    let Next {
+        survivor_path,
+        survivor_role,
+        lost_path,
+        replacement_path,
+        ids,
+        tail,
+    } = next;
+    let lost_role = match survivor_role {
+        Role::Primary => Role::Secondary,
+        Role::Secondary => Role::Primary,
+    };
+    let mut survivor = open_with_authority(&f, &survivor_path, survivor_role)?;
+    if let Some(operation) = tail {
+        let mut peer = open_with_authority(&f, &lost_path, lost_role)?;
+        let mut batch = stock_entry().batch;
+        batch.operation_id = operation.into();
+        match survivor_role {
+            Role::Primary => commit(&mut survivor, &mut peer, batch)?,
+            Role::Secondary => commit(&mut peer, &mut survivor, batch)?,
+        };
+        drop(peer);
+    }
+    // Exactly what a first loss needs: one frozen publication at the
+    // survivor's current checkpoint.
+    let survivor_manifest = match survivor.published_snapshot()? {
+        Some(old) => survivor.rotate_snapshot(&old)?,
+        None => survivor.publish_snapshot()?,
+    };
+    let survivor_checkpoint = survivor.checkpoint()?;
+    ensure(
+        survivor_manifest.checkpoint == survivor_checkpoint,
+        "next-loss publication is not current",
+    )?;
+    let survivor_view = serde_json::to_string(&survivor.view()?)?;
+    let (survivor_receipts, survivor_capacity) = node_state(&survivor)?;
+    drop(survivor);
+
+    let replacement_generation = {
+        let node = Node::<StockSchema>::open(
+            &replacement_path,
+            Role::Secondary,
+            f.identity.clone(),
+            "fixture",
+            StockSchema,
+        )?;
+        node.connection(checkpoint::generation)?
+    };
+    // A format-2 successor is canonically ordered, so the index of the member
+    // that dies now is exactly the role it holds. Nothing here is a role input
+    // to the production code: it only decides which node the fixture kills.
+    let lost_index = usize::from(lost_role == Role::Secondary);
+    let gone = first.successor.participants[lost_index].clone();
+    let alive = first.successor.participants[1 - lost_index].clone();
+    let loss = transition::LossRequest {
+        format: 2,
+        id: ids.loss,
+        authority_id: f.loss.authority_id,
+        revision: first.successor.revision + 1,
+        install: f.loss.install.clone(),
+        region: f.loss.region.clone(),
+        scope: f.loss.scope,
+        schema: f.loss.schema,
+        membership: first.successor.membership,
+        replacement_membership: ids.membership,
+        source_certificate: first.certificate,
+        source_token_digest: sha(&first.token),
+        source_cut: first.successor.survivor_cut.clone(),
+        lost_member: gone.member,
+        lost_generation: gone.generation,
+        survivor: transition::Participant {
+            target: cut(&survivor_checkpoint)?,
+            publication: id(&survivor_manifest)?,
+            ..alive
+        },
+        survivor_cut: cut(&survivor_checkpoint)?,
+        survivor_publication: id(&survivor_manifest)?,
+        replacement_member: ids.member,
+        replacement_generation,
+        fencing_ref: ids.fencing,
+        source_kind: Some(transition::SourceKind::LossSuccessor),
+        abandoned_request: None,
+        supersedes: None,
+    };
+    loss.validate()?;
+    ensure(
+        tail.is_some() == (loss.survivor_cut != loss.source_cut),
+        "next-loss tail expectation mismatch",
+    )?;
+    let token = sign_loss(&f.signer, &loss, &f.trust, ids.certificate)?;
+    let committed = first.journal.decide_loss(
+        loss.clone(),
+        &token,
+        15,
+        &f.trust.as_trust(),
+        f.gate.as_ref(),
+    )?;
+    let certificate_id = committed.certificate_id();
+    let token_digest = committed.token_digest();
+    Ok(Second {
+        f,
+        first,
+        loss,
+        certificate_id,
+        token_digest,
+        successor_id: ids.successor,
+        successor_certificate: ids.successor_certificate,
+        survivor_path,
+        lost_path,
+        replacement_path,
+        survivor_role,
+        lost_role,
+        survivor_checkpoint,
+        survivor_manifest,
+        survivor_view,
+        survivor_receipts,
+        survivor_capacity,
+    })
+}
+
+/// A certified pair, one completed loss recovery, and a real second loss.
+fn second_loss(lost: Role, losing: Losing, tail: bool) -> Result<Second> {
+    let f = fixture(lost, false)?;
+    let first = recover_once(&f)?;
+    let (survivor_path, survivor_role, lost_path) = match losing {
+        Losing::FirstReplacement => (
+            f.survivor_path.clone(),
+            f.survivor_role(),
+            f.replacement_path.clone(),
+        ),
+        Losing::FirstSurvivor => (
+            f.replacement_path.clone(),
+            f.lost_role(),
+            f.survivor_path.clone(),
+        ),
+    };
+    let replacement_path = f.dir.path().join("replacement-2");
+    decide_next_loss(
+        f,
+        first,
+        Next {
+            survivor_path,
+            survivor_role,
+            lost_path,
+            replacement_path,
+            ids: SECOND_IDS,
+            tail: tail.then_some("between-participant-losses"),
+        },
+    )
+}
+
+/// The whole node side of a second (or later) recovery, end to end.
+fn recover_second(
+    s: &Second,
+    name: &str,
+) -> Result<(transition::Journal, transition::LossSuccessorRequest)> {
+    let successor = s.successor();
+    let journal = s.decide(name, &successor)?;
+    let live = s.live(&journal);
+    let handle = s.handle()?;
+    ensure(handle.role == s.survivor_role, "derived survivor role")?;
+    let mut replacement = s.replacement()?;
+    bootstrap_replacement(
+        &handle,
+        &mut replacement,
+        &s.first.journal,
+        s.f.gate.as_ref(),
+    )?;
+    install_pair(
+        &handle,
+        &mut replacement,
+        "fixture",
+        &s.founding(),
+        &successor,
+        &live,
+    )?;
+    s.arm(name)?;
+    complete_successor(&handle, &replacement, &successor, &live)?;
+    drop(replacement);
+    drop(handle);
+    for (path, role) in [
+        (&s.survivor_path, s.survivor_role),
+        (&s.replacement_path, s.lost_role),
+    ] {
+        let node = s.open(path, role)?;
+        record_completion(&node)?;
+        ensure(node.checkpoint().is_ok(), "recovered node is not admitted")?;
+        drop(node);
+    }
+    Ok((journal, successor))
+}
+
+/// From a decided second loss to the first write of the twice-recovered pair,
+/// for every combination of which role was lost first and which member was
+/// lost second.
+fn second_recovery_cycle(lost: Role, losing: Losing, tail: bool) -> Result<()> {
+    let s = second_loss(lost, losing, tail)?;
+    assert_eq!(s.loss.kind(), transition::SourceKind::LossSuccessor);
+    assert_eq!(s.loss.source_cut, s.first.successor.survivor_cut);
+    assert_eq!(tail, s.loss.survivor_cut != s.loss.source_cut);
+
+    // I8 analogue: deciding the second loss closes the founding successor
+    // journal, so the recovered pair loses admission on BOTH nodes before any
+    // node-side step of the new recovery has run.
+    for (path, role) in [
+        (&s.survivor_path, s.survivor_role),
+        (&s.lost_path, s.lost_role),
+    ] {
+        let node = s.open(path, role)?;
+        assert_err_contains(
+            node.checkpoint(),
+            "loss successor superseded by participant loss",
+        );
+        drop(node);
+    }
+
+    let before_cycles = cycle_rows(&s.survivor_path)?;
+    let (journal, successor) = recover_second(&s, "successor-journal-2")?;
+    assert_eq!(successor.format, 2);
+    assert_eq!(
+        successor.survivor_index,
+        Some(u8::from(s.survivor_role == Role::Secondary))
+    );
+
+    // The retirement and the new install are one step: exactly one more
+    // verified cycle row, and the founding receipt left with it.
+    let rows = cycle_rows(&s.survivor_path)?;
+    assert_eq!(rows.len(), before_cycles.len() + 1);
+    let retired: RetiredLoss = serde_json::from_str(&rows[rows.len() - 1].1)?;
+    assert_eq!(rows[rows.len() - 1].0, s.first.successor.revision - 1);
+    assert_eq!(rows[rows.len() - 1].2, hash(&retired)?);
+    assert_eq!(retired.next, s.loss);
+    assert_eq!(retired.installed.successor, s.first.successor);
+    assert_eq!(
+        retired.installed.successor_token.as_deref(),
+        Some(s.first.token.as_str())
+    );
+    // The replacement is brand new and has retired nothing.
+    assert!(cycle_rows(&s.replacement_path)?.is_empty());
+
+    // Both records are format 2 and carry the token the authority issued for
+    // this successor, verifiable under the fixture trust store alone.
+    let record = decode_install(
+        install_state(&s.survivor_path)?
+            .0
+            .as_deref()
+            .ok_or("survivor record missing")?,
+    )?;
+    let replacement_record = decode_install(
+        install_state(&s.replacement_path)?
+            .0
+            .as_deref()
+            .ok_or("replacement record missing")?,
+    )?;
+    for r in [&record, &replacement_record] {
+        assert_eq!(r.format, 2);
+        assert_eq!(r.loss, s.loss);
+        assert_eq!(r.successor, successor);
+        let token = r
+            .successor_token
+            .clone()
+            .ok_or("stored successor token missing")?;
+        assert_eq!(sha(&token), r.successor_token_digest);
+        assert_eq!(
+            transition::verify_successor_historical(&token, &s.f.trust.as_trust(), &successor)?,
+            r.successor_certificate
+        );
+    }
+    assert_eq!(record.installed_role, s.survivor_role);
+    assert_eq!(record.previous_role, s.survivor_role);
+    assert_eq!(replacement_record.installed_role, s.lost_role);
+    assert_eq!(replacement_record.previous_role, Role::Secondary);
+
+    let survivor_node = s.open(&s.survivor_path, s.survivor_role)?;
+    let replacement_node = s.open(&s.replacement_path, s.lost_role)?;
+    // The replacement carries exactly the survivor's frozen state: view,
+    // receipts and capacity accounting, at the cut the loss named.
+    assert_eq!(s.survivor_manifest.checkpoint, s.survivor_checkpoint);
+    assert_eq!(survivor_node.checkpoint()?, s.survivor_checkpoint);
+    assert_eq!(replacement_node.checkpoint()?, s.survivor_checkpoint);
+    assert_eq!(
+        serde_json::to_string(&replacement_node.view()?)?,
+        s.survivor_view
+    );
+    assert_eq!(
+        serde_json::to_string(&survivor_node.view()?)?,
+        s.survivor_view
+    );
+    assert_eq!(
+        node_state(&replacement_node)?,
+        (s.survivor_receipts.clone(), s.survivor_capacity)
+    );
+    assert_eq!(
+        node_state(&survivor_node)?,
+        (s.survivor_receipts.clone(), s.survivor_capacity)
+    );
+    // The successor membership names the new pair on both sides, and it is no
+    // longer the membership the previous recovery installed.
+    assert_eq!(
+        survivor_node.required_recovery_peer()?,
+        Some(s.loss.replacement_member)
+    );
+    assert_eq!(
+        replacement_node.required_recovery_peer()?,
+        Some(s.loss.survivor.member)
+    );
+    assert_eq!(
+        survivor_node.recovery_member_identity()?,
+        Some(s.loss.survivor.member)
+    );
+    assert_eq!(
+        replacement_node.recovery_member_identity()?,
+        Some(s.loss.replacement_member)
+    );
+    let membership = survivor_node.summary()?.membership;
+    assert_eq!(membership, replacement_node.summary()?.membership);
+    assert_eq!(membership, Some(membership_digest(&record)?));
+    assert_ne!(membership, Some(membership_digest(&retired.installed)?));
+    assert_ne!(membership, Some(s.f.certificate.membership));
+
+    // First write of the twice-recovered pair.
+    let before = s.survivor_receipts.len() as u64;
+    assert_eq!(before, s.loss.survivor_cut.sequence);
+    let (mut primary, mut secondary) = match s.survivor_role {
+        Role::Primary => (survivor_node, replacement_node),
+        Role::Secondary => (replacement_node, survivor_node),
+    };
+    let mut batch = stock_entry().batch;
+    batch.operation_id = "after-second-participant-loss".into();
+    assert_eq!(
+        commit(&mut primary, &mut secondary, batch.clone())?.sequence,
+        before + 1
+    );
+    // Exact retry of the write is a no-op.
+    assert_eq!(
+        commit(&mut primary, &mut secondary, batch.clone())?.sequence,
+        before + 1
+    );
+    assert_eq!(
+        serde_json::to_string(&primary.view()?)?,
+        serde_json::to_string(&secondary.view()?)?
+    );
+    // Receipts continue from the second survivor cut, on both nodes.
+    let receipts = receipt_rows(&primary)?;
+    assert_eq!(receipts.len() as u64, before + 1);
+    assert_eq!(receipts[..before as usize], s.survivor_receipts[..]);
+    assert_eq!(receipt_rows(&secondary)?, receipts);
+    assert_eq!(capacity_of(&primary)?, capacity_of(&secondary)?);
+    assert_eq!(capacity_of(&primary)?.0, before + 1);
+    assert!(primary.receipt(&batch.operation_id)?.is_some());
+    assert!(secondary.receipt(&batch.operation_id)?.is_some());
+
+    // Neither member this lineage has fenced is ever admissible again.
+    for path in [&s.lost_path, &s.f.lost_path] {
+        for role in [Role::Primary, Role::Secondary] {
+            let outcome = s.open(path, role);
+            assert!(outcome.is_err() || outcome?.checkpoint().is_err());
+        }
+    }
+    // Maintenance and compaction stay shut on a twice-recovered pair.
+    for node in [&mut primary, &mut secondary] {
+        assert!(node.plan_compaction().is_err());
+        assert!(node.enable_maintenance().is_err());
+        assert!(node.publish_recovery_snapshot().is_err());
+    }
+    drop(primary);
+    drop(secondary);
+    drop(journal);
+    drop(s);
+    Ok(())
+}
+
+#[test]
+fn second_loss_of_the_first_replacement_after_a_lost_primary() -> Result<()> {
+    second_recovery_cycle(Role::Primary, Losing::FirstReplacement, false)
+}
+
+#[test]
+fn second_loss_of_the_first_survivor_after_a_lost_primary() -> Result<()> {
+    second_recovery_cycle(Role::Primary, Losing::FirstSurvivor, true)
+}
+
+#[test]
+fn second_loss_of_the_first_replacement_after_a_lost_secondary() -> Result<()> {
+    second_recovery_cycle(Role::Secondary, Losing::FirstReplacement, true)
+}
+
+#[test]
+fn second_loss_of_the_first_survivor_after_a_lost_secondary() -> Result<()> {
+    second_recovery_cycle(Role::Secondary, Losing::FirstSurvivor, false)
+}
+
+/// A third loss on top of the second: the retired history grows by one
+/// hash-linked row, every row founds the next, and the chain keeps verifying
+/// on every open of the node that has now survived three times.
+#[test]
+fn a_third_loss_extends_the_verified_cycle_chain() -> Result<()> {
+    let s = second_loss(Role::Secondary, Losing::FirstReplacement, false)?;
+    let (journal, successor) = recover_second(&s, "successor-journal-2")?;
+    let proof =
+        journal.fetch_loss_successor(&successor, &s.f.trust.as_trust(), s.f.gate.as_ref())?;
+    let second = FirstRecovery {
+        token: proof.token().to_owned(),
+        certificate: proof.certificate_id(),
+        journal,
+        successor,
+    };
+    let Second {
+        f,
+        survivor_path,
+        replacement_path,
+        survivor_role,
+        ..
+    } = s;
+    let third_replacement = f.dir.path().join("replacement-3");
+    // The member that survived twice survives once more, so it is its own
+    // history that has to keep verifying.
+    let t = decide_next_loss(
+        f,
+        second,
+        Next {
+            survivor_path,
+            survivor_role,
+            lost_path: replacement_path,
+            replacement_path: third_replacement,
+            ids: THIRD_IDS,
+            tail: Some("between-second-and-third-loss"),
+        },
+    )?;
+    assert_eq!(cycle_rows(&t.survivor_path)?.len(), 1);
+    recover_second(&t, "successor-journal-3")?;
+
+    let rows = cycle_rows(&t.survivor_path)?;
+    assert_eq!(rows.len(), 2);
+    let older: RetiredLoss = serde_json::from_str(&rows[0].1)?;
+    let newer: RetiredLoss = serde_json::from_str(&rows[1].1)?;
+    assert_eq!(rows[0].2, hash(&older)?);
+    assert_eq!(rows[1].2, hash(&newer)?);
+    assert_eq!(older.parent, None);
+    assert_eq!(newer.parent.as_deref(), Some(rows[0].2.as_str()));
+    assert!(rows[0].0 < rows[1].0);
+    // Each retirement is the recovery the next row was installed by, and the
+    // oldest one was founded by a certificate, not by an earlier loss.
+    assert_eq!(older.next, newer.installed.loss);
+    assert_eq!(newer.next, t.loss);
+    assert_eq!(
+        older.installed.loss.kind(),
+        transition::SourceKind::Completed
+    );
+    assert_eq!(
+        newer.installed.loss.kind(),
+        transition::SourceKind::LossSuccessor
+    );
+    // The thrice-recovered pair writes.
+    let before = t.survivor_receipts.len() as u64;
+    let survivor_node = t.open(&t.survivor_path, t.survivor_role)?;
+    let replacement_node = t.open(&t.replacement_path, t.lost_role)?;
+    let (mut primary, mut secondary) = match t.survivor_role {
+        Role::Primary => (survivor_node, replacement_node),
+        Role::Secondary => (replacement_node, survivor_node),
+    };
+    let mut batch = stock_entry().batch;
+    batch.operation_id = "after-third-participant-loss".into();
+    assert_eq!(
+        commit(&mut primary, &mut secondary, batch)?.sequence,
+        before + 1
+    );
+    assert_eq!(receipt_rows(&primary)?, receipt_rows(&secondary)?);
+    drop(primary);
+    drop(secondary);
+    drop(t);
+    Ok(())
+}
+
+/// Run the retirement step alone, inside a transaction that is always rolled
+/// back: the node-side identity guard is reachable without a journal, which is
+/// the point — the journal file and this node file are different trust domains.
+fn retire_directly(
+    path: &Path,
+    founding: &Installed,
+    next: &transition::LossRequest,
+) -> Result<()> {
+    let db = Vesta::open(path, "fixture")?;
+    db.with_connection(|c| {
+        Ok((|| -> Result<()> {
+            let tx = c.unchecked_transaction()?;
+            let outcome = retire_founding(&tx, founding, next);
+            tx.rollback()?;
+            outcome
+        })())
+    })?
+}
+
+/// Every way of mis-stating what founded a second loss fails closed, and none
+/// of it is ever repaired.
+#[test]
+fn second_loss_evidence_rejects_every_founding_mismatch() -> Result<()> {
+    let s = second_loss(Role::Primary, Losing::FirstReplacement, false)?;
+    let survivor = s.survivor_path.clone();
+    // Baseline: the genuine decision derives the surviving role, and no role
+    // was supplied anywhere.
+    assert_eq!(s.f.derive_role_at(&survivor, &s.loss)?, s.survivor_role);
+    // The member this loss fences derives nothing on its own file.
+    assert_err_contains(
+        s.f.derive_role_at(&s.lost_path, &s.loss),
+        "loss founding participant mismatch",
+    );
+
+    // Provenance the record and its receipt do not agree on.
+    for loss in [
+        transition::LossRequest {
+            source_certificate: [101; 32],
+            ..s.loss.clone()
+        },
+        transition::LossRequest {
+            source_token_digest: [102; 32],
+            ..s.loss.clone()
+        },
+        transition::LossRequest {
+            source_cut: transition::Checkpoint {
+                sequence: s.loss.source_cut.sequence,
+                digest: [103; 32],
+            },
+            ..s.loss.clone()
+        },
+        transition::LossRequest {
+            membership: [104; 32],
+            ..s.loss.clone()
+        },
+    ] {
+        assert_err_contains(
+            s.f.derive_role_at(&survivor, &loss),
+            "loss founding successor mismatch",
+        );
+    }
+
+    // Participants that are not the two the founding successor names.
+    for loss in [
+        transition::LossRequest {
+            lost_member: [105; 32],
+            ..s.loss.clone()
+        },
+        transition::LossRequest {
+            lost_generation: [106; 32],
+            ..s.loss.clone()
+        },
+    ] {
+        assert_err_contains(
+            s.f.derive_role_at(&survivor, &loss),
+            "loss lost participant mismatch",
+        );
+    }
+    assert_err_contains(
+        s.f.derive_role_at(
+            &survivor,
+            &transition::LossRequest {
+                survivor: transition::Participant {
+                    member: [107; 32],
+                    ..s.loss.survivor.clone()
+                },
+                ..s.loss.clone()
+            },
+        ),
+        "loss founding participant mismatch",
+    );
+
+    // S10/S11 evidence is refused outright, ahead of every founding check.
+    for loss in [
+        transition::LossRequest {
+            source_kind: Some(transition::SourceKind::Decided),
+            abandoned_request: Some([108; 32]),
+            ..s.loss.clone()
+        },
+        transition::LossRequest {
+            source_kind: Some(transition::SourceKind::Completed),
+            abandoned_request: Some([109; 32]),
+            ..s.loss.clone()
+        },
+        transition::LossRequest {
+            supersedes: Some(transition::Supersedes {
+                loss_certificate: [110; 32],
+                loss_token_digest: [111; 32],
+                abort_certificate: [112; 32],
+                abort_token_digest: [113; 32],
+            }),
+            ..s.loss.clone()
+        },
+    ] {
+        assert_err_contains(s.f.derive_role_at(&survivor, &loss), NOT_ENABLED);
+    }
+
+    // The founding recovery must be complete.
+    let receipt = completion_row(&survivor)?.ok_or("founding receipt missing")?;
+    tamper(&survivor, "DROP TABLE recovery_loss_completion")?;
+    assert_err_contains(
+        s.f.derive_role_at(&survivor, &s.loss),
+        "loss founding recovery incomplete",
+    );
+    tamper(
+        &survivor,
+        &format!(
+            "CREATE TABLE recovery_loss_completion(id INTEGER PRIMARY KEY CHECK(id=1),receipt TEXT NOT NULL);
+             INSERT INTO recovery_loss_completion VALUES(1,'{}');",
+            receipt.replace('\'', "''")
+        ),
+    )?;
+    assert_eq!(s.f.derive_role_at(&survivor, &s.loss)?, s.survivor_role);
+
+    // The successor states each role twice — canonical order and founding
+    // evidence — and the two must agree.
+    let successor = s.successor();
+    let slot = successor.survivor_index().map_err(|e| e.to_string())?;
+    assert!(require_canonical_role(&successor, slot, s.lost_role).is_err());
+    assert!(require_canonical_role(&successor, roles(&successor)?.1, s.survivor_role).is_err());
+    require_canonical_role(&successor, slot, s.survivor_role)?;
+    require_canonical_role(&successor, roles(&successor)?.1, s.lost_role)?;
+    let journal = s.decide("successor-journal-2", &successor)?;
+    let live = s.live(&journal);
+    let handle = s.handle()?;
+    let mut relabelled = successor.clone();
+    relabelled.survivor_index = Some(1 - u8::try_from(slot)?);
+    assert_err_contains(
+        handle.install_successor("fixture", &relabelled, &live),
+        "invalid loss successor request",
+    );
+    drop(handle);
+
+    // Node-side identity retirement. Every identity the recovery being retired
+    // burns counts, not only those of recoveries retired before it.
+    let founding = decode_install(
+        install_state(&survivor)?
+            .0
+            .as_deref()
+            .ok_or("founding record missing")?,
+    )?;
+    for reused in [
+        founding.member,
+        founding.generation,
+        founding.loss.lost_member,
+        founding.loss.lost_generation,
+        founding.loss.replacement_member,
+        founding.loss.replacement_generation,
+        founding.loss.membership,
+        founding.successor.membership,
+    ] {
+        for next in [
+            transition::LossRequest {
+                replacement_member: reused,
+                ..s.loss.clone()
+            },
+            transition::LossRequest {
+                replacement_generation: reused,
+                ..s.loss.clone()
+            },
+            transition::LossRequest {
+                replacement_membership: reused,
+                ..s.loss.clone()
+            },
+        ] {
+            assert_err_contains(
+                retire_directly(&survivor, &founding, &next),
+                "participant-loss identity reuse",
+            );
+        }
+    }
+    // The genuine retirement is accepted, and rolled back again.
+    retire_directly(&survivor, &founding, &s.loss)?;
+    assert!(cycle_rows(&survivor)?.is_empty());
+    assert!(completion_row(&survivor)?.is_some());
+    assert_eq!(s.f.derive_role_at(&survivor, &s.loss)?, s.survivor_role);
+    drop(journal);
+    drop(s);
+    Ok(())
+}
+
+/// Corrupt a compact token's signature without changing its shape.
+fn forge(token: &str) -> String {
+    let mut bytes = token.as_bytes().to_vec();
+    let at = bytes.len() - 10;
+    bytes[at] = if bytes[at] == b'A' { b'B' } else { b'A' };
+    String::from_utf8(bytes).unwrap_or_default()
+}
+
+/// Replace the survivor's founding evidence with a successor of our own making
+/// and return the loss that would be anchored to it. No journal ever sees
+/// these: they exist only to reach node-side clauses a real flow cannot.
+fn refound(
+    s: &Second,
+    successor: &transition::LossSuccessorRequest,
+    token: &str,
+) -> Result<transition::LossRequest> {
+    let good = install_state(&s.survivor_path)?.0.ok_or("record missing")?;
+    let mut record: serde_json::Value = serde_json::from_str(&good)?;
+    record["successor"] = serde_json::to_value(successor)?;
+    record["successor_token"] = token.into();
+    record["successor_token_digest"] = serde_json::to_value(sha(token))?;
+    write_install(&s.survivor_path, &serde_json::to_string(&record)?)?;
+    let mut receipt: serde_json::Value =
+        serde_json::from_str(&completion_row(&s.survivor_path)?.ok_or("receipt missing")?)?;
+    receipt[1] = serde_json::to_value(successor.id)?;
+    receipt[2] = serde_json::to_value(sha(token))?;
+    write_completion(&s.survivor_path, &serde_json::to_string(&receipt)?)?;
+    let index = usize::from(s.survivor_role == Role::Secondary);
+    Ok(transition::LossRequest {
+        source_cut: successor.survivor_cut.clone(),
+        source_token_digest: sha(token),
+        survivor: transition::Participant {
+            target: s.loss.survivor_cut.clone(),
+            publication: s.loss.survivor_publication,
+            ..successor.participants[index].clone()
+        },
+        ..s.loss.clone()
+    })
+}
+
+/// Rebuild a founding successor around a different cut, keeping it a
+/// well-formed signed request.
+fn recut(
+    successor: &transition::LossSuccessorRequest,
+    survivor_index: usize,
+    cut: transition::Checkpoint,
+    id: [u8; 32],
+) -> transition::LossSuccessorRequest {
+    let mut recut = successor.clone();
+    recut.id = id;
+    recut.survivor_cut = cut.clone();
+    recut.participants[survivor_index].target = cut.clone();
+    recut.participants[survivor_index].old_base = None;
+    recut.participants[1 - survivor_index].target = cut.clone();
+    recut.participants[1 - survivor_index].old_base = Some(cut);
+    recut
+}
+
+/// The founding successor is authenticated by signature under the handle's own
+/// trust store, never by the digests the record happens to carry, and the cut
+/// it names must anchor in this node's own history.
+#[test]
+fn second_loss_requires_a_verifiable_founding_token() -> Result<()> {
+    let s = second_loss(Role::Secondary, Losing::FirstReplacement, false)?;
+    let survivor = s.survivor_path.clone();
+    let good = install_state(&survivor)?.0.ok_or("record missing")?;
+    let receipt = completion_row(&survivor)?.ok_or("receipt missing")?;
+    assert_eq!(s.f.derive_role_at(&survivor, &s.loss)?, s.survivor_role);
+    let index = usize::from(s.survivor_role == Role::Secondary);
+
+    // A format-1 record predates the stored token. It still decodes — the node
+    // still opens on it — but it can found nothing.
+    let mut stripped: serde_json::Value = serde_json::from_str(&good)?;
+    stripped["format"] = 1.into();
+    assert!(stripped
+        .as_object_mut()
+        .ok_or("record object")?
+        .remove("successor_token")
+        .is_some());
+    write_install(&survivor, &serde_json::to_string(&stripped)?)?;
+    drop(s.open(&survivor, s.survivor_role)?);
+    assert_err_contains(
+        s.f.derive_role_at(&survivor, &s.loss),
+        "founding record carries no successor token",
+    );
+    write_install(&survivor, &good)?;
+    assert_eq!(s.f.derive_role_at(&survivor, &s.loss)?, s.survivor_role);
+
+    // A validly signed token, issued for a different successor.
+    let other = successor_for(
+        &s.loss,
+        s.certificate_id,
+        s.token_digest,
+        s.survivor_role,
+        2,
+        [121; 32],
+    );
+    let foreign = sign_successor(&s.f.signer, &other, &s.f.trust, s.first.certificate)?;
+    let attempt = refound(&s, &s.first.successor, &foreign)?;
+    assert_err_contains(s.f.derive_role_at(&survivor, &attempt), "request binding");
+
+    // The genuine token with a broken signature.
+    let forged = forge(&s.first.token);
+    assert_ne!(forged, s.first.token);
+    let attempt = refound(&s, &s.first.successor, &forged)?;
+    assert_err_contains(s.f.derive_role_at(&survivor, &attempt), "signature");
+
+    // A founding cut this node's own history does not anchor.
+    let anchored = recut(
+        &s.first.successor,
+        index,
+        transition::Checkpoint {
+            sequence: s.loss.source_cut.sequence,
+            digest: [123; 32],
+        },
+        [122; 32],
+    );
+    let token = sign_successor(&s.f.signer, &anchored, &s.f.trust, s.first.certificate)?;
+    let attempt = refound(&s, &anchored, &token)?;
+    assert_err_contains(
+        s.f.derive_role_at(&survivor, &attempt),
+        "loss survivor anchor mismatch",
+    );
+
+    // A founding cut below this node's own base, refused before anything is
+    // recomputed at all.
+    let base = base_of(&survivor)?;
+    assert!(base.sequence >= 1);
+    let low = recut(
+        &s.first.successor,
+        index,
+        transition::Checkpoint {
+            sequence: base.sequence - 1,
+            digest: [125; 32],
+        },
+        [124; 32],
+    );
+    let token = sign_successor(&s.f.signer, &low, &s.f.trust, s.first.certificate)?;
+    let attempt = refound(&s, &low, &token)?;
+    assert_err_contains(
+        s.f.derive_role_at(&survivor, &attempt),
+        "loss survivor base past the founding cut",
+    );
+
+    // Restored: the genuine evidence still derives exactly the same role.
+    write_install(&survivor, &good)?;
+    write_completion(&survivor, &receipt)?;
+    assert_eq!(s.f.derive_role_at(&survivor, &s.loss)?, s.survivor_role);
+    drop(s);
+    Ok(())
+}
+
+/// The retired history is verified on every read: a removed, rewritten,
+/// reordered or orphaned cycle row closes the node instead of being ignored.
+#[test]
+fn second_recovery_rejects_a_tampered_cycle_history() -> Result<()> {
+    let s = second_loss(Role::Primary, Losing::FirstReplacement, false)?;
+    recover_second(&s, "successor-journal-2")?;
+    let survivor = s.survivor_path.clone();
+    let rows = cycle_rows(&survivor)?;
+    assert_eq!(rows.len(), 1);
+    let open = || s.open(&survivor, s.survivor_role);
+    drop(open()?);
+    let restore = format!(
+        "DELETE FROM recovery_loss_cycles; INSERT INTO recovery_loss_cycles VALUES({},'{}','{}');",
+        rows[0].0,
+        rows[0].1.replace('\'', "''"),
+        rows[0].2.replace('\'', "''")
+    );
+
+    // Truncated: the install says it retired a recovery, the history does not.
+    tamper(&survivor, "DELETE FROM recovery_loss_cycles")?;
+    assert_err_contains(open(), "participant-loss cycle history missing");
+    tamper(&survivor, &restore)?;
+    drop(open()?);
+
+    // Rewritten: the stored digest no longer covers the record.
+    let mut retired: RetiredLoss = serde_json::from_str(&rows[0].1)?;
+    retired.next.replacement_member = [126; 32];
+    tamper(
+        &survivor,
+        &format!(
+            "UPDATE recovery_loss_cycles SET record='{}' WHERE revision={}",
+            serde_json::to_string(&retired)?.replace('\'', "''"),
+            rows[0].0
+        ),
+    )?;
+    assert_err_contains(open(), "participant-loss cycle chain mismatch");
+    // Rewritten with the digest recomputed: the row no longer names the
+    // install it made room for.
+    tamper(
+        &survivor,
+        &format!(
+            "UPDATE recovery_loss_cycles SET record='{}',digest='{}' WHERE revision={}",
+            serde_json::to_string(&retired)?.replace('\'', "''"),
+            hash(&retired)?,
+            rows[0].0
+        ),
+    )?;
+    assert_err_contains(open(), "participant-loss cycle chain mismatch");
+    tamper(&survivor, &restore)?;
+    drop(open()?);
+
+    // A second, unlinked row.
+    tamper(
+        &survivor,
+        &format!(
+            "INSERT INTO recovery_loss_cycles VALUES({},'{}','{}')",
+            rows[0].0 + 1,
+            rows[0].1.replace('\'', "''"),
+            rows[0].2.replace('\'', "''")
+        ),
+    )?;
+    assert_err_contains(open(), "participant-loss cycle chain mismatch");
+    tamper(
+        &survivor,
+        &format!(
+            "DELETE FROM recovery_loss_cycles WHERE revision={}",
+            rows[0].0 + 1
+        ),
+    )?;
+    drop(open()?);
+
+    // An emptied singleton is a partial state, not an empty slot.
+    let record = install_state(&survivor)?.0.ok_or("record missing")?;
+    tamper(&survivor, "DELETE FROM recovery_loss_active WHERE id=1")?;
+    assert_err_contains(open(), "participant-loss singleton mismatch");
+    // A retired history with no active record at all.
+    tamper(&survivor, "DROP TABLE recovery_loss_active")?;
+    assert_err_contains(open(), "orphan participant-loss cycle history");
+    tamper(
+        &survivor,
+        &format!(
+            "CREATE TABLE recovery_loss_active(id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL);
+             INSERT INTO recovery_loss_active VALUES(1,'{}');",
+            record.replace('\'', "''")
+        ),
+    )?;
+    let node = open()?;
+    assert!(node.checkpoint().is_ok());
+    drop(node);
+    drop(s);
+    Ok(())
+}
+
+/// Boundaries of the second-recovery operator flow. Everything is dropped and
+/// reopened from disk between them, and replaying a prefix is always an exact
+/// no-op.
+const SECOND_DECIDED: u32 = 0;
+const SECOND_BOOTSTRAP: u32 = 1;
+const SECOND_SURVIVOR_INSTALL: u32 = 2;
+const SECOND_REPLACEMENT_INSTALL: u32 = 3;
+const SECOND_ACKS: u32 = 4;
+const SECOND_COMPLETION: u32 = 5;
+const SECOND_FIRST_RECEIPT: u32 = 6;
+const SECOND_LAST: u32 = SECOND_FIRST_RECEIPT;
+
+/// Replay the whole second recovery from the top and stop after `stop`.
+fn replay_second(
+    s: &Second,
+    journal: &transition::Journal,
+    successor: &transition::LossSuccessorRequest,
+    stop: u32,
+) -> Result<()> {
+    if stop < SECOND_BOOTSTRAP {
+        return Ok(());
+    }
+    let live = s.live(journal);
+    let handle = s.handle()?;
+    let installed = install_state(&s.replacement_path)?.0.is_some();
+    let mut replacement = s.replacement()?;
+    if installed {
+        // Bootstrap is ordinary admitted work, so it is closed once the
+        // successor membership is installed: replaying it must fail, not
+        // repair.
+        ensure(
+            bootstrap_replacement(
+                &handle,
+                &mut replacement,
+                &s.first.journal,
+                s.f.gate.as_ref(),
+            )
+            .is_err(),
+            "bootstrap admitted after install",
+        )?;
+    } else {
+        bootstrap_replacement(
+            &handle,
+            &mut replacement,
+            &s.first.journal,
+            s.f.gate.as_ref(),
+        )?;
+        if stop == SECOND_BOOTSTRAP {
+            return Ok(());
+        }
+    }
+    handle.install_successor("fixture", successor, &live)?;
+    if stop == SECOND_SURVIVOR_INSTALL {
+        return Ok(());
+    }
+    install_replacement(&mut replacement, &s.founding(), successor, &live)?;
+    if stop == SECOND_REPLACEMENT_INSTALL {
+        return Ok(());
+    }
+    // The replacement object must be reopened under its installed role.
+    drop(replacement);
+    let replacement = s.replacement()?;
+    if journal
+        .fetch_loss_successor(successor, &s.f.trust.as_trust(), s.f.gate.as_ref())?
+        .acknowledgements()
+        != [true; 2]
+    {
+        let evidence = InstalledParticipants {
+            survivor: &handle,
+            replacement: &replacement,
+            policy: s.f.gate.as_ref(),
+        };
+        let decision = journal.fetch_loss_successor(successor, &s.f.trust.as_trust(), &evidence)?;
+        for participant in decision.request().participants.iter() {
+            journal.acknowledge_loss_successor(
+                &decision,
+                participant,
+                &s.f.trust.as_trust(),
+                &evidence,
+            )?;
+        }
+    }
+    if stop == SECOND_ACKS {
+        return Ok(());
+    }
+    complete_successor(&handle, &replacement, successor, &live)?;
+    if stop == SECOND_COMPLETION {
+        return Ok(());
+    }
+    drop(replacement);
+    drop(handle);
+    let survivor_node = s.open(&s.survivor_path, s.survivor_role)?;
+    record_completion(&survivor_node)?;
+    drop(survivor_node);
+    if stop == SECOND_FIRST_RECEIPT {
+        return Ok(());
+    }
+    let replacement_node = s.open(&s.replacement_path, s.lost_role)?;
+    record_completion(&replacement_node)?;
+    Ok(())
+}
+
+/// State every boundary of the second recovery must leave behind, read from
+/// disk only.
+fn assert_second_state(
+    s: &Second,
+    journal: &transition::Journal,
+    successor: &transition::LossSuccessorRequest,
+    stop: u32,
+) -> Result<()> {
+    let survivor = install_state(&s.survivor_path)?;
+    let record = decode_install(survivor.0.as_deref().ok_or("survivor record missing")?)?;
+    let rows = cycle_rows(&s.survivor_path)?;
+    // The retirement and the new record are one atomic step: either the
+    // founding record with no history at all, or the new record with exactly
+    // one verified retirement and the founding receipt gone with it.
+    if stop < SECOND_SURVIVOR_INSTALL {
+        assert_eq!(record.loss, s.f.loss, "founding record at step {stop}");
+        assert!(rows.is_empty(), "cycle rows at step {stop}");
+        assert!(completion_row(&s.survivor_path)?.is_some());
+    } else {
+        assert_eq!(record.loss, s.loss, "new record at step {stop}");
+        assert_eq!(rows.len(), 1, "cycle rows at step {stop}");
+        let retired: RetiredLoss = serde_json::from_str(&rows[0].1)?;
+        assert_eq!(retired.next, s.loss);
+        assert_eq!(retired.installed.successor, s.first.successor);
+        assert_eq!(
+            completion_row(&s.survivor_path)?.is_some(),
+            stop >= SECOND_FIRST_RECEIPT,
+            "survivor receipt at step {stop}"
+        );
+    }
+    // No install ever writes the survivor's owner row.
+    assert_eq!(owner_role(&survivor.1)?, s.survivor_role);
+    let replacement = install_state(&s.replacement_path)?;
+    assert_eq!(
+        replacement.0.is_some(),
+        stop >= SECOND_REPLACEMENT_INSTALL,
+        "replacement record at step {stop}"
+    );
+    assert_eq!(
+        owner_role(&replacement.1)?,
+        if stop >= SECOND_REPLACEMENT_INSTALL {
+            s.lost_role
+        } else {
+            Role::Secondary
+        }
+    );
+    assert!(cycle_rows(&s.replacement_path)?.is_empty());
+    // Acknowledgements and the authority completion follow the step exactly.
+    assert_eq!(
+        journal
+            .fetch_loss_successor(successor, &s.f.trust.as_trust(), s.f.gate.as_ref())?
+            .acknowledgements()
+            == [true; 2],
+        stop >= SECOND_ACKS,
+        "acks at step {stop}"
+    );
+    assert_eq!(
+        journal
+            .fetch_completed_loss_successor(successor, &s.f.trust.as_trust(), s.f.gate.as_ref())
+            .is_ok(),
+        stop >= SECOND_COMPLETION,
+        "authority completion at step {stop}"
+    );
+    // Admission opens for a node only once its own receipt is durable.
+    let survivor_node = s.open(&s.survivor_path, s.survivor_role)?;
+    assert_eq!(
+        survivor_node.checkpoint().is_ok(),
+        stop >= SECOND_FIRST_RECEIPT,
+        "survivor admission at step {stop}"
+    );
+    drop(survivor_node);
+    let replacement_node = s.replacement()?;
+    assert_eq!(
+        replacement_node.checkpoint().is_ok(),
+        stop < SECOND_REPLACEMENT_INSTALL,
+        "replacement admission at step {stop}"
+    );
+    drop(replacement_node);
+    // The member this loss fences never becomes admissible again.
+    let stale = s.open(&s.lost_path, s.lost_role);
+    assert!(
+        stale.is_err() || stale?.checkpoint().is_err(),
+        "lost member admitted at step {stop}"
+    );
+    Ok(())
+}
+
+/// Every boundary of the second recovery, crashed by dropping everything and
+/// reopening from disk. Each attempt replays the whole flow from the top, so
+/// every earlier step is proved an exact idempotent no-op, and the survivor's
+/// retirement is proved atomic with its new install.
+#[test]
+fn second_recovery_converges_after_a_crash_at_every_boundary() -> Result<()> {
+    let s = second_loss(Role::Secondary, Losing::FirstSurvivor, false)?;
+    let successor = s.successor();
+    let journal = s.decide("successor-journal-2", &successor)?;
+    s.arm("successor-journal-2")?;
+    let mut durable: Option<String> = None;
+    for stop in SECOND_DECIDED..=SECOND_LAST {
+        replay_second(&s, &journal, &successor, stop)?;
+        assert_second_state(&s, &journal, &successor, stop)?;
+        // Once written, the new record never changes again.
+        if stop >= SECOND_SURVIVOR_INSTALL {
+            let current = install_state(&s.survivor_path)?.0;
+            if let Some(previous) = &durable {
+                assert_eq!(current.as_deref(), Some(previous.as_str()));
+            }
+            durable = current;
+        }
+    }
+    // Exact replay of the whole second recovery from the top converges, and
+    // the pair writes.
+    replay_second(&s, &journal, &successor, u32::MAX)?;
+    assert_eq!(install_state(&s.survivor_path)?.0, durable);
+    assert_eq!(cycle_rows(&s.survivor_path)?.len(), 1);
+    let before = s.survivor_receipts.len() as u64;
+    let survivor_node = s.open(&s.survivor_path, s.survivor_role)?;
+    let replacement_node = s.open(&s.replacement_path, s.lost_role)?;
+    let (mut primary, mut secondary) = match s.survivor_role {
+        Role::Primary => (survivor_node, replacement_node),
+        Role::Secondary => (replacement_node, survivor_node),
+    };
+    let mut batch = stock_entry().batch;
+    batch.operation_id = "after-second-loss-crash-walk".into();
+    assert_eq!(
+        commit(&mut primary, &mut secondary, batch)?.sequence,
+        before + 1
+    );
+    let receipts = receipt_rows(&primary)?;
+    assert_eq!(receipts.len() as u64, before + 1);
+    assert_eq!(receipts[..before as usize], s.survivor_receipts[..]);
+    assert_eq!(receipt_rows(&secondary)?, receipts);
+    drop(primary);
+    drop(secondary);
+    drop(journal);
+    drop(s);
     Ok(())
 }

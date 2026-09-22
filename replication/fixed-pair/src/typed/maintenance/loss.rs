@@ -20,7 +20,15 @@ const INSTALL_TABLE: &str = "recovery_loss_active";
 #[cfg(any(test, feature = "experimental-recovery"))]
 const INSTALL_DDL: &str = "CREATE TABLE IF NOT EXISTS main.recovery_loss_active(\
      id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL)";
-const INSTALL_LIMIT: usize = 64 * 1024;
+/// The install record now carries the issued successor token as well, so the
+/// cap is the record's old 64 KiB plus room for a token of the largest size
+/// the recovery crate will ever verify.
+const INSTALL_LIMIT: usize = 256 * 1024;
+/// Unchanged cap for the completion receipt, which carries no token.
+const COMPLETION_LIMIT: usize = 64 * 1024;
+/// Mirror of the recovery crate's private `MAX_TOKEN`: every token this module
+/// stores or replays is bounded before it is decoded or verified.
+const MAX_TOKEN: usize = 64 * 1024;
 #[cfg(any(test, feature = "experimental-recovery"))]
 /// Recovery metadata a certified survivor legitimately carries: its membership
 /// came from a completed recovery. Anything else under `recovery_` fails closed.
@@ -31,11 +39,23 @@ const SURVIVOR_RECOVERY_TABLES: &[&str] = &[
     "recovery_delivery",
     "recovery_loss_active",
     "recovery_loss_completion",
+    "recovery_loss_cycles",
     "recovery_seal",
 ];
 #[cfg(any(test, feature = "experimental-recovery"))]
 /// A bootstrap replacement has no recovery history of its own.
 const REPLACEMENT_RECOVERY_TABLES: &[&str] = &["recovery_loss_active", "recovery_loss_completion"];
+/// Append-only, hash-linked history of the loss recoveries this survivor has
+/// already been through. Rows are only ever appended, never rewritten.
+const CYCLES_TABLE: &str = "recovery_loss_cycles";
+#[cfg(any(test, feature = "experimental-recovery"))]
+const CYCLES_DDL: &str = "CREATE TABLE IF NOT EXISTS main.recovery_loss_cycles(\
+     revision INTEGER PRIMARY KEY,record TEXT NOT NULL,digest TEXT NOT NULL)";
+const MAX_CYCLE_ROWS: u64 = 1024;
+#[cfg(any(test, feature = "experimental-recovery"))]
+/// S10/S11 are not implemented on the node side yet; a loss that needs them is
+/// refused rather than partially honoured.
+const NOT_ENABLED: &str = "participant-loss feature not enabled on this node yet";
 /// Singleton local completion receipt. Only its presence *together with* a live
 /// completed-successor proof can reopen ordinary admission (I6).
 const COMPLETION_TABLE: &str = "recovery_loss_completion";
@@ -65,8 +85,15 @@ pub(super) struct Evidence {
     manifest: snapshot::Manifest,
 }
 
-/// Durable local record of the installed successor membership (format 1).
+/// Durable local record of the installed successor membership.
 /// Written once per node, compared byte-for-byte on retry, never repaired.
+///
+/// Format 2 additionally stores the exact issued successor token. It is what
+/// lets a later loss authenticate this recovery's founding successor *by
+/// signature* under the node's own bound trust store, instead of trusting the
+/// digests the node once wrote down. Format-1 records — written before this
+/// existed — still decode and still serve the first-loss flow unchanged;
+/// `serde_json` omits a skipped `None`, so their bytes are untouched.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Installed {
@@ -77,6 +104,9 @@ pub(crate) struct Installed {
     successor: transition::LossSuccessorRequest,
     successor_certificate: [u8; 32],
     successor_token_digest: [u8; 32],
+    /// Format 2 only, and then always present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    successor_token: Option<String>,
     source_scope: transition::JournalScope,
     member: [u8; 32],
     generation: [u8; 32],
@@ -265,14 +295,21 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
             "loss successor installation mismatch",
         )?;
         require_canonical_role(request, request.survivor_index()?, self.role)?;
+        // The token is what a later loss will re-verify by signature, so it is
+        // bounded here, before it is ever written down.
+        ensure(
+            !proof.token().is_empty() && proof.token().len() <= MAX_TOKEN,
+            "loss successor token limit",
+        )?;
         Ok(Installed {
-            format: 1,
+            format: 2,
             loss: self.request.clone(),
             loss_certificate: loss.certificate_id(),
             loss_token_digest: loss.token_digest(),
             successor: request.clone(),
             successor_certificate: proof.certificate_id(),
             successor_token_digest: proof.token_digest(),
+            successor_token: Some(proof.token().to_owned()),
             source_scope: proof.source_scope().clone(),
             member: self.request.survivor.member,
             generation: self.request.survivor.generation,
@@ -352,12 +389,23 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
                 )?;
                 let owner = owner_row(&tx)?;
                 ensure(owner == owner_expected, "loss install owner mismatch")?;
-                if let Some((json, _)) = read_install(&tx)? {
-                    // I5: exact retry only. A record that differs in any byte is
-                    // a conflict and is never repaired.
-                    ensure(json == expected, "loss install conflict")?;
-                    tx.rollback()?;
-                    return Ok(());
+                if let Some((json, current)) = read_install(&tx)? {
+                    if json == expected {
+                        // I5: exact retry only.
+                        tx.rollback()?;
+                        return Ok(());
+                    }
+                    // Otherwise this must be the founding record of the
+                    // recovery this loss retires; anything else is a conflict.
+                    ensure(
+                        matches!(
+                            self.request.source_kind,
+                            Some(transition::SourceKind::LossSuccessor)
+                        ) && current.successor_certificate == self.request.source_certificate
+                            && current.successor_token_digest == self.request.source_token_digest,
+                        "loss install conflict",
+                    )?;
+                    retire_founding(&tx, &current, &self.request)?;
                 }
                 tx.execute_batch(INSTALL_DDL)?;
                 ensure(
@@ -522,13 +570,126 @@ fn ensure_recovery_tables(c: &Connection, allowed: &[&str]) -> Result<()> {
 
 /// The singleton install record, with the size and shape caps of I9. More than
 /// one row, a wrong id or an oversized record is a conflict, never a repair.
+/// Format 1 carries no successor token and format 2 always does; anything else
+/// is refused rather than interpreted.
 fn read_install(c: &Connection) -> Result<Option<(String, Installed)>> {
     let Some(json) = singleton(c, INSTALL_TABLE, "record", INSTALL_LIMIT)? else {
         return Ok(None);
     };
     let record: Installed = serde_json::from_str(&json)?;
-    ensure(record.format == 1, "loss install format")?;
+    ensure(
+        match (record.format, record.successor_token.as_deref()) {
+            (1, None) => true,
+            (2, Some(token)) => !token.is_empty() && token.len() <= MAX_TOKEN,
+            _ => false,
+        },
+        "loss install format",
+    )?;
     Ok(Some((json, record)))
+}
+
+/// One retired loss recovery: the record that founded it, the completion
+/// receipt that closed it, and the loss that retired it.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetiredLoss {
+    parent: Option<String>,
+    installed: Installed,
+    completion: String,
+    next: transition::LossRequest,
+}
+
+/// Walk the append-only cycle chain, verifying the hash link and every stored
+/// receipt. Bounded before any row is decoded.
+fn visit_cycles(c: &Connection, mut visit: impl FnMut(&RetiredLoss) -> Result<()>) -> Result<()> {
+    if !table_exists(c, CYCLES_TABLE)? {
+        return Ok(());
+    }
+    let (rows, longest): (u64, u64) = c.query_row(
+        "SELECT count(*),coalesce(max(length(CAST(record AS BLOB))),0) \
+         FROM main.recovery_loss_cycles",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    ensure(
+        rows <= MAX_CYCLE_ROWS && longest <= 256 * 1024,
+        "participant-loss cycle limit",
+    )?;
+    let mut parent: Option<String> = None;
+    let mut previous: Option<u64> = None;
+    // The loss that retired the previous row. It must be exactly the loss the
+    // next row's record was installed by, so neither a removed row nor a
+    // reordered one can pass as history.
+    let mut previous_next: Option<transition::LossRequest> = None;
+    let mut statement = c.prepare(
+        "SELECT revision,record,digest FROM main.recovery_loss_cycles ORDER BY revision",
+    )?;
+    let mut cursor = statement.query([])?;
+    while let Some(row) = cursor.next()? {
+        let revision: u64 = row.get(0)?;
+        let json: String = row.get(1)?;
+        let stored: String = row.get(2)?;
+        let record: RetiredLoss = serde_json::from_str(&json)?;
+        ensure(
+            stored == hash(&record)?
+                && record.parent == parent
+                && revision == record.installed.loss.revision
+                && previous.is_none_or(|p| p < revision)
+                // Only a recovery that could found a second loss can ever have
+                // been retired by one, so every retired record carries a token.
+                && record.installed.format == 2
+                && record.installed.successor_token.is_some()
+                && record.next.revision > revision
+                && match &previous_next {
+                    Some(next) => *next == record.installed.loss,
+                    // The oldest retirement is the pair's first loss: it was
+                    // founded by a certificate, never by an earlier recovery.
+                    None => record.installed.loss.kind() != transition::SourceKind::LossSuccessor,
+                },
+            "participant-loss cycle chain mismatch",
+        )?;
+        let receipt: CompletionReceipt = serde_json::from_str(&record.completion)?;
+        ensure(
+            receipt.0 == 1
+                && receipt.1 == record.installed.successor.id
+                && receipt.2 == record.installed.successor_token_digest
+                && receipt.3 == record.installed.successor_certificate
+                && receipt.4 != [0; 32],
+            "participant-loss retired completion mismatch",
+        )?;
+        visit(&record)?;
+        parent = Some(stored);
+        previous = Some(revision);
+        previous_next = Some(record.next);
+    }
+    Ok(())
+}
+
+/// Every member, generation and membership one recovery burns for good.
+#[cfg(any(test, feature = "experimental-recovery"))]
+fn retired_of(record: &Installed) -> [[u8; 32]; 8] {
+    [
+        record.member,
+        record.generation,
+        record.loss.lost_member,
+        record.loss.lost_generation,
+        record.loss.replacement_member,
+        record.loss.replacement_generation,
+        record.loss.membership,
+        record.successor.membership,
+    ]
+}
+
+#[cfg(any(test, feature = "experimental-recovery"))]
+/// Every member, generation and membership this node has already retired. A
+/// replacement may never reuse any of them, whatever the journal says.
+fn retired_identities(c: &Connection) -> Result<Vec<[u8; 32]>> {
+    let mut retired = Vec::new();
+    visit_cycles(c, |record| {
+        retired.extend(retired_of(&record.installed));
+        Ok(())
+    })?;
+    Ok(retired)
 }
 
 /// Structural binding of a successor membership to its parent loss decision.
@@ -604,6 +765,25 @@ fn survivor_owner_role(
     let Some((_, record)) = read_install(c)? else {
         return Ok(derived);
     };
+    // The record may be the install of THIS loss, or the founding record of
+    // the recovery this loss retires. They are told apart by exact binding,
+    // never by a flag: a founding record leaves the owner row alone.
+    if record.loss != *loss {
+        ensure(
+            matches!(
+                loss.source_kind,
+                Some(transition::SourceKind::LossSuccessor)
+            ) && record.successor_certificate == loss.source_certificate
+                && record.successor_token_digest == loss.source_token_digest
+                && record.member == loss.survivor.member
+                && record.generation == loss.survivor.generation
+                // The role the founding successor's participant order implies
+                // is the role that record already committed this node to.
+                && record.installed_role == derived,
+            "loss install record mismatch",
+        )?;
+        return Ok(derived);
+    }
     ensure(
         record.loss == *loss
             // The survivor keeps its derived role: an install that claims to
@@ -626,42 +806,132 @@ fn survivor_owner_role(
 /// `source_certificate` + `source_token_digest`, so a caller cannot substitute
 /// one; the index of the lost member inside it decides the role, exactly as I1
 /// decides the survivor's. No caller-supplied role or boolean is involved.
-fn replacement_role(
-    certificate: &transition::Request,
-    certificate_token: &str,
-    trust: &transition::TrustStore,
-    loss: &transition::LossRequest,
-) -> Result<Role> {
-    let verified =
-        transition::verify_historical(certificate_token, &trust.as_trust(), certificate)?;
-    ensure(
-        verified.certificate_id() == loss.source_certificate
-            && verified.token_digest() == loss.source_token_digest
-            && certificate.membership == loss.membership
-            && certificate.authority_id == loss.authority_id
-            && certificate.install == loss.install
-            && certificate.region == loss.region
-            && certificate.scope == loss.scope
-            && certificate.schema == loss.schema,
-        "loss replacement certificate mismatch",
-    )?;
-    let mut matches = certificate
-        .participants
+/// The signed document a loss is founded on, supplied by the operator exactly
+/// as the authority issued it. Both arms are authenticated by signature and
+/// pinned to the loss's `source_certificate`/`source_token_digest`; neither
+/// carries a role, so the role is always read out of the participant order.
+#[cfg(any(test, feature = "experimental-recovery"))]
+pub enum Founding {
+    /// The certified compaction that founded an ordinary pair.
+    Certificate(transition::Request, String),
+    /// The completed loss successor that founded an already-recovered pair.
+    Successor(transition::LossSuccessorRequest, String),
+}
+
+#[cfg(any(test, feature = "experimental-recovery"))]
+impl Founding {
+    /// Authenticate the document and pin it to this loss, then return the role
+    /// the *lost* member held. The replacement inherits exactly that role.
+    fn lost_role(
+        &self,
+        trust: &transition::TrustStore,
+        loss: &transition::LossRequest,
+    ) -> Result<Role> {
+        match self {
+            Self::Certificate(certificate, token) => {
+                let verified =
+                    transition::verify_historical(token, &trust.as_trust(), certificate)?;
+                ensure(
+                    verified.certificate_id() == loss.source_certificate
+                        && verified.token_digest() == loss.source_token_digest
+                        && certificate.membership == loss.membership
+                        && certificate.authority_id == loss.authority_id
+                        && certificate.install == loss.install
+                        && certificate.region == loss.region
+                        && certificate.scope == loss.scope
+                        && certificate.schema == loss.schema,
+                    "loss replacement certificate mismatch",
+                )?;
+                let index = sole_participant(
+                    &certificate.participants,
+                    loss.lost_member,
+                    loss.lost_generation,
+                    "certified",
+                )?;
+                let survivor = &certificate.participants[1 - index];
+                ensure(
+                    survivor.member == loss.survivor.member
+                        && survivor.generation == loss.survivor.generation,
+                    "loss survivor participant mismatch",
+                )?;
+                // The certified order is canonical: index 0 is the Primary.
+                Ok(if index == 0 {
+                    Role::Primary
+                } else {
+                    Role::Secondary
+                })
+            }
+            Self::Successor(successor, token) => {
+                let certificate =
+                    transition::verify_successor_historical(token, &trust.as_trust(), successor)?;
+                ensure(
+                    certificate == loss.source_certificate
+                        && !token.is_empty()
+                        && token.len() <= MAX_TOKEN
+                        && Sha256::digest(token.as_bytes()).as_slice() == loss.source_token_digest
+                        && successor.format == 2
+                        && successor.membership == loss.membership
+                        && successor.authority_id == loss.authority_id
+                        && successor.install == loss.install
+                        && successor.region == loss.region
+                        && successor.scope == loss.scope
+                        && successor.schema == loss.schema,
+                    "loss founding successor mismatch",
+                )?;
+                let index = sole_participant(
+                    &successor.participants,
+                    loss.lost_member,
+                    loss.lost_generation,
+                    "founding",
+                )?;
+                let survivor = &successor.participants[1 - index];
+                ensure(
+                    survivor.member == loss.survivor.member
+                        && survivor.generation == loss.survivor.generation,
+                    "loss survivor participant mismatch",
+                )?;
+                // A format-2 successor is ordered `[primary, secondary]`.
+                Ok(if index == 0 {
+                    Role::Primary
+                } else {
+                    Role::Secondary
+                })
+            }
+        }
+    }
+}
+
+/// Exactly one participant may carry this member and generation.
+#[cfg(any(test, feature = "experimental-recovery"))]
+fn sole_participant(
+    participants: &[transition::Participant; 2],
+    member: [u8; 32],
+    generation: [u8; 32],
+    what: &str,
+) -> Result<usize> {
+    let mut matches = participants
         .iter()
         .enumerate()
-        .filter(|(_, p)| p.member == loss.lost_member && p.generation == loss.lost_generation);
-    let index = matches.next().ok_or("loss lost member not certified")?.0;
+        .filter(|(_, p)| p.member == member && p.generation == generation);
+    let index = match matches.next() {
+        Some((index, _)) => index,
+        None => return Err(format!("loss lost member not {what}").into()),
+    };
     ensure(matches.next().is_none(), "loss lost member ambiguous")?;
-    let survivor = &certificate.participants[1 - index];
+    Ok(index)
+}
+
+/// S10/S11 evidence is refused until their node side exists.
+#[cfg(any(test, feature = "experimental-recovery"))]
+fn require_supported_loss(loss: &transition::LossRequest) -> Result<()> {
     ensure(
-        survivor.member == loss.survivor.member && survivor.generation == loss.survivor.generation,
-        "loss survivor participant mismatch",
+        loss.supersedes.is_none() && loss.abandoned_request.is_none(),
+        NOT_ENABLED,
     )?;
-    Ok(if index == 0 {
-        Role::Primary
-    } else {
-        Role::Secondary
-    })
+    ensure(
+        !matches!(loss.source_kind, Some(transition::SourceKind::Decided)),
+        NOT_ENABLED,
+    )
 }
 
 #[cfg(any(test, feature = "experimental-recovery"))]
@@ -671,8 +941,7 @@ fn replacement_role(
 /// different machine and is not reachable here.
 pub fn install_replacement<A: ReplicatedSchema, P: transition::LossPolicy>(
     replacement: &mut Node<A>,
-    certificate: &transition::Request,
-    certificate_token: &str,
+    founding: &Founding,
     successor: &transition::LossSuccessorRequest,
     authorities: &Authorities<'_, P>,
 ) -> Result<()> {
@@ -700,16 +969,22 @@ pub fn install_replacement<A: ReplicatedSchema, P: transition::LossPolicy>(
             && successor_binds(request, parent),
         "loss replacement installation mismatch",
     )?;
-    let installed_role = replacement_role(certificate, certificate_token, trust, parent)?;
+    require_supported_loss(parent)?;
+    let installed_role = founding.lost_role(trust, parent)?;
     require_canonical_role(request, roles(request)?.1, installed_role)?;
+    ensure(
+        !proof.token().is_empty() && proof.token().len() <= MAX_TOKEN,
+        "loss successor token limit",
+    )?;
     let record = Installed {
-        format: 1,
+        format: 2,
         loss: parent.clone(),
         loss_certificate: proof.loss_certificate_id(),
         loss_token_digest: proof.loss_token_digest(),
         successor: request.clone(),
         successor_certificate: proof.certificate_id(),
         successor_token_digest: proof.token_digest(),
+        successor_token: Some(proof.token().to_owned()),
         source_scope: proof.source_scope().clone(),
         member: parent.replacement_member,
         generation: parent.replacement_generation,
@@ -852,19 +1127,12 @@ pub fn install_pair<A: ReplicatedSchema, P: transition::LossPolicy>(
     survivor: &LossSurvivorHandle<A>,
     replacement: &mut Node<A>,
     passphrase: &str,
-    certificate: &transition::Request,
-    certificate_token: &str,
+    founding: &Founding,
     successor: &transition::LossSuccessorRequest,
     authorities: &Authorities<'_, P>,
 ) -> Result<()> {
     survivor.install_successor(passphrase, successor, authorities)?;
-    install_replacement(
-        replacement,
-        certificate,
-        certificate_token,
-        successor,
-        authorities,
-    )
+    install_replacement(replacement, founding, successor, authorities)
 }
 
 #[cfg(any(test, feature = "experimental-recovery"))]
@@ -972,6 +1240,228 @@ pub fn validate_successor_installation<A: ReplicatedSchema>(
     })
 }
 
+/// Retire the recovery that founded this survivor: append it to the
+/// append-only cycle history, then remove its active record and completion
+/// receipt so the new install can take their place. All inside the caller's
+/// transaction, so the retirement and the new record are one atomic step.
+#[cfg(any(test, feature = "experimental-recovery"))]
+fn retire_founding(
+    c: &Connection,
+    founding: &Installed,
+    next: &transition::LossRequest,
+) -> Result<()> {
+    let completion = read_completion(c)?.ok_or("loss founding recovery incomplete")?;
+    let mut parent = None;
+    let mut retired = Vec::new();
+    visit_cycles(c, |record| {
+        parent = Some(hash(record)?);
+        retired.push(record.installed.loss.revision);
+        Ok(())
+    })?;
+    ensure(
+        retired.iter().all(|r| *r < next.revision) && founding.loss.revision < next.revision,
+        "participant-loss cycle revision reuse",
+    )?;
+    // Defence in depth: the journal refuses a reused identity too, but the
+    // journal file and this node file are different trust domains. The
+    // recovery being retired right now burns its own identities as well, and
+    // they are not in the cycle table yet — every one of them has to be in the
+    // set, or the very first retirement would let the member this pair just
+    // lost walk back in as the replacement.
+    let mut already = retired_identities(c)?;
+    already.extend(retired_of(founding));
+    ensure(
+        ![
+            next.replacement_member,
+            next.replacement_generation,
+            next.replacement_membership,
+        ]
+        .iter()
+        .any(|id| already.contains(id)),
+        "participant-loss identity reuse",
+    )?;
+    let record = RetiredLoss {
+        parent,
+        installed: founding.clone(),
+        completion,
+        next: next.clone(),
+    };
+    let json = serde_json::to_string(&record)?;
+    ensure(json.len() <= 256 * 1024, "participant-loss cycle limit")?;
+    c.execute_batch(CYCLES_DDL)?;
+    ensure(
+        c.execute(
+            "INSERT INTO main.recovery_loss_cycles VALUES(?1,?2,?3)",
+            params![founding.loss.revision, json, hash(&record)?],
+        )? == 1,
+        "participant-loss cycle write failed",
+    )?;
+    ensure(
+        c.execute("DELETE FROM main.recovery_loss_active WHERE id=1", [])? == 1,
+        "participant-loss retirement failed",
+    )?;
+    c.execute_batch("DROP TABLE main.recovery_loss_completion")?;
+    Ok(())
+}
+
+/// What founded this survivor, read from its own durable state. A certified
+/// pair is founded by its latest compaction certificate; a pair that already
+/// survived a loss is founded by that recovery's completed successor, which the
+/// node authenticated by signature when it installed it.
+#[cfg(any(test, feature = "experimental-recovery"))]
+enum SurvivorFounding {
+    Certificate {
+        request: transition::Request,
+    },
+    Successor {
+        successor: transition::LossSuccessorRequest,
+    },
+}
+
+#[cfg(any(test, feature = "experimental-recovery"))]
+impl SurvivorFounding {
+    /// `(local role, local participant)` derived from the founding document.
+    fn survivor_evidence(
+        &self,
+        loss: &transition::LossRequest,
+    ) -> Result<(Role, transition::Participant)> {
+        let (participants, canonical) = match self {
+            Self::Certificate { request } => (&request.participants, true),
+            Self::Successor { successor } => (&successor.participants, successor.format == 2),
+        };
+        let mut matches = participants.iter().enumerate().filter(|(_, p)| {
+            p.member == loss.survivor.member && p.generation == loss.survivor.generation
+        });
+        let index = matches.next().ok_or("loss survivor not certified")?.0;
+        ensure(matches.next().is_none(), "loss survivor ambiguous")?;
+        let lost = &participants[1 - index];
+        ensure(
+            lost.member == loss.lost_member && lost.generation == loss.lost_generation,
+            "loss lost participant mismatch",
+        )?;
+        // Only a canonically ordered document carries a role at all.
+        ensure(
+            canonical,
+            "format-1 loss recovery cannot take a second loss",
+        )?;
+        Ok((
+            if index == 0 {
+                Role::Primary
+            } else {
+                Role::Secondary
+            },
+            participants[index].clone(),
+        ))
+    }
+}
+
+/// Read and pin the survivor's founding document from its own durable state.
+#[cfg(any(test, feature = "experimental-recovery"))]
+fn survivor_founding(
+    c: &Connection,
+    trust: &transition::TrustStore,
+    loss: &transition::LossRequest,
+) -> Result<SurvivorFounding> {
+    if !matches!(
+        loss.source_kind,
+        Some(transition::SourceKind::LossSuccessor)
+    ) {
+        let json: String = c.query_row(
+            "SELECT record FROM node_compaction_certificates ORDER BY sequence DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure(json.len() <= 256 * 1024, "loss certificate limit")?;
+        let certificate: certified::CertificateRecord = serde_json::from_str(&json)?;
+        let verified = transition::verify_historical(
+            &certificate.token,
+            &trust.as_trust(),
+            &certificate.request,
+        )?;
+        ensure(
+            certificate.request.membership == loss.membership
+                && verified.certificate_id() == loss.source_certificate
+                && verified.token_digest() == loss.source_token_digest,
+            "loss survivor evidence mismatch",
+        )?;
+        return Ok(SurvivorFounding::Certificate {
+            request: certificate.request,
+        });
+    }
+    // The founding recovery must be complete. Until this loss is installed it
+    // is still the active record next to its receipt; the install moves both,
+    // atomically, into the append-only cycle history, and the row that carries
+    // them names exactly this loss as the one that retired them. Both phases
+    // of that single transaction therefore have to validate.
+    let (record, receipt) = match read_install(c)? {
+        None => return Err("loss founding recovery missing".into()),
+        Some((_, active)) if active.loss == *loss => {
+            let mut last: Option<RetiredLoss> = None;
+            visit_cycles(c, |row| {
+                last = Some(row.clone());
+                Ok(())
+            })?;
+            let row = last.ok_or("loss founding recovery missing")?;
+            ensure(row.next == *loss, "loss founding recovery mismatch")?;
+            (row.installed, row.completion)
+        }
+        Some((_, founding)) => (
+            founding,
+            read_completion(c)?.ok_or("loss founding recovery incomplete")?,
+        ),
+    };
+    let stored: CompletionReceipt = serde_json::from_str(&receipt)?;
+    ensure(
+        stored.1 == record.successor.id
+            && stored.2 == record.successor_token_digest
+            && stored.3 == record.successor_certificate,
+        "loss founding receipt mismatch",
+    )?;
+    // Symmetry with the replacement side: the founding successor is
+    // authenticated by signature under the trust store this handle is bound
+    // to, not merely by the digests this node once wrote down. A format-1
+    // record predates the stored token and can found nothing.
+    let token = record
+        .successor_token
+        .clone()
+        .ok_or("founding record carries no successor token")?;
+    ensure(token.len() <= MAX_TOKEN, "loss founding token limit")?;
+    ensure(
+        record.successor.format == 2,
+        "format-1 loss recovery cannot take a second loss",
+    )?;
+    let certificate =
+        transition::verify_successor_historical(&token, &trust.as_trust(), &record.successor)?;
+    let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    ensure(
+        certificate == record.successor_certificate
+            && certificate == loss.source_certificate
+            && digest == record.successor_token_digest
+            && digest == loss.source_token_digest
+            && record.successor.survivor_cut == loss.source_cut
+            && record.successor.membership == loss.membership
+            && record.successor.authority_id == loss.authority_id
+            && record.successor.install == loss.install
+            && record.successor.region == loss.region
+            && record.successor.scope == loss.scope
+            && record.successor.schema == loss.schema,
+        "loss founding successor mismatch",
+    )?;
+    // The local node must be the one the founding recovery left standing, and
+    // it must not be the member this loss fences.
+    ensure(
+        record.member != loss.lost_member
+            && record.generation != loss.lost_generation
+            && record.member == loss.survivor.member
+            && record.generation == loss.survivor.generation
+            && checkpoint::generation(c)? == record.generation,
+        "loss founding participant mismatch",
+    )?;
+    Ok(SurvivorFounding::Successor {
+        successor: record.successor,
+    })
+}
+
 #[cfg(any(test, feature = "experimental-recovery"))]
 pub(super) fn validate<A: ReplicatedSchema>(
     c: &Connection,
@@ -1017,44 +1507,16 @@ pub(super) fn validate<A: ReplicatedSchema>(
         loss.membership != loss.replacement_membership,
         "loss membership reused",
     )?;
-    let json: String = c.query_row(
-        "SELECT record FROM node_compaction_certificates ORDER BY sequence DESC LIMIT 1",
-        [],
-        |r| r.get(0),
-    )?;
-    ensure(json.len() <= 256 * 1024, "loss certificate limit")?;
-    let certificate: certified::CertificateRecord = serde_json::from_str(&json)?;
-    let verified = crate::recovery::transition::verify_historical(
-        &certificate.token,
-        &trust.as_trust(),
-        &certificate.request,
-    )?;
+    require_supported_loss(loss)?;
     // I1. The survivor index — and therefore the local role — is derived only
-    // from the signed loss decision and this historically verified certificate.
-    // Exactly one participant may match the survivor member *and* generation,
-    // the other one must be exactly the fenced member/generation, and the owner
-    // row must already carry the role that the index implies. Anything else
-    // fails closed; no caller can supply or influence the role.
-    let mut matches = certificate
-        .request
-        .participants
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| {
-            p.member == loss.survivor.member && p.generation == loss.survivor.generation
-        });
-    let index = matches.next().ok_or("loss survivor not certified")?.0;
-    ensure(matches.next().is_none(), "loss survivor ambiguous")?;
-    let lost = &certificate.request.participants[1 - index];
-    ensure(
-        lost.member == loss.lost_member && lost.generation == loss.lost_generation,
-        "loss lost participant mismatch",
-    )?;
-    let role = if index == 0 {
-        Role::Primary
-    } else {
-        Role::Secondary
-    };
+    // from the signed loss decision and the document that founded this pair:
+    // the certified compaction for an ordinary pair, or the completed loss
+    // successor of its previous recovery. Exactly one participant may match the
+    // survivor member *and* generation, the other one must be exactly the
+    // fenced member/generation, and the owner row must already carry the role
+    // that the position implies. No caller can supply or influence the role.
+    let founding = survivor_founding(c, trust, loss)?;
+    let (role, local) = founding.survivor_evidence(loss)?;
     // Installation-aware, still never an input: the owner row carries the
     // derived role until the signed successor membership is durably installed,
     // and exactly the role that record commits it to afterwards.
@@ -1063,7 +1525,6 @@ pub(super) fn validate<A: ReplicatedSchema>(
         identities[0] == serde_json::to_string(&(identity, owner))?,
         "loss survivor owner mismatch",
     )?;
-    let local = certificate.request.participants[index].clone();
     let base = checkpoint::base_for::<SchemaId>(c)?.ok_or("loss survivor base missing")?;
     let current = checkpoint::current_for(c, adapter, identity, initial, true)?.0;
     let manifest_json: String = c.query_row(
@@ -1074,21 +1535,55 @@ pub(super) fn validate<A: ReplicatedSchema>(
     ensure(manifest_json.len() <= 8192, "loss manifest limit")?;
     let manifest = snapshot::Manifest::decode(manifest_json.as_bytes())?;
     ensure(
-        certificate.request.membership == loss.membership
-            && verified.certificate_id() == loss.source_certificate
-            && verified.token_digest() == loss.source_token_digest
-            && local.member == loss.survivor.member
+        local.member == loss.survivor.member
             && local.generation == loss.survivor.generation
-            && local.old_base == loss.survivor.old_base
-            && local.target == loss.source_cut
-            && base.sequence == loss.source_cut.sequence
-            && id(&base)? == loss.source_cut.digest
             && current == manifest.checkpoint
             && current.sequence == loss.survivor_cut.sequence
             && id(&current)? == loss.survivor_cut.digest
             && id(&manifest)? == loss.survivor_publication,
         "loss survivor evidence mismatch",
     )?;
+    // Continuity with the founding cut. A certified pair still has that exact
+    // checkpoint as its base; a pair that already survived a loss may have
+    // compacted past it, so the checkpoint is recomputed at that sequence.
+    match founding {
+        SurvivorFounding::Certificate { .. } => ensure(
+            local.old_base == loss.survivor.old_base
+                && local.target == loss.source_cut
+                && base.sequence == loss.source_cut.sequence
+                && id(&base)? == loss.source_cut.digest,
+            "loss survivor evidence mismatch",
+        )?,
+        SurvivorFounding::Successor { .. } => {
+            // The same participant clauses the certificate arm makes, read out
+            // of the founding successor instead.
+            ensure(
+                local.old_base == loss.survivor.old_base && local.target == loss.source_cut,
+                "loss survivor evidence mismatch",
+            )?;
+            ensure(
+                base.sequence <= loss.source_cut.sequence,
+                "loss survivor base past the founding cut",
+            )?;
+            let anchor = if base.sequence == loss.source_cut.sequence {
+                base.clone()
+            } else {
+                checkpoint::calculate_for(
+                    c,
+                    adapter,
+                    identity,
+                    initial,
+                    true,
+                    Some(loss.source_cut.sequence),
+                )?
+            };
+            ensure(
+                anchor.sequence == loss.source_cut.sequence
+                    && id(&anchor)? == loss.source_cut.digest,
+                "loss survivor anchor mismatch",
+            )?;
+        }
+    }
     Node::<A>::verify_publication_in(c, &manifest, identity, contract)?;
     Ok(Evidence { role, manifest })
 }
@@ -1118,7 +1613,7 @@ fn completion_receipt(record: &Installed, completion: [u8; 32]) -> Result<String
 }
 
 fn read_completion(c: &Connection) -> Result<Option<String>> {
-    let Some(json) = singleton(c, COMPLETION_TABLE, "receipt", INSTALL_LIMIT)? else {
+    let Some(json) = singleton(c, COMPLETION_TABLE, "receipt", COMPLETION_LIMIT)? else {
         return Ok(None);
     };
     let receipt: CompletionReceipt = serde_json::from_str(&json)?;
@@ -1143,6 +1638,40 @@ pub(crate) fn state(c: &Connection) -> Result<Option<Installed>> {
     )?;
     ensure(shadows == 0, "participant-loss table shadowed")?;
     let record = read_install(c)?.map(|(_, record)| record);
+    // The retired history is verified on every read, and a node that has
+    // retired a recovery must still be inside one.
+    let mut retired = 0u64;
+    let mut last_next: Option<transition::LossRequest> = None;
+    visit_cycles(c, |row| {
+        retired += 1;
+        last_next = Some(row.next.clone());
+        Ok(())
+    })?;
+    ensure(
+        retired == 0 || record.is_some(),
+        "orphan participant-loss cycle history",
+    )?;
+    if let Some(record) = &record {
+        // The active record is exactly the install the last retirement made
+        // room for, and an install founded by an earlier recovery must have
+        // retired it. Neither end of the history can be dropped unnoticed.
+        ensure(
+            last_next.is_none_or(|next| next == record.loss),
+            "participant-loss cycle chain mismatch",
+        )?;
+        // A *survivor* installed by a loss that was founded on an earlier
+        // recovery necessarily retired that recovery in the same transaction.
+        // A replacement is a new file and has nothing to retire, which is
+        // exactly what tells the two apart — never a flag.
+        ensure(
+            retired > 0
+                || !(matches!(
+                    record.loss.source_kind,
+                    Some(transition::SourceKind::LossSuccessor)
+                ) && record.member == record.loss.survivor.member),
+            "participant-loss cycle history missing",
+        )?;
+    }
     ensure(
         record.is_some() || !table_exists(c, COMPLETION_TABLE)?,
         "orphan participant-loss completion",
@@ -1179,7 +1708,7 @@ fn validate_installed(
 ) -> Result<()> {
     let index = successor_index(record)?;
     ensure(
-        record.format == 1
+        matches!(record.format, 1 | 2)
             && record.installed_role == role
             && owner_row(c)? == serde_json::to_string(&(identity, role))?
             && checkpoint::generation(c)? == record.generation
@@ -1292,7 +1821,7 @@ pub fn record_completion<A: ReplicatedSchema>(node: &Node<A>) -> Result<()> {
         )?;
         let receipt = completion_receipt(&record, completed.completion())?;
         ensure(
-            receipt.len() <= INSTALL_LIMIT,
+            receipt.len() <= COMPLETION_LIMIT,
             "participant-loss completion too large",
         )?;
         // Read before creating the table: a table that exists with no row is a
