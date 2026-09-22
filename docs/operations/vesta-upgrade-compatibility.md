@@ -161,11 +161,24 @@ Any format-marker mismatch, incomplete metadata set, ledger mismatch, sequence g
 divergent pair must fail closed. Restore a verified generation; do not edit markers or
 delete lifecycle metadata.
 
+## Confirmed against the code (2026-09-22)
+
+- `node_runtime` format 2 is written by the typed recovery cycle path
+  (`typed/recovery/cycles.rs`) only; `enable_maintenance` adds 2 to the current format
+  (1 → 3, 2 → 4), and the pending-maintenance path moves 3/4 → 5 and back.
+- Maintenance version 2 is still written by the legacy original-pair compaction
+  (`typed/maintenance/compaction.rs`); certified maintenance requires version 1 → 3 and
+  refuses a node carrying version 2 at preflight.
+- A format-1 `Installed` record is read-only for this build: every new install writes
+  format 2 (with the successor token). A format-1 record completes its own first-loss
+  recovery but cannot found a second loss.
+- Older-binary behaviour on a format-2 journal is covered by the recovery crate tests
+  `f1_a_decided_head_abort_locks_old_binaries_out_of_the_journal`,
+  `f1_a_successor_abort_and_a_supersession_lock_old_binaries_out` and
+  `f1_a_marker_stripped_or_a_table_without_a_marker_fails_the_new_reader_closed`
+  (`recovery/tests/transition_review_fixes.rs`), which re-implement the strict scope
+  decode of the previous reader.
+
 ## To be confirmed
 
-- Whether any supported path writes `node_runtime` format 2 other than the typed recovery
-  cycle path.
-- Whether a format-1 `Installed` record can still be *created* by this build, or only read.
-- Exact older-binary behaviour on a format-2 journal has been reasoned about from the scope
-  row decode; the downgrade tests named in the review record should be cited here once run.
 - Root Vesta v1 → v2 sidecar migration has not been re-qualified as part of this tree.
