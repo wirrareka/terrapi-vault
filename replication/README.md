@@ -117,6 +117,43 @@ bridge still permits only one replacement; the typed bridge supports successive 
 replacements with the same survivor and independently authorized decisions for each cycle.
 No journal GC, production anti-rollback backend or performance guarantee is claimed.
 
+## Participant loss
+
+Permanent loss of one member is recovered through an authority-signed `LossRequest` plus a
+signed loss successor membership, under the `experimental-recovery` feature
+(`typed::maintenance::loss`). The survivor keeps its pre-loss role; the replacement inherits
+the lost member's role. A loss-recovered node opens **only** with a `CertifiedAuthority`
+that returns a live completed successor, and certified maintenance is closed on such a pair
+in this release. The library cannot prove host death or fencing: both are the
+operator's/authority's duty, and every `LossPolicy` hook that needs live external evidence
+is default-deny. Runbook: [participant loss](../docs/operations/vesta-participant-loss.md).
+
+## Maintenance abort
+
+A certified maintenance that is PREPARED — or DECIDED but unapplied — on both nodes can be
+cancelled by an authority-signed `MaintenanceAbort`: both nodes durably enter an `aborting`
+phase, the journal records the abort only on proof of both, then each node rolls back to its
+pre-PREPARE state (secondary first). An applied transition can never be aborted. The flow is
+crate-internal in this release and has no public operator API. Runbook:
+[maintenance abort](../docs/operations/vesta-maintenance-abort.md).
+
+Recording an abort or a superseding loss burns the one-way `journal_format = 2` marker into
+the journal scope row; older binaries then fail closed and downgrade is unsupported. See
+[upgrade and compatibility](../docs/operations/vesta-upgrade-compatibility.md).
+
+Termination of an in-flight certified maintenance by a participant loss is **not enabled**:
+its entry point is crate-internal, its `LossPolicy` hooks are default-deny, and independent
+review required fixes before it may be turned on. See
+[loss during maintenance](../docs/operations/vesta-loss-during-maintenance.md).
+
+## Platform status
+
+Everything in this tree is verified on **macOS arm64 only**. Linux and FreeBSD runtime
+qualification has **not** been executed for this tree: CI workflows exist, but a workflow
+configuration is not evidence of execution. Do not claim platform coverage without an actual
+job URL, OS/architecture, Rust/SQLite/SQLCipher versions, command, result and
+ignored-test count.
+
 Typed snapshots have one frozen publication and one bootstrap slot per database,
 with at most 100,000 SQL rows and 100,000 receipt entries, each category bounded to
 256 MiB encoded content. Page limits and supported SQL shapes are enforced, not
