@@ -153,6 +153,25 @@ failures. Serialization does not prove throughput headroom or eliminate sensitiv
 unrelated external host load. Ignored subprocess entry points are called
 by parent tests with temporary fixtures; they are not skipped parent scenarios.
 
+### Slow tests
+
+Two participant-loss scenarios **are** skipped by a default run and are reported as
+`ignored`, not as passed: `crash_matrix_for_lost_primary_without_tail` and
+`crash_matrix_for_lost_secondary_without_tail`. Each spawns one subprocess per crash
+boundary and re-derives an Argon2 key on every database open. Their `with_tail`
+counterparts stay in the default run, so both surviving roles and the tail shape are
+always covered; the no-tail pair is the redundant half. Run them — and every other
+ignored entry point — with:
+
+```sh
+cargo +1.89.0 test --locked -p terrapi-vesta-replication --all-features --lib crash_matrix -- --include-ignored
+```
+
+A release gate must use `-- --include-ignored`; the default run is for iteration only.
+Measured on the development host, `--lib loss` takes roughly 8 minutes by default and
+roughly 12 with the two ignored matrices included; these are timings of one machine,
+not a performance guarantee.
+
 Current port results and remaining gates are tracked in
 [`docs/planning/replication-product.md`](../docs/planning/replication-product.md).
 The inherited 222-test result is baseline evidence only, not evidence for this port.

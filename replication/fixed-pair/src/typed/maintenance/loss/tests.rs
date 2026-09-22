@@ -127,6 +127,31 @@ impl transition::LossPolicy for Gate {
             "test successor continuity revoked",
         )
     }
+    fn successor_abort_authorized(
+        &self,
+        _: &transition::JournalScope,
+        _: &transition::LossRequest,
+        _: &transition::LossSuccessorRequest,
+        _: &transition::LossSuccessorAbort,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        // Faked like every other authority fact here, but it really runs, so
+        // revocation is observable exactly where the journal consults it.
+        ensure(
+            self.live.load(Ordering::SeqCst),
+            "test successor abort revoked",
+        )
+    }
+    fn superseded_successor_aborted(
+        &self,
+        _: &transition::JournalScope,
+        _: &transition::LossRequest,
+        _: &transition::Supersedes,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        ensure(
+            self.live.load(Ordering::SeqCst),
+            "test supersession evidence revoked",
+        )
+    }
     // `loss_successor_applied` is deliberately left at its default deny: these
     // tests never acknowledge a participant.
 }
@@ -398,6 +423,16 @@ fn node_state(node: &Node<StockSchema>) -> Result<(Vec<String>, (u64, u64))> {
 /// optionally leave a committed tail plus a fresh frozen publication on the
 /// survivor, and decide the loss of `lost` through the real journal.
 fn fixture(lost: Role, tail: bool) -> Result<Fixture> {
+    fixture_of(lost, tail, 1)
+}
+
+/// The same pair with a format-2 first loss. A format-1 loss carries no
+/// optional fields at all, so only a format-2 one can ever be superseded.
+fn fixture_v2(lost: Role, tail: bool) -> Result<Fixture> {
+    fixture_of(lost, tail, 2)
+}
+
+fn fixture_of(lost: Role, tail: bool, format: u32) -> Result<Fixture> {
     let support::CertifiedPair {
         dir,
         mut p,
@@ -537,7 +572,7 @@ fn fixture(lost: Role, tail: bool) -> Result<Fixture> {
     let lost_participant = &certificate.participants[1 - survivor_index];
     let survivor_participant = &certificate.participants[survivor_index];
     let loss = transition::LossRequest {
-        format: 1,
+        format,
         id: [45; 32],
         authority_id: certificate.authority_id,
         revision: certificate.revision + 1,
@@ -562,7 +597,10 @@ fn fixture(lost: Role, tail: bool) -> Result<Fixture> {
         replacement_member: [47; 32],
         replacement_generation,
         fencing_ref: [48; 32],
-        source_kind: None,
+        // A format-2 first loss is anchored to the same completed certificate;
+        // only the optional fields exist at all, and only format 2 can ever be
+        // superseded.
+        source_kind: (format == 2).then_some(transition::SourceKind::Completed),
         abandoned_request: None,
         supersedes: None,
     };
@@ -3321,7 +3359,14 @@ fn crash_matrix(lost: Role, tail: bool) -> Result<()> {
     Ok(())
 }
 
+/// The four crash matrices differ only in which role was lost and whether a
+/// tail was committed, and each spawns one subprocess per boundary. The two
+/// tail variants stay in the default run so both surviving roles and the tail
+/// shape are always covered; the two no-tail variants are the redundant half
+/// and are opted into with `--include-ignored`. They are skipped, not passed:
+/// a default run reports them as ignored.
 #[test]
+#[ignore = "slow: subprocess crash matrix; run with -- --include-ignored"]
 fn crash_matrix_for_lost_primary_without_tail() -> Result<()> {
     crash_matrix(Role::Primary, false)
 }
@@ -3332,6 +3377,7 @@ fn crash_matrix_for_lost_primary_with_tail() -> Result<()> {
 }
 
 #[test]
+#[ignore = "slow: subprocess crash matrix; run with -- --include-ignored"]
 fn crash_matrix_for_lost_secondary_without_tail() -> Result<()> {
     crash_matrix(Role::Secondary, false)
 }
@@ -4659,7 +4705,7 @@ fn second_loss_evidence_rejects_every_founding_mismatch() -> Result<()> {
         "loss founding participant mismatch",
     );
 
-    // S10/S11 evidence is refused outright, ahead of every founding check.
+    // S11 evidence is refused outright, ahead of every founding check.
     for loss in [
         transition::LossRequest {
             source_kind: Some(transition::SourceKind::Decided),
@@ -4671,18 +4717,26 @@ fn second_loss_evidence_rejects_every_founding_mismatch() -> Result<()> {
             abandoned_request: Some([109; 32]),
             ..s.loss.clone()
         },
-        transition::LossRequest {
-            supersedes: Some(transition::Supersedes {
-                loss_certificate: [110; 32],
-                loss_token_digest: [111; 32],
-                abort_certificate: [112; 32],
-                abort_token_digest: [113; 32],
-            }),
-            ..s.loss.clone()
-        },
     ] {
         assert_err_contains(s.f.derive_role_at(&survivor, &loss), NOT_ENABLED);
     }
+    // S10 supersession is honoured now, but this survivor has never aborted
+    // anything, so it has no local authority for one.
+    assert_err_contains(
+        s.f.derive_role_at(
+            &survivor,
+            &transition::LossRequest {
+                supersedes: Some(transition::Supersedes {
+                    loss_certificate: [110; 32],
+                    loss_token_digest: [111; 32],
+                    abort_certificate: [112; 32],
+                    abort_token_digest: [113; 32],
+                }),
+                ..s.loss.clone()
+            },
+        ),
+        "superseded loss has no local tombstone",
+    );
 
     // The founding recovery must be complete.
     let receipt = completion_row(&survivor)?.ok_or("founding receipt missing")?;
@@ -5251,5 +5305,1156 @@ fn second_recovery_converges_after_a_crash_at_every_boundary() -> Result<()> {
     drop(secondary);
     drop(journal);
     drop(s);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// S10: an authority-signed abort of a decided successor, the survivor's
+// un-installation of it, and the superseding loss that follows.
+//
+// A wrong replacement used to be permanent: the successor journal was the only
+// door out of a participant loss and it only opened forwards. The abort makes
+// that journal terminal, the survivor drops back to "post-`decide_loss`,
+// pre-install" — export-only, admission shut — and a superseding `LossRequest`
+// with a fresh replacement membership starts over.
+// ---------------------------------------------------------------------------
+
+fn sign_abort(
+    key: &EcdsaKeyPair,
+    abort: &transition::LossSuccessorAbort,
+    trust: &transition::TrustStore,
+    certificate_id: [u8; 32],
+) -> Result<String> {
+    let header = B64.encode(serde_json::to_vec(&serde_json::json!({
+        "alg": "ES256", "kid": "fixture", "typ": transition::LOSS_SUCCESSOR_ABORT_TOKEN_TYPE
+    }))?);
+    let claims = B64.encode(serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "iss": trust.profile.issuer,
+        "aud": trust.profile.audience,
+        "action": "abort_loss_successor",
+        "certificate_id": certificate_id,
+        "iat": 10, "nbf": 10, "exp": 20,
+        "request": abort,
+        "request_digest": abort.digest()?,
+    }))?);
+    let input = format!("{header}.{claims}");
+    let signature = key
+        .sign(&SystemRandom::new(), input.as_bytes())
+        .map_err(|_| "abort token signing")?;
+    Ok(format!("{input}.{}", B64.encode(signature.as_ref())))
+}
+
+/// The signed cancellation of `successor`, bound to its parent loss.
+fn abort_of(
+    loss: &transition::LossRequest,
+    parent: ([u8; 32], [u8; 32]),
+    successor: &transition::LossSuccessorRequest,
+    successor_certificate: [u8; 32],
+    successor_token: &str,
+    id: [u8; 32],
+    fencing: [u8; 32],
+) -> transition::LossSuccessorAbort {
+    transition::LossSuccessorAbort {
+        format: 2,
+        id,
+        authority_id: loss.authority_id,
+        revision: successor.revision,
+        install: loss.install.clone(),
+        region: loss.region.clone(),
+        scope: loss.scope,
+        schema: loss.schema,
+        membership: loss.replacement_membership,
+        parent_loss_certificate: parent.0,
+        parent_loss_token_digest: parent.1,
+        successor_id: successor.id,
+        successor_certificate,
+        successor_token_digest: sha(successor_token),
+        fencing_ref: fencing,
+    }
+}
+
+/// Raw append-only tombstone rows of a node, read outside every guard.
+fn tombstone_rows(path: &Path) -> Result<Vec<(u64, String, String)>> {
+    let db = Vesta::open_read_only_with_passphrase(path, "fixture")?;
+    db.with_connection(|c| {
+        Ok((|| -> Result<Vec<(u64, String, String)>> {
+            if !table_exists(c, ABORTED_TABLE)? {
+                return Ok(Vec::new());
+            }
+            Ok(c.prepare(
+                "SELECT revision,record,digest FROM recovery_loss_aborted ORDER BY revision",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+        })())
+    })?
+}
+
+/// A first loss whose successor was decided, installed to some depth, and then
+/// cancelled by the authority.
+struct Aborted {
+    f: Fixture,
+    journal: transition::Journal,
+    successor: transition::LossSuccessorRequest,
+    successor_token: String,
+    successor_certificate: [u8; 32],
+    abort: transition::LossSuccessorAbort,
+    abort_certificate: [u8; 32],
+    abort_token_digest: [u8; 32],
+    /// Snapshot of the successor journal taken before the abort, for the
+    /// rolled-back-authority replay tests.
+    before_abort: PathBuf,
+}
+
+/// How far the aborted attempt got before the authority cancelled it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Reached {
+    /// Only the survivor installed.
+    SurvivorInstall,
+    /// Both nodes installed.
+    BothInstalls,
+    /// Both installed and one participant acknowledged.
+    OneAck,
+}
+
+impl Aborted {
+    fn live<'a>(&'a self, journal: &'a transition::Journal) -> Authorities<'a, Gate> {
+        authorities(&self.f, journal)
+    }
+    fn handle(&self) -> Result<LossSurvivorHandle<StockSchema>> {
+        self.f.survivor_handle()
+    }
+}
+
+/// Build a certified pair, lose `lost`, install the successor as far as
+/// `reached`, then have the authority abort it.
+fn abort_fixture(lost: Role, reached: Reached) -> Result<Aborted> {
+    let f = fixture_v2(lost, false)?;
+    let handle = f.survivor_handle()?;
+    let mut replacement = f.replacement()?;
+    bootstrap_replacement(&handle, &mut replacement, &f.journal, f.gate.as_ref())?;
+    let (journal, proof) = successor_proof(&f, "successor-journal")?;
+    let successor = proof.request().clone();
+    let successor_token = proof.token().to_owned();
+    let successor_certificate = proof.certificate_id();
+    let live = authorities(&f, &journal);
+    handle.install_successor("fixture", &successor, &live)?;
+    if reached != Reached::SurvivorInstall {
+        install_replacement(&mut replacement, &founding(&f), &successor, &live)?;
+    }
+    if reached == Reached::OneAck {
+        // One real acknowledgement, through the live installation evidence.
+        drop(replacement);
+        let reopened = f.open_replacement(f.lost_role())?;
+        let evidence = InstalledParticipants {
+            survivor: &handle,
+            replacement: &reopened,
+            policy: f.gate.as_ref(),
+        };
+        let decision = journal.fetch_loss_successor(&successor, &f.trust.as_trust(), &evidence)?;
+        journal.acknowledge_loss_successor(
+            &decision,
+            &decision.request().participants[0],
+            &f.trust.as_trust(),
+            &evidence,
+        )?;
+        ensure(
+            journal
+                .fetch_loss_successor(&successor, &f.trust.as_trust(), f.gate.as_ref())?
+                .acknowledgements()
+                == [true, false],
+            "abort fixture acknowledgement mismatch",
+        )?;
+        drop(reopened);
+        replacement = f.open_replacement(f.lost_role())?;
+    }
+    drop(replacement);
+    drop(handle);
+
+    // Snapshot the authority before the abort: a rolled-back successor journal
+    // must still not let the aborted successor be installed again.
+    let before_abort = f.dir.path().join("successor-journal-before-abort");
+    swap_database(&f.dir.path().join("successor-journal"), &before_abort)?;
+
+    let abort = abort_of(
+        &f.loss,
+        (f.loss_certificate_id, f.loss_token_digest),
+        &successor,
+        successor_certificate,
+        &successor_token,
+        [130; 32],
+        [131; 32],
+    );
+    let committed = journal.abort_loss_successor(
+        abort.clone(),
+        &sign_abort(&f.signer, &abort, &f.trust, [132; 32])?,
+        15,
+        &f.trust.as_trust(),
+        f.gate.as_ref(),
+    )?;
+    let abort_certificate = committed.certificate_id();
+    let abort_token_digest = committed.token_digest();
+    Ok(Aborted {
+        f,
+        journal,
+        successor,
+        successor_token,
+        successor_certificate,
+        abort,
+        abort_certificate,
+        abort_token_digest,
+        before_abort,
+    })
+}
+
+/// The loss that supersedes an aborted attempt. It may change the replacement
+/// member, generation and membership, and nothing else; the generation has to
+/// be the real one of the fresh replacement file, because the successor
+/// membership is signed against it.
+fn superseding(
+    a: &Aborted,
+    member: [u8; 32],
+    generation: [u8; 32],
+    membership: [u8; 32],
+) -> transition::LossRequest {
+    transition::LossRequest {
+        id: [133; 32],
+        revision: a.f.loss.revision + 1,
+        replacement_member: member,
+        replacement_generation: generation,
+        replacement_membership: membership,
+        supersedes: Some(transition::Supersedes {
+            loss_certificate: a.f.loss_certificate_id,
+            loss_token_digest: a.f.loss_token_digest,
+            abort_certificate: a.abort_certificate,
+            abort_token_digest: a.abort_token_digest,
+        }),
+        ..a.f.loss.clone()
+    }
+}
+
+/// A superseding loss decided in the source journal, plus the fresh empty
+/// replacement it names.
+struct Superseded {
+    loss: transition::LossRequest,
+    certificate_id: [u8; 32],
+    token_digest: [u8; 32],
+    path: PathBuf,
+}
+
+/// A superseding loss and its signed token, not yet recorded anywhere. The
+/// token is signed exactly once: a re-signed token is an immutable conflict,
+/// so a resume must replay this value, never mint a new one.
+struct Pending {
+    loss: transition::LossRequest,
+    token: String,
+    path: PathBuf,
+}
+
+fn pending_supersession(
+    a: &Aborted,
+    name: &str,
+    member: [u8; 32],
+    membership: [u8; 32],
+) -> Result<Pending> {
+    let path = a.f.dir.path().join(name);
+    let generation = {
+        let node = Node::<StockSchema>::open(
+            &path,
+            Role::Secondary,
+            a.f.identity.clone(),
+            "fixture",
+            StockSchema,
+        )?;
+        node.connection(checkpoint::generation)?
+    };
+    let loss = superseding(a, member, generation, membership);
+    loss.validate()?;
+    Ok(Pending {
+        token: sign_loss(&a.f.signer, &loss, &a.f.trust, [134; 32])?,
+        loss,
+        path,
+    })
+}
+
+/// Record it in the real source journal. Idempotent: an exact retry of the
+/// same decision and token converges.
+fn decide_pending(a: &Aborted, p: &Pending) -> Result<Superseded> {
+    let committed = a.f.journal.decide_loss(
+        p.loss.clone(),
+        &p.token,
+        15,
+        &a.f.trust.as_trust(),
+        a.f.gate.as_ref(),
+    )?;
+    Ok(Superseded {
+        certificate_id: committed.certificate_id(),
+        token_digest: committed.token_digest(),
+        loss: p.loss.clone(),
+        path: p.path.clone(),
+    })
+}
+
+/// Decide the superseding loss against the real source journal.
+fn supersede(
+    a: &Aborted,
+    name: &str,
+    member: [u8; 32],
+    membership: [u8; 32],
+) -> Result<Superseded> {
+    decide_pending(a, &pending_supersession(a, name, member, membership)?)
+}
+
+/// The whole node side of a superseding recovery: export, bootstrap, both
+/// installs, both ACKs, completion and both local receipts.
+fn recover_superseded(
+    a: &Aborted,
+    s: &Superseded,
+    name: &str,
+) -> Result<(transition::Journal, transition::LossSuccessorRequest)> {
+    let successor = successor_for(
+        &s.loss,
+        s.certificate_id,
+        s.token_digest,
+        a.f.survivor_role(),
+        2,
+        [135; 32],
+    );
+    let journal = transition::Journal::create_loss_successor(
+        &a.f.dir.path().join(name),
+        "successor-fixture",
+        successor_scope_of(&a.f, &s.loss),
+        &a.f.journal,
+        &a.f.trust.as_trust(),
+        a.f.gate.as_ref(),
+    )?;
+    journal.decide_loss_successor(
+        successor.clone(),
+        &sign_successor(&a.f.signer, &successor, &a.f.trust, [136; 32])?,
+        15,
+        &a.f.trust.as_trust(),
+        a.f.gate.as_ref(),
+    )?;
+    // The handle now validates the superseding decision, so it must be
+    // reopened: the previous one is bound to the aborted one.
+    let handle = LossSurvivorHandle::open_existing(
+        &a.f.survivor_path,
+        a.f.identity.clone(),
+        "fixture",
+        StockSchema,
+        &a.f.trust,
+        &a.f.journal,
+        a.f.gate.as_ref(),
+    )?;
+    let mut replacement = Node::open_with_transition_trust(
+        &s.path,
+        Role::Secondary,
+        a.f.identity.clone(),
+        "fixture",
+        StockSchema,
+        a.f.trust.clone(),
+    )?;
+    let live = authorities(&a.f, &journal);
+    bootstrap_replacement(&handle, &mut replacement, &a.f.journal, a.f.gate.as_ref())?;
+    install_pair(
+        &handle,
+        &mut replacement,
+        "fixture",
+        &founding(&a.f),
+        &successor,
+        &live,
+    )?;
+    a.f.live.attach_successor(transition::Journal::open(
+        &a.f.dir.path().join(name),
+        "successor-fixture",
+        successor_scope_of(&a.f, &s.loss),
+        &a.f.trust.as_trust(),
+    )?)?;
+    complete_successor(&handle, &replacement, &successor, &live)?;
+    drop(replacement);
+    drop(handle);
+    for (path, role) in [
+        (&a.f.survivor_path, a.f.survivor_role()),
+        (&s.path, a.f.lost_role()),
+    ] {
+        let node = open_with_authority(&a.f, path, role)?;
+        record_completion(&node)?;
+        ensure(
+            node.checkpoint().is_ok(),
+            "superseded recovery is not admitted",
+        )?;
+        drop(node);
+    }
+    Ok((journal, successor))
+}
+
+/// Abort at three depths, un-install, supersede, recover for real, write.
+fn abort_and_supersede(lost: Role, reached: Reached) -> Result<()> {
+    let a = abort_fixture(lost, reached)?;
+    let survivor = a.f.survivor_path.clone();
+    let derived = a.f.survivor_role();
+    // Before the un-install the survivor still carries the aborted install and
+    // is closed: the successor journal is terminal, so nothing can complete.
+    assert!(install_state(&survivor)?.0.is_some());
+    assert!(tombstone_rows(&survivor)?.is_empty());
+    let handle = a.handle()?;
+    let live = a.live(&a.journal);
+    assert_err_contains(
+        complete_successor(
+            &handle,
+            &a.f.open_replacement(match reached {
+                Reached::SurvivorInstall => Role::Secondary,
+                _ => a.f.lost_role(),
+            })?,
+            &a.successor,
+            &live,
+        ),
+        "loss successor aborted",
+    );
+
+    // Un-install. One transaction: the tombstone appears and the active record
+    // goes, or neither happens.
+    handle.abort_successor_install("fixture", &a.successor, &live)?;
+    let rows = tombstone_rows(&survivor)?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(install_state(&survivor)?.0, None);
+    assert_eq!(completion_row(&survivor)?, None);
+    let tombstone: AbortedSuccessor = serde_json::from_str(&rows[0].1)?;
+    assert_eq!(rows[0].0, a.f.loss.revision);
+    assert_eq!(rows[0].2, hash(&tombstone)?);
+    assert_eq!(tombstone.parent, None);
+    assert_eq!(tombstone.loss, a.f.loss);
+    assert_eq!(tombstone.loss_certificate, a.f.loss_certificate_id);
+    assert_eq!(tombstone.loss_token_digest, a.f.loss_token_digest);
+    assert_eq!(tombstone.successor_id, a.successor.id);
+    assert_eq!(tombstone.successor_certificate, a.successor_certificate);
+    assert_eq!(tombstone.successor_token_digest, sha(&a.successor_token));
+    assert_eq!(tombstone.abort_certificate, a.abort_certificate);
+    assert_eq!(tombstone.abort_token_digest, a.abort_token_digest);
+    assert_eq!(tombstone.fencing_ref, a.abort.fencing_ref);
+    // The owner row was never written by any of this.
+    assert_eq!(owner_role(&install_state(&survivor)?.1)?, derived);
+    // Exact retry of the un-install is a verified no-op.
+    handle.abort_successor_install("fixture", &a.successor, &live)?;
+    assert_eq!(tombstone_rows(&survivor)?, rows);
+
+    // C6: the survivor is exactly "post-`decide_loss`, pre-install" — still
+    // exportable through the handle, and not openable as an ordinary node at
+    // all, because its pre-loss certificate is superseded.
+    assert_eq!(
+        handle.manifest(&a.f.journal, a.f.gate.as_ref())?,
+        a.f.survivor_manifest
+    );
+    handle.page(0, &a.f.journal, a.f.gate.as_ref())?;
+    assert!(a.f.open_node(&survivor, derived).is_err());
+    assert!(open_with_authority(&a.f, &survivor, derived).is_err());
+    // The aborted replacement stays installed-but-closed for ever.
+    if reached != Reached::SurvivorInstall {
+        let stale = a.f.open_replacement(a.f.lost_role())?;
+        assert!(stale.checkpoint().is_err());
+        drop(stale);
+    }
+    // Replay protection: even with the pre-abort successor journal swapped
+    // back, the aborted successor can never be installed here again.
+    drop(handle);
+    swap_database(&a.before_abort, &a.f.dir.path().join("successor-journal"))?;
+    let rolled_back = transition::Journal::open(
+        &a.f.dir.path().join("successor-journal"),
+        "successor-fixture",
+        successor_scope(&a.f),
+        &a.f.trust.as_trust(),
+    )?;
+    let handle = a.handle()?;
+    assert_err_contains(
+        handle.install_successor("fixture", &a.successor, &a.live(&rolled_back)),
+        "aborted loss successor cannot be installed",
+    );
+    assert_eq!(install_state(&survivor)?.0, None);
+    drop(rolled_back);
+    drop(handle);
+    swap_database(
+        &a.f.dir.path().join("successor-journal-before-abort"),
+        &a.f.dir.path().join("successor-journal"),
+    )?;
+
+    // Restart between the un-install and the superseding decision: nothing is
+    // carried in memory.
+    let s = supersede(&a, "replacement-superseding", [140; 32], [141; 32])?;
+    assert_eq!(
+        a.f.journal
+            .fetch_loss(&a.f.trust.as_trust(), a.f.gate.as_ref())?
+            .request(),
+        &s.loss
+    );
+    let (journal, successor) = recover_superseded(&a, &s, "successor-journal-superseding")?;
+    assert_ne!(successor.id, a.successor.id);
+
+    // The tombstone survives the whole superseding recovery and the install
+    // record now names the new replacement.
+    assert_eq!(tombstone_rows(&survivor)?, rows);
+    let record = decode_install(
+        install_state(&survivor)?
+            .0
+            .as_deref()
+            .ok_or("survivor record missing")?,
+    )?;
+    assert_eq!(record.loss, s.loss);
+    assert_eq!(record.successor, successor);
+    assert!(cycle_rows(&survivor)?.is_empty());
+
+    // First write of the superseded pair.
+    let survivor_node = open_with_authority(&a.f, &survivor, derived)?;
+    let replacement_node = open_with_authority(&a.f, &s.path, a.f.lost_role())?;
+    assert_eq!(
+        survivor_node.required_recovery_peer()?,
+        Some(s.loss.replacement_member)
+    );
+    // The aborted replacement is never a peer again.
+    assert_ne!(
+        survivor_node.required_recovery_peer()?,
+        Some(a.f.loss.replacement_member)
+    );
+    let before = a.f.survivor_receipts.len() as u64;
+    let (mut primary, mut secondary) = match derived {
+        Role::Primary => (survivor_node, replacement_node),
+        Role::Secondary => (replacement_node, survivor_node),
+    };
+    let mut batch = stock_entry().batch;
+    batch.operation_id = "after-superseding-recovery".into();
+    assert_eq!(
+        commit(&mut primary, &mut secondary, batch)?.sequence,
+        before + 1
+    );
+    let receipts = receipt_rows(&primary)?;
+    assert_eq!(receipts.len() as u64, before + 1);
+    assert_eq!(receipts[..before as usize], a.f.survivor_receipts[..]);
+    assert_eq!(receipt_rows(&secondary)?, receipts);
+    // The aborted replacement file is still closed, after the supersession too.
+    if reached != Reached::SurvivorInstall {
+        let stale = a.f.open_replacement(a.f.lost_role())?;
+        assert!(stale.checkpoint().is_err());
+        drop(stale);
+    }
+    drop(primary);
+    drop(secondary);
+    drop(journal);
+    drop(a);
+    Ok(())
+}
+
+#[test]
+fn abort_after_the_survivor_install_is_superseded_for_a_lost_primary() -> Result<()> {
+    abort_and_supersede(Role::Primary, Reached::SurvivorInstall)
+}
+
+#[test]
+fn abort_after_both_installs_is_superseded_for_a_lost_secondary() -> Result<()> {
+    abort_and_supersede(Role::Secondary, Reached::BothInstalls)
+}
+
+#[test]
+fn abort_after_one_acknowledgement_is_superseded_for_a_lost_primary() -> Result<()> {
+    abort_and_supersede(Role::Primary, Reached::OneAck)
+}
+
+#[test]
+fn abort_after_both_installs_is_superseded_for_a_lost_primary() -> Result<()> {
+    abort_and_supersede(Role::Primary, Reached::BothInstalls)
+}
+
+/// Run the survivor's tombstone check alone, on a read-only connection: the
+/// deeper identity layer is only reachable across several attempts, so it is
+/// driven directly rather than through a third signed supersession.
+fn supersession_check(path: &Path, loss: &transition::LossRequest) -> Result<()> {
+    let db = Vesta::open_read_only_with_passphrase(path, "fixture")?;
+    db.with_connection(|c| {
+        c.pragma_update(None, "query_only", true)?;
+        Ok(require_supersession(c, loss))
+    })?
+}
+
+/// Write a well-formed local completion receipt straight into a survivor that
+/// never earned one. Only used to reach the guard that refuses to un-install a
+/// completed recovery.
+fn forge_completion(path: &Path, record: &Installed) -> Result<()> {
+    let receipt = serde_json::to_string(&(
+        1u32,
+        record.successor.id,
+        record.successor_token_digest,
+        record.successor_certificate,
+        [142u8; 32],
+    ))?;
+    tamper(
+        path,
+        &format!(
+            "CREATE TABLE IF NOT EXISTS recovery_loss_completion(id INTEGER PRIMARY KEY CHECK(id=1),receipt TEXT NOT NULL);
+             INSERT INTO recovery_loss_completion VALUES(1,'{}');",
+            receipt.replace('\'', "''")
+        ),
+    )
+}
+
+/// Every way of mis-stating an abort or a supersession fails closed, and the
+/// un-installation is never partially applied.
+#[test]
+fn superseding_loss_evidence_rejects_every_mismatch() -> Result<()> {
+    let a = abort_fixture(Role::Secondary, Reached::BothInstalls)?;
+    let survivor = a.f.survivor_path.clone();
+    let derived = a.f.survivor_role();
+    let good = install_state(&survivor)?.0.ok_or("record missing")?;
+    let record = decode_install(&good)?;
+
+    // S11 evidence is still refused, ahead of everything else.
+    for loss in [
+        transition::LossRequest {
+            abandoned_request: Some([143; 32]),
+            ..a.f.loss.clone()
+        },
+        transition::LossRequest {
+            source_kind: Some(transition::SourceKind::Decided),
+            abandoned_request: Some([144; 32]),
+            ..a.f.loss.clone()
+        },
+    ] {
+        assert_err_contains(a.f.derive_role_at(&survivor, &loss), NOT_ENABLED);
+    }
+
+    // A supersession with no tombstone on this node is refused: the authority's
+    // journal cannot vouch for this file.
+    let orphan = superseding(&a, [145; 32], [146; 32], [147; 32]);
+    assert_err_contains(
+        a.f.derive_role_at(&survivor, &orphan),
+        "superseded loss has no local tombstone",
+    );
+
+    // A journal with no abort in it cannot authorise an un-installation.
+    let journal_path = a.f.dir.path().join("successor-journal");
+    swap_database(&a.before_abort, &journal_path)?;
+    let unaborted = transition::Journal::open(
+        &journal_path,
+        "successor-fixture",
+        successor_scope(&a.f),
+        &a.f.trust.as_trust(),
+    )?;
+    let handle = a.handle()?;
+    assert_err_contains(
+        handle.abort_successor_install("fixture", &a.successor, &a.live(&unaborted)),
+        "loss successor abort missing",
+    );
+    assert_eq!(install_state(&survivor)?.0.as_deref(), Some(good.as_str()));
+    assert!(tombstone_rows(&survivor)?.is_empty());
+    drop(unaborted);
+    drop(handle);
+    swap_database(
+        &a.f.dir.path().join("successor-journal-before-abort"),
+        &journal_path,
+    )?;
+
+    // An abort recorded for a different successor authorises nothing.
+    let handle = a.handle()?;
+    let other = successor_request_with(&a.f, [148; 32]);
+    assert_err_contains(
+        handle.abort_successor_install("fixture", &other, &a.live(&a.journal)),
+        "loss successor abort binding mismatch",
+    );
+
+    // A local record that no longer binds the abort is a conflict, not a state
+    // to adopt. Only the un-install's own binding check can catch this: the
+    // record still decodes and still belongs to this loss and successor.
+    let mut restamped: serde_json::Value = serde_json::from_str(&good)?;
+    restamped["successor_certificate"] = serde_json::to_value([149u8; 32])?;
+    drop(handle);
+    write_install(&survivor, &serde_json::to_string(&restamped)?)?;
+    let handle = a.handle()?;
+    assert_err_contains(
+        handle.abort_successor_install("fixture", &a.successor, &a.live(&a.journal)),
+        "participant-loss un-install binding mismatch",
+    );
+    drop(handle);
+    write_install(&survivor, &good)?;
+
+    // A completed recovery is never un-installed: after completion a bad
+    // replacement is an ordinary new loss, not a rollback.
+    forge_completion(&survivor, &record)?;
+    let handle = a.handle()?;
+    assert_err_contains(
+        handle.abort_successor_install("fixture", &a.successor, &a.live(&a.journal)),
+        "completed participant-loss recovery cannot be un-installed",
+    );
+    assert_eq!(install_state(&survivor)?.0.as_deref(), Some(good.as_str()));
+    assert!(tombstone_rows(&survivor)?.is_empty());
+    drop(handle);
+    tamper(&survivor, "DROP TABLE recovery_loss_completion")?;
+
+    // Only a survivor capability can un-install anything: the replacement file
+    // is not a certified survivor and cannot even open one.
+    assert!(LossSurvivorHandle::<StockSchema>::open_existing(
+        &a.f.replacement_path,
+        a.f.identity.clone(),
+        "fixture",
+        StockSchema,
+        &a.f.trust,
+        &a.f.journal,
+        a.f.gate.as_ref(),
+    )
+    .is_err());
+
+    // The genuine un-installation, at last.
+    let handle = a.handle()?;
+    handle.abort_successor_install("fixture", &a.successor, &a.live(&a.journal))?;
+    assert_eq!(install_state(&survivor)?.0, None);
+    assert_eq!(tombstone_rows(&survivor)?.len(), 1);
+
+    // The replacement cannot be re-installed against the live journal either.
+    let mut stale = a.f.open_replacement(a.f.lost_role())?;
+    assert_err_contains(
+        install_replacement(
+            &mut stale,
+            &founding(&a.f),
+            &a.successor,
+            &a.live(&a.journal),
+        ),
+        "loss successor aborted",
+    );
+    assert!(stale.checkpoint().is_err());
+    drop(stale);
+
+    // A supersession may change the replacement and nothing else.
+    let mut widened = superseding(&a, [150; 32], [151; 32], [152; 32]);
+    widened.survivor_publication = [153; 32];
+    assert_err_contains(
+        a.f.derive_role_at(&survivor, &widened),
+        "superseding loss changes more than the replacement",
+    );
+    // The aborted replacement's own identity can never come back.
+    for reused in [
+        superseding(&a, a.f.loss.replacement_member, [154; 32], [155; 32]),
+        superseding(&a, [156; 32], a.f.loss.replacement_generation, [157; 32]),
+        superseding(&a, [158; 32], [159; 32], a.f.loss.replacement_membership),
+    ] {
+        assert_err_contains(
+            a.f.derive_role_at(&survivor, &reused),
+            "superseding loss reuses a retired replacement",
+        );
+    }
+    // The deeper layer: an identity this file burnt for another reason is
+    // refused even when it is not the previous attempt's replacement.
+    let mut deep = superseding(&a, [160; 32], [161; 32], [162; 32]);
+    deep.replacement_member = a.f.loss.lost_member;
+    assert_err_contains(
+        supersession_check(&survivor, &deep),
+        "participant-loss identity reuse",
+    );
+    // And the genuine supersession still validates on this file.
+    let s = supersede(&a, "replacement-superseding", [163; 32], [164; 32])?;
+    assert_eq!(a.f.derive_role_at(&survivor, &s.loss)?, derived);
+    drop(a);
+    Ok(())
+}
+
+/// Abort, supersede, recover — and then lose a participant of the new pair for
+/// real. The cycle history and the tombstone history coexist on one file and
+/// both are verified on every read.
+#[test]
+fn a_second_loss_after_a_superseded_recovery_keeps_both_histories() -> Result<()> {
+    let a = abort_fixture(Role::Primary, Reached::BothInstalls)?;
+    let survivor = a.f.survivor_path.clone();
+    let handle = a.handle()?;
+    handle.abort_successor_install("fixture", &a.successor, &a.live(&a.journal))?;
+    drop(handle);
+    let s = supersede(&a, "replacement-superseding", [170; 32], [171; 32])?;
+    let (journal, successor) = recover_superseded(&a, &s, "successor-journal-superseding")?;
+    assert_eq!(tombstone_rows(&survivor)?.len(), 1);
+    assert!(cycle_rows(&survivor)?.is_empty());
+
+    // An ordinary second loss on the recovered pair: the first survivor stays,
+    // the superseding replacement is the one lost now.
+    let proof =
+        journal.fetch_loss_successor(&successor, &a.f.trust.as_trust(), a.f.gate.as_ref())?;
+    let first = FirstRecovery {
+        token: proof.token().to_owned(),
+        certificate: proof.certificate_id(),
+        journal,
+        successor,
+    };
+    let Aborted { f, .. } = a;
+    let replacement_path = f.dir.path().join("replacement-after-supersession");
+    let survivor_role = f.survivor_role();
+    let second = decide_next_loss(
+        f,
+        first,
+        Next {
+            survivor_path: survivor.clone(),
+            survivor_role,
+            lost_path: s.path.clone(),
+            replacement_path,
+            ids: SECOND_IDS,
+            tail: Some("between-supersession-and-second-loss"),
+        },
+    )?;
+    recover_second(&second, "successor-journal-second")?;
+
+    // Both histories are on the same file and both verify.
+    let cycles = cycle_rows(&survivor)?;
+    let tombstones = tombstone_rows(&survivor)?;
+    assert_eq!(cycles.len(), 1);
+    assert_eq!(tombstones.len(), 1);
+    let retired: RetiredLoss = serde_json::from_str(&cycles[0].1)?;
+    let tombstone: AbortedSuccessor = serde_json::from_str(&tombstones[0].1)?;
+    assert_eq!(cycles[0].2, hash(&retired)?);
+    assert_eq!(tombstones[0].2, hash(&tombstone)?);
+    // The retired recovery is the superseding one, and the tombstone is the
+    // attempt it replaced: same lineage, different replacement.
+    assert_eq!(retired.next, second.loss);
+    assert!(retired.installed.loss.supersedes.is_some());
+    assert_eq!(
+        retired.installed.loss.replacement_member,
+        s.loss.replacement_member
+    );
+    assert_ne!(
+        tombstone.loss.replacement_member,
+        retired.installed.loss.replacement_member
+    );
+    assert_eq!(
+        tombstone.loss.lost_member,
+        retired.installed.loss.lost_member
+    );
+
+    // The twice-changed pair writes.
+    let before = second.survivor_receipts.len() as u64;
+    let survivor_node = second.open(&second.survivor_path, second.survivor_role)?;
+    let replacement_node = second.open(&second.replacement_path, second.lost_role)?;
+    let (mut primary, mut secondary) = match second.survivor_role {
+        Role::Primary => (survivor_node, replacement_node),
+        Role::Secondary => (replacement_node, survivor_node),
+    };
+    let mut batch = stock_entry().batch;
+    batch.operation_id = "after-supersession-and-second-loss".into();
+    assert_eq!(
+        commit(&mut primary, &mut secondary, batch)?.sequence,
+        before + 1
+    );
+    assert_eq!(receipt_rows(&primary)?, receipt_rows(&secondary)?);
+    drop(primary);
+    drop(secondary);
+    drop(second);
+    Ok(())
+}
+
+/// The tombstone history is verified on every read of the node's loss state: a
+/// rewritten, truncated or foreign row closes the node instead of being
+/// ignored.
+#[test]
+fn superseded_recovery_rejects_a_tampered_tombstone_history() -> Result<()> {
+    let a = abort_fixture(Role::Secondary, Reached::BothInstalls)?;
+    let survivor = a.f.survivor_path.clone();
+    let handle = a.handle()?;
+    handle.abort_successor_install("fixture", &a.successor, &a.live(&a.journal))?;
+    drop(handle);
+    let s = supersede(&a, "replacement-superseding", [180; 32], [181; 32])?;
+    recover_superseded(&a, &s, "successor-journal-superseding")?;
+    let rows = tombstone_rows(&survivor)?;
+    assert_eq!(rows.len(), 1);
+    let derived = a.f.survivor_role();
+    let open = || open_with_authority(&a.f, &survivor, derived);
+    drop(open()?);
+    let restore = format!(
+        "DELETE FROM recovery_loss_aborted; INSERT INTO recovery_loss_aborted VALUES({},'{}','{}');",
+        rows[0].0,
+        rows[0].1.replace('\'', "''"),
+        rows[0].2.replace('\'', "''")
+    );
+
+    // Truncated: the install record supersedes an attempt the file no longer
+    // admits to having made.
+    tamper(&survivor, "DELETE FROM recovery_loss_aborted")?;
+    assert_err_contains(open(), "participant-loss tombstone limit");
+    tamper(&survivor, "DROP TABLE recovery_loss_aborted")?;
+    // With the table gone the supersession has no local authority at all.
+    assert_err_contains(
+        a.f.derive_role_at(&survivor, &s.loss),
+        "superseded loss has no local tombstone",
+    );
+    tamper(
+        &survivor,
+        &format!(
+            "CREATE TABLE recovery_loss_aborted(revision INTEGER PRIMARY KEY,record TEXT NOT NULL,digest TEXT NOT NULL);
+             {restore}"
+        ),
+    )?;
+    drop(open()?);
+
+    // Rewritten: the stored digest no longer covers the record.
+    let mut tombstone: AbortedSuccessor = serde_json::from_str(&rows[0].1)?;
+    tombstone.abort_certificate = [182; 32];
+    tamper(
+        &survivor,
+        &format!(
+            "UPDATE recovery_loss_aborted SET record='{}' WHERE revision={}",
+            serde_json::to_string(&tombstone)?.replace('\'', "''"),
+            rows[0].0
+        ),
+    )?;
+    assert_err_contains(open(), "participant-loss tombstone chain mismatch");
+    // Rewritten with the digest recomputed: the supersession no longer binds.
+    tamper(
+        &survivor,
+        &format!(
+            "UPDATE recovery_loss_aborted SET record='{}',digest='{}' WHERE revision={}",
+            serde_json::to_string(&tombstone)?.replace('\'', "''"),
+            hash(&tombstone)?,
+            rows[0].0
+        ),
+    )?;
+    drop(open()?);
+    assert_err_contains(
+        a.f.derive_role_at(&survivor, &s.loss),
+        "superseded loss has no local tombstone",
+    );
+    tamper(&survivor, &restore)?;
+    drop(open()?);
+
+    // A tombstone for a loss this file was never part of is not history.
+    let mut foreign: AbortedSuccessor = serde_json::from_str(&rows[0].1)?;
+    foreign.loss.lost_member = [183; 32];
+    foreign.parent = Some(rows[0].2.clone());
+    tamper(
+        &survivor,
+        &format!(
+            "INSERT INTO recovery_loss_aborted VALUES({},'{}','{}')",
+            rows[0].0 + 1,
+            serde_json::to_string(&foreign)?.replace('\'', "''"),
+            hash(&foreign)?
+        ),
+    )?;
+    assert_err_contains(open(), "participant-loss tombstone chain mismatch");
+    tamper(
+        &survivor,
+        &format!(
+            "DELETE FROM recovery_loss_aborted WHERE revision={}",
+            rows[0].0 + 1
+        ),
+    )?;
+    let node = open()?;
+    assert!(node.checkpoint().is_ok());
+    drop(node);
+    drop(a);
+    Ok(())
+}
+
+/// Boundaries of the abort/supersede flow. Everything is dropped and reopened
+/// from disk between them, and replaying a prefix is always an exact no-op.
+const ABORT_DECIDED: u32 = 0;
+const ABORT_UNINSTALLED: u32 = 1;
+const ABORT_SUPERSEDED: u32 = 2;
+const ABORT_BOOTSTRAP: u32 = 3;
+const ABORT_LAST: u32 = ABORT_BOOTSTRAP;
+
+/// Replay the whole abort/supersede flow from the top and stop after `stop`.
+/// The superseding decision is signed once, up front, so a replay never needs
+/// a new authority action — exactly like an operator resuming after a crash.
+fn replay_abort(a: &Aborted, p: &Pending, stop: u32) -> Result<()> {
+    if stop < ABORT_UNINSTALLED {
+        return Ok(());
+    }
+    if install_state(&a.f.survivor_path)?.0.is_some() {
+        let handle = a.handle()?;
+        handle.abort_successor_install("fixture", &a.successor, &a.live(&a.journal))?;
+        drop(handle);
+    } else {
+        // Exact retry of a completed un-installation converges without
+        // touching the tombstone it already wrote.
+        let rows = tombstone_rows(&a.f.survivor_path)?;
+        let handle = a.handle()?;
+        handle.abort_successor_install("fixture", &a.successor, &a.live(&a.journal))?;
+        drop(handle);
+        ensure(
+            tombstone_rows(&a.f.survivor_path)? == rows,
+            "un-install retry rewrote the tombstone",
+        )?;
+    }
+    if stop == ABORT_UNINSTALLED {
+        return Ok(());
+    }
+    // Only now can the authority supersede: `Journal::abort_loss_successor`
+    // is already recorded and the survivor has durably un-installed. The exact
+    // same decision and token are replayed on every resume.
+    let s = decide_pending(a, p)?;
+    ensure(
+        a.f.journal
+            .fetch_loss(&a.f.trust.as_trust(), a.f.gate.as_ref())?
+            .request()
+            == &s.loss,
+        "superseding decision missing",
+    )?;
+    ensure(
+        a.f.derive_role_at(&a.f.survivor_path, &s.loss)? == a.f.survivor_role(),
+        "superseding evidence mismatch",
+    )?;
+    if stop == ABORT_SUPERSEDED {
+        return Ok(());
+    }
+    let handle = LossSurvivorHandle::open_existing(
+        &a.f.survivor_path,
+        a.f.identity.clone(),
+        "fixture",
+        StockSchema,
+        &a.f.trust,
+        &a.f.journal,
+        a.f.gate.as_ref(),
+    )?;
+    let mut replacement = Node::open_with_transition_trust(
+        &s.path,
+        Role::Secondary,
+        a.f.identity.clone(),
+        "fixture",
+        StockSchema,
+        a.f.trust.clone(),
+    )?;
+    bootstrap_replacement(&handle, &mut replacement, &a.f.journal, a.f.gate.as_ref())?;
+    drop(replacement);
+    drop(handle);
+    Ok(())
+}
+
+/// State every boundary of the abort/supersede flow must leave behind.
+fn assert_abort_state(a: &Aborted, p: &Pending, stop: u32) -> Result<()> {
+    let survivor = install_state(&a.f.survivor_path)?;
+    let tombstones = tombstone_rows(&a.f.survivor_path)?;
+    // One transaction: either the aborted record with no tombstone, or the
+    // tombstone with no record at all. Never both, never neither.
+    assert_eq!(
+        survivor.0.is_some(),
+        stop < ABORT_UNINSTALLED,
+        "survivor record at step {stop}"
+    );
+    assert_eq!(
+        tombstones.len(),
+        usize::from(stop >= ABORT_UNINSTALLED),
+        "tombstones at step {stop}"
+    );
+    assert_eq!(completion_row(&a.f.survivor_path)?, None);
+    assert!(cycle_rows(&a.f.survivor_path)?.is_empty());
+    // The owner row is never written by an abort or an un-installation.
+    assert_eq!(owner_role(&survivor.1)?, a.f.survivor_role());
+    // The survivor is never admitted anywhere along this walk. While the
+    // aborted install is still there it opens as a loss-installed node and is
+    // closed for want of a completion receipt; once un-installed it does not
+    // open at all, because its pre-loss certificate is superseded (C6).
+    let opened = open_with_authority(&a.f, &a.f.survivor_path, a.f.survivor_role());
+    assert_eq!(
+        opened.is_ok(),
+        stop < ABORT_UNINSTALLED,
+        "survivor open at step {stop}"
+    );
+    if let Ok(node) = opened {
+        assert!(
+            node.checkpoint().is_err(),
+            "survivor admitted at step {stop}"
+        );
+        drop(node);
+    }
+    // The superseding decision only exists from its own step on, and the
+    // effective loss follows it.
+    assert_eq!(
+        a.f.journal
+            .fetch_loss(&a.f.trust.as_trust(), a.f.gate.as_ref())?
+            .request()
+            == &p.loss,
+        stop >= ABORT_SUPERSEDED,
+        "effective loss at step {stop}"
+    );
+    // Its export capability keeps working throughout, against whichever
+    // decision is currently effective.
+    let handle = LossSurvivorHandle::<StockSchema>::open_existing(
+        &a.f.survivor_path,
+        a.f.identity.clone(),
+        "fixture",
+        StockSchema,
+        &a.f.trust,
+        &a.f.journal,
+        a.f.gate.as_ref(),
+    )?;
+    assert_eq!(handle.role, a.f.survivor_role());
+    drop(handle);
+    // The aborted replacement stays installed and closed for ever.
+    let stale = a.f.open_replacement(a.f.lost_role())?;
+    assert!(stale.checkpoint().is_err(), "aborted peer at step {stop}");
+    drop(stale);
+    // The fresh replacement is an ordinary empty node until it is bootstrapped.
+    let fresh = Node::<StockSchema>::open(
+        &p.path,
+        Role::Secondary,
+        a.f.identity.clone(),
+        "fixture",
+        StockSchema,
+    )?;
+    assert_eq!(
+        fresh.checkpoint()?.sequence,
+        if stop >= ABORT_BOOTSTRAP {
+            a.f.loss.survivor_cut.sequence
+        } else {
+            0
+        },
+        "fresh replacement at step {stop}"
+    );
+    drop(fresh);
+    Ok(())
+}
+
+/// Every boundary of the abort/supersede flow, crashed by dropping everything
+/// and reopening from disk, then the whole recovery carried to a first write.
+#[test]
+fn superseded_recovery_converges_after_a_crash_at_every_boundary() -> Result<()> {
+    let a = abort_fixture(Role::Secondary, Reached::BothInstalls)?;
+    // The abort is already durable in the successor journal; the superseding
+    // decision is signed once here and only recorded at its own step, because
+    // the authority cannot supersede before the survivor has un-installed.
+    let p = pending_supersession(&a, "replacement-superseding", [190; 32], [191; 32])?;
+    let mut durable: Option<String> = None;
+    for stop in ABORT_DECIDED..=ABORT_LAST {
+        replay_abort(&a, &p, stop)?;
+        assert_abort_state(&a, &p, stop)?;
+        if stop >= ABORT_UNINSTALLED {
+            let rows = tombstone_rows(&a.f.survivor_path)?;
+            let current = rows.first().map(|row| row.1.clone());
+            if let Some(previous) = &durable {
+                assert_eq!(current.as_deref(), Some(previous.as_str()));
+            }
+            durable = current;
+        }
+    }
+    assert!(durable.is_some());
+    // Resume from the top and carry the superseding recovery all the way.
+    replay_abort(&a, &p, u32::MAX)?;
+    let s = decide_pending(&a, &p)?;
+    let (_journal, _successor) = recover_superseded(&a, &s, "successor-journal-superseding")?;
+    assert_eq!(
+        tombstone_rows(&a.f.survivor_path)?
+            .first()
+            .map(|row| row.1.clone()),
+        durable
+    );
+    let before = a.f.survivor_receipts.len() as u64;
+    let survivor_node = open_with_authority(&a.f, &a.f.survivor_path, a.f.survivor_role())?;
+    let replacement_node = open_with_authority(&a.f, &s.path, a.f.lost_role())?;
+    let (mut primary, mut secondary) = match a.f.survivor_role() {
+        Role::Primary => (survivor_node, replacement_node),
+        Role::Secondary => (replacement_node, survivor_node),
+    };
+    let mut batch = stock_entry().batch;
+    batch.operation_id = "after-abort-crash-walk".into();
+    assert_eq!(
+        commit(&mut primary, &mut secondary, batch)?.sequence,
+        before + 1
+    );
+    let receipts = receipt_rows(&primary)?;
+    assert_eq!(receipts.len() as u64, before + 1);
+    assert_eq!(receipts[..before as usize], a.f.survivor_receipts[..]);
+    assert_eq!(receipt_rows(&secondary)?, receipts);
+    drop(primary);
+    drop(secondary);
+    drop(a);
     Ok(())
 }

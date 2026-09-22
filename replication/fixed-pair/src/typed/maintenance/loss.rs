@@ -37,6 +37,7 @@ const SURVIVOR_RECOVERY_TABLES: &[&str] = &[
     "recovery_completion",
     "recovery_cycles",
     "recovery_delivery",
+    "recovery_loss_aborted",
     "recovery_loss_active",
     "recovery_loss_completion",
     "recovery_loss_cycles",
@@ -52,6 +53,14 @@ const CYCLES_TABLE: &str = "recovery_loss_cycles";
 const CYCLES_DDL: &str = "CREATE TABLE IF NOT EXISTS main.recovery_loss_cycles(\
      revision INTEGER PRIMARY KEY,record TEXT NOT NULL,digest TEXT NOT NULL)";
 const MAX_CYCLE_ROWS: u64 = 1024;
+/// Append-only, hash-linked tombstones of the successor memberships this
+/// survivor installed and then un-installed under an authority-signed abort.
+/// A successor named here can never be installed again, and its replacement
+/// identity can never come back (S10).
+const ABORTED_TABLE: &str = "recovery_loss_aborted";
+#[cfg(any(test, feature = "experimental-recovery"))]
+const ABORTED_DDL: &str = "CREATE TABLE IF NOT EXISTS main.recovery_loss_aborted(\
+     revision INTEGER PRIMARY KEY,record TEXT NOT NULL,digest TEXT NOT NULL)";
 #[cfg(any(test, feature = "experimental-recovery"))]
 /// S10/S11 are not implemented on the node side yet; a loss that needs them is
 /// refused rather than partially honoured.
@@ -383,6 +392,10 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
                     "loss install evidence changed",
                 )?;
                 ensure_recovery_tables(&tx, SURVIVOR_RECOVERY_TABLES)?;
+                // S10 replay protection: a successor membership this node has
+                // already un-installed under a signed abort is never installed
+                // again, whatever a rolled-back journal file claims.
+                require_not_aborted(&tx, successor, record.successor_certificate)?;
                 ensure(
                     checkpoint::generation(&tx)? == self.request.survivor.generation,
                     "loss install generation mismatch",
@@ -484,6 +497,250 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
         successor_journal.fetch_loss_successor(successor, &trust.as_trust(), policy)?;
         Ok(())
     }
+
+    /// Atomically un-install the successor membership this survivor installed,
+    /// under the authority's signed abort (S10).
+    ///
+    /// The abort is never a parameter: it is fetched live from the successor
+    /// journal on both sides of the durable step (I2), so a caller can no more
+    /// hand in an abort than it can hand in a loss decision. A *completed*
+    /// successor is never un-installed — after completion a bad replacement is
+    /// an ordinary new loss — and the replacement itself is never touched: it
+    /// stays installed, closed for ever, and is discarded.
+    ///
+    /// The result is exactly the pre-install state: export-only, with ordinary
+    /// admission still shut because the pre-loss certificate is superseded.
+    pub fn abort_successor_install<P: transition::LossPolicy>(
+        &self,
+        passphrase: &str,
+        successor: &transition::LossSuccessorRequest,
+        authorities: &Authorities<'_, P>,
+    ) -> Result<()> {
+        let trust = &self.trust;
+        let policy = authorities.policy;
+        let source_journal = authorities.source;
+        let successor_journal = authorities.successor;
+        self.revalidate(source_journal, policy)?;
+        let loss = source_journal.fetch_loss(&trust.as_trust(), policy)?;
+        ensure(loss.request() == &self.request, "loss decision changed")?;
+        let abort =
+            successor_journal.fetch_loss_successor_abort(successor, &trust.as_trust(), policy)?;
+        let owner_expected = serde_json::to_string(&(&self.identity, self.role))?;
+        self.require_same_file()?;
+        let rw = Vesta::open_existing_read_write_with_passphrase(&self.path, passphrase)?;
+        let identity = self.require_same_file();
+        let outcome = rw.with_connection(|c| {
+            Ok((|| -> Result<()> {
+                identity?;
+                c.pragma_update(None, "synchronous", "FULL")?;
+                c.pragma_update(None, "temp_store", "MEMORY")?;
+                let synchronous: i64 = c.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
+                let mode: String = c.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+                ensure(
+                    synchronous == 2 && mode == "wal",
+                    "loss install durability mismatch",
+                )?;
+                let tx = Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
+                // I4: the full evidence validation re-runs on this very
+                // connection before anything is written.
+                let evidence = validate::<A>(
+                    &tx,
+                    &self.adapter,
+                    &self.identity,
+                    &self.contract,
+                    &self.initial,
+                    trust,
+                    &self.request,
+                )?;
+                ensure(
+                    evidence.role == self.role && evidence.manifest == self.manifest,
+                    "loss un-install evidence changed",
+                )?;
+                ensure_recovery_tables(&tx, SURVIVOR_RECOVERY_TABLES)?;
+                ensure(
+                    owner_row(&tx)? == owner_expected,
+                    "loss un-install owner mismatch",
+                )?;
+                match read_install(&tx)? {
+                    // I5: exact retry. The tombstone is already durable and the
+                    // active record is already gone; nothing is repaired. Every
+                    // field this abort determines must match; `parent` belongs
+                    // to the chain and `visit_aborted` has already checked it.
+                    None => {
+                        let mut last: Option<AbortedSuccessor> = None;
+                        visit_aborted(&tx, |row| {
+                            last = Some(row.clone());
+                            Ok(())
+                        })?;
+                        let row = last.ok_or("participant-loss un-install conflict")?;
+                        ensure(
+                            // The authority may already have superseded the
+                            // attempt this abort cancelled, so the tombstone's
+                            // loss is bound by lineage; every value the abort
+                            // itself determines is bound exactly.
+                            same_attempt(&row.loss, loss.request())
+                                && row.loss_certificate == abort.abort().parent_loss_certificate
+                                && row.loss_token_digest == abort.abort().parent_loss_token_digest
+                                && row.successor_id == abort.abort().successor_id
+                                && row.successor_certificate == abort.abort().successor_certificate
+                                && row.successor_token_digest
+                                    == abort.abort().successor_token_digest
+                                && row.abort_certificate == abort.certificate_id()
+                                && row.abort_token_digest == abort.token_digest()
+                                && row.fencing_ref == abort.fencing_ref(),
+                            "participant-loss un-install conflict",
+                        )?;
+                        tx.rollback()?;
+                        return Ok(());
+                    }
+                    Some((_, record)) => {
+                        // A completed recovery is never un-installed.
+                        ensure(
+                            read_completion(&tx)?.is_none(),
+                            "completed participant-loss recovery cannot be un-installed",
+                        )?;
+                        ensure(
+                            record.loss == self.request
+                                && record.successor == *successor
+                                && record.successor.id == abort.abort().successor_id
+                                && record.successor_certificate
+                                    == abort.abort().successor_certificate
+                                && record.successor_token_digest
+                                    == abort.abort().successor_token_digest
+                                && record.loss_certificate == abort.abort().parent_loss_certificate
+                                && record.loss_token_digest
+                                    == abort.abort().parent_loss_token_digest
+                                && record.member == self.request.survivor.member
+                                && record.previous_role == self.role
+                                && record.installed_role == self.role,
+                            "participant-loss un-install binding mismatch",
+                        )?;
+                    }
+                }
+                let tombstone = aborted_record(&tx, &loss, &abort)?;
+                let json = serde_json::to_string(&tombstone)?;
+                ensure(
+                    json.len() <= INSTALL_LIMIT,
+                    "participant-loss tombstone too large",
+                )?;
+                tx.execute_batch(ABORTED_DDL)?;
+                ensure(
+                    tx.execute(
+                        "INSERT INTO main.recovery_loss_aborted VALUES(?1,?2,?3)",
+                        params![self.request.revision, json, hash(&tombstone)?],
+                    )? == 1,
+                    "participant-loss tombstone write failed",
+                )?;
+                ensure(
+                    tx.execute("DELETE FROM main.recovery_loss_active WHERE id=1", [])? == 1,
+                    "participant-loss un-install failed",
+                )?;
+                // An empty singleton table is a partial state, not an empty
+                // slot, so the slot itself goes with the record.
+                tx.execute_batch("DROP TABLE main.recovery_loss_active")?;
+                // Post-state: no active record, no completion, the owner row
+                // untouched, and the whole evidence path still validating.
+                let after = validate::<A>(
+                    &tx,
+                    &self.adapter,
+                    &self.identity,
+                    &self.contract,
+                    &self.initial,
+                    trust,
+                    &self.request,
+                )?;
+                ensure(
+                    after.role == self.role
+                        && after.manifest == self.manifest
+                        && state(&tx)?.is_none()
+                        && !table_exists(&tx, COMPLETION_TABLE)?
+                        && owner_row(&tx)? == owner_expected,
+                    "participant-loss un-install post-state mismatch",
+                )?;
+                // I2: the last live checks sit immediately before the commit.
+                ensure(
+                    source_journal
+                        .fetch_loss(&trust.as_trust(), policy)?
+                        .request()
+                        == &self.request,
+                    "loss decision changed",
+                )?;
+                let live = successor_journal.fetch_loss_successor_abort(
+                    successor,
+                    &trust.as_trust(),
+                    policy,
+                )?;
+                ensure(
+                    live.abort() == abort.abort()
+                        && live.certificate_id() == abort.certificate_id()
+                        && live.token_digest() == abort.token_digest(),
+                    "loss successor abort changed",
+                )?;
+                tx.commit()?;
+                Ok(())
+            })())
+        })?;
+        drop(rw);
+        outcome?;
+        // Full revalidation through the retained read-only connection, which
+        // still points at the inode validated at `open_existing`.
+        let (evidence, durable) = self.db.with_connection(|c| {
+            Ok((|| -> Result<(Evidence, Option<Installed>)> {
+                let evidence = validate::<A>(
+                    c,
+                    &self.adapter,
+                    &self.identity,
+                    &self.contract,
+                    &self.initial,
+                    trust,
+                    &self.request,
+                )?;
+                Ok((evidence, state(c)?))
+            })())
+        })??;
+        ensure(
+            evidence.role == self.role && evidence.manifest == self.manifest && durable.is_none(),
+            "participant-loss un-install revalidation mismatch",
+        )?;
+        self.revalidate(source_journal, policy)?;
+        successor_journal.fetch_loss_successor_abort(successor, &trust.as_trust(), policy)?;
+        Ok(())
+    }
+}
+
+/// The tombstone a signed abort commits this survivor to, hash-linked to the
+/// tombstones already recorded.
+#[cfg(any(test, feature = "experimental-recovery"))]
+fn aborted_record(
+    c: &Connection,
+    loss: &transition::CommittedLoss,
+    abort: &transition::CommittedLossSuccessorAbort,
+) -> Result<AbortedSuccessor> {
+    let mut parent = None;
+    let mut previous: Option<u64> = None;
+    visit_aborted(c, |row| {
+        parent = Some(hash(row)?);
+        previous = Some(row.loss.revision);
+        Ok(())
+    })?;
+    ensure(
+        previous.is_none_or(|p| p < loss.request().revision),
+        "participant-loss tombstone revision reuse",
+    )?;
+    Ok(AbortedSuccessor {
+        parent,
+        loss: loss.request().clone(),
+        // Taken from the abort, not from the loss read: the tombstone must
+        // name exactly the decision the signed abort names as its parent.
+        loss_certificate: abort.abort().parent_loss_certificate,
+        loss_token_digest: abort.abort().parent_loss_token_digest,
+        successor_id: abort.abort().successor_id,
+        successor_certificate: abort.abort().successor_certificate,
+        successor_token_digest: abort.abort().successor_token_digest,
+        abort_certificate: abort.certificate_id(),
+        abort_token_digest: abort.token_digest(),
+        fencing_ref: abort.fencing_ref(),
+    })
 }
 
 fn owner_row(c: &Connection) -> Result<String> {
@@ -681,7 +938,8 @@ fn retired_of(record: &Installed) -> [[u8; 32]; 8] {
 }
 
 #[cfg(any(test, feature = "experimental-recovery"))]
-/// Every member, generation and membership this node has already retired. A
+/// Every member, generation and membership this node has already retired —
+/// through a completed recovery *or* through an aborted successor. A
 /// replacement may never reuse any of them, whatever the journal says.
 fn retired_identities(c: &Connection) -> Result<Vec<[u8; 32]>> {
     let mut retired = Vec::new();
@@ -689,7 +947,190 @@ fn retired_identities(c: &Connection) -> Result<Vec<[u8; 32]>> {
         retired.extend(retired_of(&record.installed));
         Ok(())
     })?;
+    visit_aborted(c, |row| {
+        // An aborted replacement is fenced for good: its member, generation
+        // and membership are burnt exactly as a completed one's are.
+        retired.extend([
+            row.loss.lost_member,
+            row.loss.lost_generation,
+            row.loss.replacement_member,
+            row.loss.replacement_generation,
+            row.loss.membership,
+            row.loss.replacement_membership,
+        ]);
+        Ok(())
+    })?;
     Ok(retired)
+}
+
+/// One un-installed successor membership: the loss it belonged to, the
+/// successor it activated and the signed abort that cancelled it.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AbortedSuccessor {
+    parent: Option<String>,
+    loss: transition::LossRequest,
+    /// The loss's own certificate id and token digest. `Supersedes` names the
+    /// superseded loss by exactly these two values, so without them the node
+    /// could not bind a superseding decision to its own tombstone.
+    loss_certificate: [u8; 32],
+    loss_token_digest: [u8; 32],
+    successor_id: [u8; 32],
+    successor_certificate: [u8; 32],
+    successor_token_digest: [u8; 32],
+    abort_certificate: [u8; 32],
+    abort_token_digest: [u8; 32],
+    /// The abort's opaque fencing reference, kept so the tombstone records
+    /// *why* the replacement may never return.
+    fencing_ref: [u8; 32],
+}
+
+/// Walk the append-only tombstone chain, verifying the hash link. Bounded
+/// before any row is decoded, exactly like the cycle history.
+fn visit_aborted(
+    c: &Connection,
+    mut visit: impl FnMut(&AbortedSuccessor) -> Result<()>,
+) -> Result<()> {
+    if !table_exists(c, ABORTED_TABLE)? {
+        return Ok(());
+    }
+    let (rows, longest): (u64, u64) = c.query_row(
+        "SELECT count(*),coalesce(max(length(CAST(record AS BLOB))),0) \
+         FROM main.recovery_loss_aborted",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    // An existing table with no rows at all is a partial state, not an empty
+    // history: an un-installation writes its row and drops the active record
+    // in one transaction.
+    ensure(
+        (1..=MAX_CYCLE_ROWS).contains(&rows) && longest <= 256 * 1024,
+        "participant-loss tombstone limit",
+    )?;
+    let mut parent: Option<String> = None;
+    let mut previous: Option<u64> = None;
+    let mut statement = c.prepare(
+        "SELECT revision,record,digest FROM main.recovery_loss_aborted ORDER BY revision",
+    )?;
+    let mut cursor = statement.query([])?;
+    while let Some(row) = cursor.next()? {
+        let revision: u64 = row.get(0)?;
+        let json: String = row.get(1)?;
+        let stored: String = row.get(2)?;
+        let record: AbortedSuccessor = serde_json::from_str(&json)?;
+        ensure(
+            stored == hash(&record)?
+                && record.parent == parent
+                && revision == record.loss.revision
+                && previous.is_none_or(|p| p < revision)
+                && record.loss_certificate != [0; 32]
+                && record.loss_token_digest != [0; 32]
+                && record.successor_id != [0; 32]
+                && record.successor_certificate != [0; 32]
+                && record.successor_token_digest != [0; 32]
+                && record.abort_certificate != [0; 32]
+                && record.abort_token_digest != [0; 32]
+                && record.fencing_ref != [0; 32],
+            "participant-loss tombstone chain mismatch",
+        )?;
+        visit(&record)?;
+        parent = Some(stored);
+        previous = Some(revision);
+    }
+    Ok(())
+}
+
+/// Everything a superseding loss must keep identical to the loss it replaces.
+/// This is the recovery crate's own rule set, mirrored so the node can never
+/// accept a "supersession" the journal would have refused, and so a tombstone
+/// can be recognised as belonging to the same lineage as a later attempt.
+fn same_lineage(previous: &transition::LossRequest, next: &transition::LossRequest) -> bool {
+    previous.format == next.format
+        && previous.kind() == next.kind()
+        && previous.authority_id == next.authority_id
+        && previous.install == next.install
+        && previous.region == next.region
+        && previous.scope == next.scope
+        && previous.schema == next.schema
+        && previous.membership == next.membership
+        && previous.source_certificate == next.source_certificate
+        && previous.source_token_digest == next.source_token_digest
+        && previous.source_cut == next.source_cut
+        && previous.lost_member == next.lost_member
+        && previous.lost_generation == next.lost_generation
+        && previous.survivor == next.survivor
+        && previous.survivor_cut == next.survivor_cut
+        && previous.survivor_publication == next.survivor_publication
+        && previous.abandoned_request == next.abandoned_request
+}
+
+/// True when `next` is `previous` itself or a loss that supersedes it.
+fn same_attempt(previous: &transition::LossRequest, next: &transition::LossRequest) -> bool {
+    previous == next || (next.supersedes.is_some() && same_lineage(previous, next))
+}
+
+/// A successor membership that was un-installed under a signed abort can never
+/// be installed again — not from a rolled-back journal file, not ever.
+#[cfg(any(test, feature = "experimental-recovery"))]
+fn require_not_aborted(
+    c: &Connection,
+    successor: &transition::LossSuccessorRequest,
+    certificate: [u8; 32],
+) -> Result<()> {
+    let mut conflict = false;
+    visit_aborted(c, |row| {
+        // Either identifier is enough: a replay can reuse the request id, the
+        // certificate id, or both.
+        conflict |= row.successor_id == successor.id || row.successor_certificate == certificate;
+        Ok(())
+    })?;
+    ensure(!conflict, "aborted loss successor cannot be installed")
+}
+
+/// The tombstone that authorises `loss` to supersede an earlier attempt, read
+/// from this node's own append-only history. The authority's journal ran the
+/// same rule set; this file is a different trust domain and runs it again.
+#[cfg(any(test, feature = "experimental-recovery"))]
+fn require_supersession(c: &Connection, loss: &transition::LossRequest) -> Result<()> {
+    let Some(supersedes) = loss.supersedes.as_ref() else {
+        return Ok(());
+    };
+    let mut superseded: Option<transition::LossRequest> = None;
+    visit_aborted(c, |row| {
+        if row.loss_certificate == supersedes.loss_certificate
+            && row.loss_token_digest == supersedes.loss_token_digest
+            && row.abort_certificate == supersedes.abort_certificate
+            && row.abort_token_digest == supersedes.abort_token_digest
+        {
+            superseded = Some(row.loss.clone());
+        }
+        Ok(())
+    })?;
+    let previous = superseded.ok_or("superseded loss has no local tombstone")?;
+    ensure(
+        same_lineage(&previous, loss),
+        "superseding loss changes more than the replacement",
+    )?;
+    ensure(
+        loss.revision > previous.revision
+            && loss.replacement_member != previous.replacement_member
+            && loss.replacement_generation != previous.replacement_generation
+            && loss.replacement_membership != previous.replacement_membership,
+        "superseding loss reuses a retired replacement",
+    )?;
+    // No identity this node has already burnt — through a completed recovery
+    // or through an abort — may ever come back as the new replacement.
+    let already = retired_identities(c)?;
+    ensure(
+        ![
+            loss.replacement_member,
+            loss.replacement_generation,
+            loss.replacement_membership,
+        ]
+        .iter()
+        .any(|id| already.contains(id)),
+        "participant-loss identity reuse",
+    )
 }
 
 /// Structural binding of a successor membership to its parent loss decision.
@@ -921,13 +1362,11 @@ fn sole_participant(
     Ok(index)
 }
 
-/// S10/S11 evidence is refused until their node side exists.
+/// S11 evidence is refused until its node side exists. `supersedes` is now
+/// honoured (S10); `abandoned_request` and `source_kind = Decided` are not.
 #[cfg(any(test, feature = "experimental-recovery"))]
 fn require_supported_loss(loss: &transition::LossRequest) -> Result<()> {
-    ensure(
-        loss.supersedes.is_none() && loss.abandoned_request.is_none(),
-        NOT_ENABLED,
-    )?;
+    ensure(loss.abandoned_request.is_none(), NOT_ENABLED)?;
     ensure(
         !matches!(loss.source_kind, Some(transition::SourceKind::Decided)),
         NOT_ENABLED,
@@ -1019,6 +1458,11 @@ pub fn install_replacement<A: ReplicatedSchema, P: transition::LossPolicy>(
             "loss replacement owner mismatch",
         )?;
         ensure_recovery_tables(&tx, REPLACEMENT_RECOVERY_TABLES)?;
+        // Symmetric with the survivor: an un-installed successor membership is
+        // never installed again. A bootstrap replacement has no tombstones of
+        // its own, so in practice the journal's own terminal state stops it
+        // first; this is the local half of the same rule.
+        require_not_aborted(&tx, request, record.successor_certificate)?;
         capacity::verify_schema(&tx)?;
         capacity::verify_accounting(&tx)?;
         let base = checkpoint::base_for::<SchemaId>(&tx)?.ok_or("loss replacement base missing")?;
@@ -1393,22 +1837,30 @@ fn survivor_founding(
     // atomically, into the append-only cycle history, and the row that carries
     // them names exactly this loss as the one that retired them. Both phases
     // of that single transaction therefore have to validate.
-    let (record, receipt) = match read_install(c)? {
-        None => return Err("loss founding recovery missing".into()),
-        Some((_, active)) if active.loss == *loss => {
-            let mut last: Option<RetiredLoss> = None;
-            visit_cycles(c, |row| {
-                last = Some(row.clone());
-                Ok(())
-            })?;
-            let row = last.ok_or("loss founding recovery missing")?;
-            ensure(row.next == *loss, "loss founding recovery mismatch")?;
-            (row.installed, row.completion)
-        }
-        Some((_, founding)) => (
-            founding,
-            read_completion(c)?.ok_or("loss founding recovery incomplete")?,
-        ),
+    // A survivor whose successor was un-installed under a signed abort has no
+    // active record at all (S10): it is back to "post-`decide_loss`,
+    // pre-install", and its founding recovery is in the cycle history too.
+    let active = read_install(c)?.map(|(_, record)| record);
+    let installed = active.as_ref().is_some_and(|a| a.loss != *loss);
+    let (record, receipt) = if installed {
+        let founding = active.ok_or("loss founding recovery missing")?;
+        let receipt = read_completion(c)?.ok_or("loss founding recovery incomplete")?;
+        (founding, receipt)
+    } else {
+        let mut last: Option<RetiredLoss> = None;
+        visit_cycles(c, |row| {
+            last = Some(row.clone());
+            Ok(())
+        })?;
+        let row = last.ok_or("loss founding recovery missing")?;
+        // The retirement this loss — or the attempt it supersedes — made room
+        // for. Supersession may change the replacement and nothing else, so an
+        // earlier attempt's row still names this lineage.
+        ensure(
+            same_attempt(&row.next, loss),
+            "loss founding recovery mismatch",
+        )?;
+        (row.installed, row.completion)
     };
     let stored: CompletionReceipt = serde_json::from_str(&receipt)?;
     ensure(
@@ -1508,6 +1960,10 @@ pub(super) fn validate<A: ReplicatedSchema>(
         "loss membership reused",
     )?;
     require_supported_loss(loss)?;
+    // A superseding decision needs this node's own tombstone for the attempt
+    // it replaces: the authority's journal cannot read this file, and this
+    // file cannot read the abort's journal, so both check independently.
+    require_supersession(c, loss)?;
     // I1. The survivor index — and therefore the local role — is derived only
     // from the signed loss decision and the document that founded this pair:
     // the certified compaction for an ordinary pair, or the completed loss
@@ -1632,45 +2088,81 @@ pub(crate) fn state(c: &Connection) -> Result<Option<Installed>> {
     // acceptable evidence, whatever it would return.
     let shadows: u64 = c.query_row(
         "SELECT count(*) FROM main.sqlite_schema \
-         WHERE type<>'table' AND name IN ('recovery_loss_active','recovery_loss_completion')",
+         WHERE type<>'table' AND name IN \
+         ('recovery_loss_active','recovery_loss_completion','recovery_loss_aborted')",
         [],
         |r| r.get(0),
     )?;
     ensure(shadows == 0, "participant-loss table shadowed")?;
     let record = read_install(c)?.map(|(_, record)| record);
     // The retired history is verified on every read, and a node that has
-    // retired a recovery must still be inside one.
+    // retired a recovery must still be inside one — or have un-installed it
+    // again under a signed abort, which the tombstone chain accounts for.
     let mut retired = 0u64;
     let mut last_next: Option<transition::LossRequest> = None;
+    // Every loss this file has ever been installed by, collected in the single
+    // verified walk of the cycle chain.
+    let mut known: Vec<transition::LossRequest> = Vec::new();
     visit_cycles(c, |row| {
         retired += 1;
         last_next = Some(row.next.clone());
+        known.push(row.installed.loss.clone());
+        known.push(row.next.clone());
         Ok(())
     })?;
-    ensure(
-        retired == 0 || record.is_some(),
-        "orphan participant-loss cycle history",
-    )?;
-    if let Some(record) = &record {
-        // The active record is exactly the install the last retirement made
-        // room for, and an install founded by an earlier recovery must have
-        // retired it. Neither end of the history can be dropped unnoticed.
+    let mut last_aborted: Option<transition::LossRequest> = None;
+    visit_aborted(c, |row| {
+        last_aborted = Some(row.loss.clone());
+        Ok(())
+    })?;
+    // Every tombstone belongs to the attempt this file is in, or to one of the
+    // recoveries it has retired: a tombstone for an unrelated loss is not
+    // history, it is an injected veto.
+    if let Some(current) = record
+        .as_ref()
+        .map(|r| r.loss.clone())
+        .or_else(|| last_aborted.clone())
+    {
+        known.push(current);
+    }
+    visit_aborted(c, |row| {
         ensure(
-            last_next.is_none_or(|next| next == record.loss),
-            "participant-loss cycle chain mismatch",
-        )?;
-        // A *survivor* installed by a loss that was founded on an earlier
-        // recovery necessarily retired that recovery in the same transaction.
-        // A replacement is a new file and has nothing to retire, which is
-        // exactly what tells the two apart — never a flag.
-        ensure(
-            retired > 0
-                || !(matches!(
-                    record.loss.source_kind,
-                    Some(transition::SourceKind::LossSuccessor)
-                ) && record.member == record.loss.survivor.member),
-            "participant-loss cycle history missing",
-        )?;
+            known.iter().any(|loss| same_lineage(&row.loss, loss)),
+            "participant-loss tombstone chain mismatch",
+        )
+    })?;
+    match &record {
+        // A retirement with no install at all is only explained by an abort of
+        // exactly the install it made room for.
+        None => ensure(
+            retired == 0
+                || last_aborted
+                    .as_ref()
+                    .zip(last_next.as_ref())
+                    .is_some_and(|(aborted, next)| same_attempt(next, aborted)),
+            "orphan participant-loss cycle history",
+        )?,
+        Some(record) => {
+            // The active record is exactly the install the last retirement made
+            // room for, and an install founded by an earlier recovery must have
+            // retired it. Neither end of the history can be dropped unnoticed.
+            ensure(
+                last_next.is_none_or(|next| same_attempt(&next, &record.loss)),
+                "participant-loss cycle chain mismatch",
+            )?;
+            // A *survivor* installed by a loss that was founded on an earlier
+            // recovery necessarily retired that recovery in the same transaction.
+            // A replacement is a new file and has nothing to retire, which is
+            // exactly what tells the two apart — never a flag.
+            ensure(
+                retired > 0
+                    || !(matches!(
+                        record.loss.source_kind,
+                        Some(transition::SourceKind::LossSuccessor)
+                    ) && record.member == record.loss.survivor.member),
+                "participant-loss cycle history missing",
+            )?;
+        }
     }
     ensure(
         record.is_some() || !table_exists(c, COMPLETION_TABLE)?,
