@@ -1,13 +1,26 @@
 # Participant loss during in-flight certified maintenance
 
-Status: **NOT ENABLED.** Do not plan an operation around this path.
+Status: **experimental.** Local qualification only; macOS arm64.
 
-The code exists (`typed::maintenance::pending::terminate_by_loss`, `LossRequest` format 2
-with `source_kind` and `abandoned_request`), but it is crate-internal, reachable only from
-the crate's own tests, and the `LossPolicy` hooks it depends on are **default-deny**. An
-integrator who has not written those hooks gets
-`maintenance rollback evidence missing` or `maintenance finish-forward evidence missing`
-and nothing happens.
+- The entry point is public only with the `experimental-recovery` feature:
+  `typed::maintenance::pending::terminate_by_loss(&mut handle, &authorities)`, where
+  `handle` is the survivor's `PendingMaintenanceHandle` (opened with
+  `PendingMaintenanceHandle::open_existing_with_authority`, the request read back with
+  `peek_pending`) and `authorities = MaintenanceAuthorities::new(&journal, &trust,
+  &loss_policy)` names the source journal holding the signed loss. The branch is never an
+  argument. No timestamp is taken; the loss token is verified historically.
+- The survivor-side evidence adapter exists: `typed::maintenance::loss::SurvivorEvidence`
+  wraps the integrator's own `LossPolicy` and implements, from the survivor's durable state
+  read read-only, the three hooks the journal cannot check for itself
+  (`maintenance_rollback_authorized`, `maintenance_finish_forward_authorized`,
+  `survivor_prepared` under `source_kind = Decided`). It deliberately does not take the
+  node lock. Without it (or an equivalent) those hooks stay **default-deny** and the loss
+  is refused with `maintenance rollback evidence missing` or
+  `maintenance finish-forward evidence missing`.
+- **The finish-forward branch is experimental — pending independent review before
+  production use.** Do not plan a production operation around it.
+- Authority continuity, fencing and the external head/reservation remain the integrator's
+  `LossPolicy`; `SurvivorEvidence` delegates every other decision to it.
 
 ## Why it exists
 
@@ -63,15 +76,23 @@ Consequences an operator must know:
 - No ACK is ever fabricated for the lost member, and the decided transition is never marked
   completed in the journal.
 
+## Sequence on the survivor
+
+1. The authority decides the loss with `SurvivorEvidence::new(survivor_path, identity,
+   passphrase, adapter, trust, &loss_policy)` as its `LossPolicy`, so the branch hooks see
+   the survivor's durable phase.
+2. `peek_pending(survivor_path, &identity, passphrase)` for the request, then
+   `PendingMaintenanceHandle::open_existing_with_authority(…)`.
+3. `terminate_by_loss(&mut handle, &authorities)`. Exact retry converges; after success
+   the handle only re-reads the live loss and requires the same durable trace.
+4. Drop the handle and continue with the ordinary participant-loss flow
+   ([participant loss](vesta-participant-loss.md)): `LossSurvivorHandle::open_existing`,
+   replacement bootstrap, install, completion.
+
 ## What is still missing
 
-- **The integrator adapter.** There are no production `LossPolicy` implementations for
-  `maintenance_rollback_authorized`, `maintenance_finish_forward_authorized`, or
-  `survivor_prepared` under `source_kind = Decided`. What is required is an adapter that
-  reads the survivor's durable state read-only — phase, pending request, installed base,
-  certificate — and proves the branch from it. Until that exists the path cannot be used
-  even with the feature compiled in.
-- **A public entry point.** `terminate_by_loss` is `pub(crate)`.
+- **Independent review of the finish-forward branch** before any production use.
+- Qualification beyond macOS arm64 and beyond the in-crate crash and role matrices.
 
 ## Review status
 

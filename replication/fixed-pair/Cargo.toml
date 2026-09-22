@@ -66,6 +66,9 @@ required-features = ["test-support"]
 name = "network"
 required-features = ["test-support"]
 [[test]]
+name = "certified_maintenance"
+required-features = ["experimental-recovery"]
+[[test]]
 name = "api"
 required-features = ["demo-api"]
 [[test]]

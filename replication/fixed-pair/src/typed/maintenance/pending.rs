@@ -1,11 +1,98 @@
-//! Restricted opener for a certified-maintenance operation which has already
-//! closed ordinary node admission. It never creates, migrates, or repairs data.
+//! Certified pair maintenance: an authority-decided compaction of a recovered
+//! fixed pair, its signed abort, and its termination by a participant loss.
+//!
+//! **Experimental.** This module is public only with the
+//! `experimental-recovery` feature and is crate-internal otherwise.
+//!
+//! # Lifecycle
+//!
+//! Every step is an explicit call on exclusively owned local state. A step
+//! never infers a role, never accepts a role, a connection or a boolean
+//! override from the caller, and is an exact, restartable retry of itself.
+//!
+//! 1. [`prepare_pair`] — the **one-way door**. After a read-only preflight of
+//!    both ordinary [`Node`]s it durably writes the pending marker and closes
+//!    ordinary admission on both nodes (runtime format 5). From here an
+//!    ordinary `Node::open` fails; the only way to reach the files is
+//!    [`PendingMaintenanceHandle::open_existing_with_authority`], and the only
+//!    ways out are finishing the cycle, a signed abort, or a participant loss.
+//!    The preflight refuses every state the later APPLY could never satisfy
+//!    (pinned publication, legacy compaction, stale plan, loss recovery).
+//! 2. [`decide_prepared`] — the authority records its decision for exactly the
+//!    prepared request. Neither node is mutated.
+//! 3. [`record_decided`] — each node durably records the decision (phase
+//!    `decided`).
+//! 4. [`apply_decided`] — each node prunes its log to the certified cut and
+//!    stores the certificate (phase `applied`). Irreversible: after this the
+//!    transition can only be finished forward.
+//! 5. [`acknowledge_applied`] — each node's own live state is the evidence for
+//!    its acknowledgement at the authority.
+//! 6. [`complete_authority`] — once both acknowledgements are recorded the
+//!    authority completes the transition under a *derived* completion id
+//!    (request id, token digest, acknowledgements); the caller never picks it.
+//! 7. [`record_complete`] — each node durably records the completion (phase
+//!    `complete`).
+//! 8. [`finalize_node`] (or [`finalize_pair`]) — each node archives the
+//!    completion, drops the pending tables and reopens ordinary admission.
+//!    Per node and restartable after a crash between the two nodes.
+//!
+//! [`peek_pending`] reports the durable phase, role and request of a pending
+//! node without any authority, so an operator can find out where a crashed
+//! cycle stopped and reopen it.
+//!
+//! # Abort
+//!
+//! A pair that has not applied (phase `prepared` or `decided`) can be taken
+//! back to ordinary operation with a signed maintenance abort:
+//! [`begin_abort`] on each node (durable, one-way: phase `aborting`),
+//! [`abort_authority`] (recorded at the authority only while both nodes are
+//! durably aborting on exactly that abort), then [`finish_abort`] per node or
+//! [`abort_pair`]. An applied pair can never be aborted.
+//!
+//! # Termination by participant loss
+//!
+//! If a participant is lost mid-cycle, [`terminate_by_loss`] ends the pending
+//! maintenance on the survivor under the signed loss decision. The branch is
+//! not a caller's choice: `prepared`/`decided` rolls back, `applied` finishes
+//! forward. The finish-forward branch is **experimental — pending independent
+//! review before production use**. See `docs/operations/` for the runbooks.
+//!
+//! # Integrator hooks
+//!
+//! The integrator supplies the authority side and nothing else:
+//! a [`transition::Journal`], the pinned [`transition::TrustStore`], and a
+//! [`transition::Policy`] implementing `continuity`, `prepared`, `applied`
+//! and, for abort and historical checks, `abort_applicable` and
+//! `historical_completion` (their defaults deny). `abort_applicable` must check
+//! the live authority head/reservation for the aborted revision itself;
+//! [`abort_authority`] adds the node-side evidence (both nodes durably
+//! aborting) after it. [`terminate_by_loss`] takes a
+//! [`transition::LossPolicy`]; for its survivor-side hooks the library provides
+//! [`super::loss::SurvivorEvidence`]. Journal, trust store and policy are grouped in
+//! [`MaintenanceAuthorities`] and are consulted live on every call; nothing is
+//! cached across calls. A node that already went through a certified cycle
+//! additionally needs a [`crate::typed::CertifiedAuthority`] to be opened by
+//! [`PendingMaintenanceHandle::open_existing_with_authority`].
+//!
+//! # Time
+//!
+//! No public function takes a timestamp. The only two token *validity-window*
+//! checks — issuance of the maintenance token and issuance of the abort token —
+//! read the system clock ([`std::time::SystemTime`], Unix seconds). A clock set
+//! before the Unix epoch is an error. Every other step verifies durable tokens
+//! historically (signature and binding, no expiry), so an interrupted cycle
+//! stays resumable after its tokens expire.
 use super::*;
+#[cfg(feature = "experimental-recovery")]
+use crate::recovery::transition;
 use sha2::{Digest, Sha256};
+#[cfg(feature = "experimental-recovery")]
 use std::path::Path;
 
+#[cfg(feature = "experimental-recovery")]
 const MARKER: &str = "node_pending_certified_maintenance";
 
+#[cfg(feature = "experimental-recovery")]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Marker {
@@ -19,6 +106,7 @@ struct Marker {
 
 /// Local record of a signed maintenance abort. Its presence is the durable,
 /// one-way proof that this node will never roll the transition forward.
+#[cfg(feature = "experimental-recovery")]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct AbortLocal {
@@ -30,6 +118,7 @@ struct AbortLocal {
 
 /// Format 1 rows serialise byte-identically: `abort` is skipped when absent, so
 /// a node that never aborts writes exactly the bytes it wrote before.
+#[cfg(feature = "experimental-recovery")]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Prepared {
@@ -44,6 +133,7 @@ struct Prepared {
     abort: Option<AbortLocal>,
 }
 
+#[cfg(feature = "experimental-recovery")]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Active {
@@ -59,6 +149,7 @@ fn digest<T: Serialize>(value: &T) -> Result<[u8; 32]> {
     Ok(Sha256::digest(serde_json::to_vec(value)?).into())
 }
 
+#[cfg(feature = "experimental-recovery")]
 /// Is a certified maintenance transaction durably in progress here?
 fn pending_present(c: &Connection) -> Result<bool> {
     Ok(c.query_row(
@@ -75,14 +166,33 @@ fn pending_present(c: &Connection) -> Result<bool> {
 ///
 /// This performs no authority verification: it proves only that the marker and
 /// the progress record agree with each other and with the owner row.
+#[cfg(feature = "experimental-recovery")]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PendingSummary {
+pub struct PendingSummary {
+    /// The role recorded by the durable marker and the owner row.
     pub role: Role,
+    /// The durable phase: `prepared`, `decided`, `applied`, `complete` or
+    /// `aborting`.
     pub phase: String,
-    pub request: crate::recovery::transition::Request,
+    /// The exact request this node prepared. Pass it to
+    /// [`PendingMaintenanceHandle::open_existing_with_authority`].
+    pub request: transition::Request,
 }
 
-pub(crate) fn peek_pending(
+/// Read, without any authority and without writing, where a pending certified
+/// maintenance on the node file at `path` stopped: its role, durable phase and
+/// the request it prepared.
+///
+/// Takes the ordinary node lock for the duration of the read, so it fails
+/// while a handle or `Node` holds the file. Performs no token checks at all.
+///
+/// # Errors
+///
+/// Fails when the file is absent or a symlink, the lock is held, the node has
+/// no pending certified maintenance (`"node has no pending certified
+/// maintenance"`), or the marker, progress record and owner row disagree.
+#[cfg(feature = "experimental-recovery")]
+pub fn peek_pending(
     path: impl AsRef<Path>,
     identity: &Identity<SchemaId>,
     passphrase: &str,
@@ -139,20 +249,18 @@ pub(crate) fn peek_pending(
     })?
 }
 
+/// What [`progress_of`] reads: the durable role, phase, request and decision.
+#[cfg(feature = "experimental-recovery")]
+pub(super) type Progress = (Role, String, transition::Request, Option<[u8; 32]>);
+
 /// Connection-level read of the pending progress, for callers that already
 /// hold their own read-only connection and must not take the node lock.
 /// Returns `None` when this node has no pending certified maintenance.
+#[cfg(feature = "experimental-recovery")]
 pub(super) fn progress_of(
     c: &Connection,
     identity: &Identity<SchemaId>,
-) -> Result<
-    Option<(
-        Role,
-        String,
-        crate::recovery::transition::Request,
-        Option<[u8; 32]>,
-    )>,
-> {
+) -> Result<Option<Progress>> {
     if !pending_present(c)? {
         return Ok(None);
     }
@@ -208,6 +316,7 @@ fn singleton_text(c: &Connection, table: &str, column: &str, limit: usize) -> Re
 /// Every precondition `apply_decided` later asserts about pre-existing durable
 /// state. `prepare_pair` is a one-way door, so a node that could never reach
 /// APPLY must be refused before the marker is written, not after.
+#[cfg(feature = "experimental-recovery")]
 fn require_appliable(c: &Connection) -> Result<()> {
     require_unpinned(c)?;
     let table = |name: &str| -> Result<bool> {
@@ -235,14 +344,93 @@ fn require_appliable(c: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn prepare_pair<A: ReplicatedSchema>(
+/// The live authority every journal-consulting step of this module must
+/// consult: the transition journal, the pinned trust store and the
+/// integrator's policy. Borrowed, so nothing is cached across a call; the
+/// policy is re-asked inside every step.
+///
+/// `P` is a [`transition::Policy`] for the lifecycle and abort, and a
+/// [`transition::LossPolicy`] for [`terminate_by_loss`].
+#[cfg(feature = "experimental-recovery")]
+pub struct MaintenanceAuthorities<'a, P> {
+    /// The authority's transition journal for this pair's scope.
+    pub journal: &'a transition::Journal,
+    /// The pinned authority keys and token profile.
+    pub trust: &'a transition::TrustStore,
+    /// The integrator's live policy hooks.
+    pub policy: &'a P,
+}
+
+#[cfg(feature = "experimental-recovery")]
+impl<'a, P> MaintenanceAuthorities<'a, P> {
+    /// Group the three borrowed authorities.
+    pub fn new(
+        journal: &'a transition::Journal,
+        trust: &'a transition::TrustStore,
+        policy: &'a P,
+    ) -> Self {
+        Self {
+            journal,
+            trust,
+            policy,
+        }
+    }
+}
+
+/// H3: token validity windows are checked against the system clock, never
+/// against a caller-supplied instant. Unix seconds, like the token claims.
+#[cfg(feature = "experimental-recovery")]
+fn system_now() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch")?
+        .as_secs())
+}
+
+/// Close ordinary admission on both nodes and durably record the prepared
+/// certified maintenance. **One-way door**: after this succeeds on a node,
+/// `Node::open` fails on it until the cycle is finalized, aborted or
+/// terminated by a loss.
+///
+/// `p` must be the primary and `s` the secondary of one recovered pair (the
+/// roles are the nodes' own; they are checked, never supplied). `plan` must be
+/// the exact [`compaction::PairPlan`] the authority signed into `request`.
+///
+/// Token time check: the maintenance `token` must be inside its issuance
+/// window (`nbf <= now < exp`) at the **system clock**. The token is also
+/// verified against `trust` and bound to `request`.
+///
+/// Every precondition the later APPLY needs (unpinned publication, no legacy
+/// compaction, no loss recovery, fresh plan, verified publication) is checked
+/// read-only on both nodes before either is written. Exact retry with the same
+/// arguments converges; a node already prepared for another request fails.
+///
+/// # Errors
+///
+/// Fails on any binding, preflight or durable-write mismatch, on an expired or
+/// untrusted token, or when the system clock is before the Unix epoch.
+#[cfg(feature = "experimental-recovery")]
+pub fn prepare_pair<A: ReplicatedSchema>(
     p: &mut Node<A>,
     s: &mut Node<A>,
     plan: &compaction::PairPlan,
-    request: &crate::recovery::transition::Request,
+    request: &transition::Request,
+    token: &str,
+    trust: &transition::TrustStore,
+) -> Result<()> {
+    prepare_pair_at(p, s, plan, request, token, system_now()?, trust)
+}
+
+/// [`prepare_pair`] at an explicit instant. Crate-internal: tests only.
+#[cfg(feature = "experimental-recovery")]
+pub(crate) fn prepare_pair_at<A: ReplicatedSchema>(
+    p: &mut Node<A>,
+    s: &mut Node<A>,
+    plan: &compaction::PairPlan,
+    request: &transition::Request,
     token: &str,
     now: u64,
-    trust: &crate::recovery::transition::TrustStore,
+    trust: &transition::TrustStore,
 ) -> Result<()> {
     let (p, s) = (&*p, &*s);
     plan.validate_certified()?;
@@ -276,7 +464,15 @@ pub(crate) fn prepare_pair<A: ReplicatedSchema>(
             super::loss::require_no_loss_recovery(c)?;
             let present:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='node_pending_certified_maintenance')",[],|r|r.get(0))?;
             if !present { return Ok(false); }
-            validate_pending(c,&n.adapter,&contract,&initial,n.identity(),n.role(),request,trust,n.certified_authority.as_deref(),Some(&prepared))?;
+            let binding = Binding {
+                adapter: &n.adapter,
+                contract: &contract,
+                initial: &initial,
+                identity: n.identity(),
+                role: n.role(),
+                certified_authority: n.certified_authority.as_deref(),
+            };
+            validate_pending(c, &binding, request, trust, Some(&prepared))?;
             Ok(true)
         })?;
     }
@@ -350,17 +546,41 @@ pub(crate) fn prepare_pair<A: ReplicatedSchema>(
     Ok(())
 }
 
+/// What a restricted handle proved about its node when it was opened.
+#[cfg(feature = "experimental-recovery")]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PendingInspection {
+pub struct PendingInspection {
+    /// The role recorded by the durable marker and owner row.
     pub role: Role,
+    /// The node's data identity.
     pub identity: Identity<SchemaId>,
+    /// The node's current physical checkpoint.
     pub checkpoint: Prefix,
+    /// The node's current snapshot base, if any.
     pub base: Option<Prefix>,
 }
 
+/// The static binding every validation of a pending node is checked against.
+/// Borrowed, and built either from a handle or from an ordinary node.
+#[cfg(feature = "experimental-recovery")]
+struct Binding<'a, A> {
+    adapter: &'a A,
+    contract: &'a schema_contract::Contract,
+    initial: &'a str,
+    identity: &'a Identity<SchemaId>,
+    role: Role,
+    certified_authority: Option<&'a dyn crate::typed::CertifiedAuthority>,
+}
+
+/// Restricted capability over one node whose ordinary admission is closed by a
+/// pending certified maintenance. It owns the ordinary node lock for its whole
+/// lifetime (dropping it releases the lock) and is the only way the lifecycle,
+/// abort and loss-termination steps reach the file.
+///
 /// Deliberately does not contain a `Node`, implement `Deref`, or expose a
-/// connection callback. Dropping it releases the ordinary node lock.
-pub(crate) struct PendingMaintenanceHandle<A: ReplicatedSchema> {
+/// connection callback.
+#[cfg(feature = "experimental-recovery")]
+pub struct PendingMaintenanceHandle<A: ReplicatedSchema> {
     db: Vesta,
     adapter: A,
     contract: schema_contract::Contract,
@@ -374,29 +594,56 @@ pub(crate) struct PendingMaintenanceHandle<A: ReplicatedSchema> {
     _lock: File,
 }
 
+#[cfg(feature = "experimental-recovery")]
 impl<A: ReplicatedSchema> PendingMaintenanceHandle<A> {
+    /// Test-only opener that additionally asserts the durable role. The public
+    /// opener never accepts a role; this one compares against it.
+    #[cfg(test)]
     pub(crate) fn open_existing(
         path: impl AsRef<Path>,
         role: Role,
         identity: Identity<SchemaId>,
         passphrase: &str,
         adapter: A,
-        expected: &crate::recovery::transition::Request,
-        trust: &crate::recovery::transition::TrustStore,
+        expected: &transition::Request,
+        trust: &transition::TrustStore,
     ) -> Result<Self> {
-        Self::open_existing_with_authority(
-            path, role, identity, passphrase, adapter, expected, trust, None,
-        )
+        let handle = Self::open_existing_with_authority(
+            path, identity, passphrase, adapter, expected, trust, None,
+        )?;
+        ensure(handle.role == role, "pending marker owner mismatch")?;
+        Ok(handle)
     }
 
-    pub(crate) fn open_existing_with_authority(
+    /// Open the node file at `path`, which must carry a pending certified
+    /// maintenance for exactly `expected` (use [`peek_pending`] to read it
+    /// back). Takes the ordinary node lock and holds it until drop.
+    ///
+    /// The role is read from the durable marker and must agree with the owner
+    /// row; it is never supplied. Everything the marker and progress record
+    /// claim is re-validated against the file (schema contract, runtime,
+    /// lineage, publication, recovery membership and the signed request),
+    /// first read-only and then again on the read-write connection.
+    ///
+    /// `certified_authority` is required when the node already carries a
+    /// certified history from an earlier cycle; its completed certificate is
+    /// then verified live.
+    ///
+    /// Token time checks: none. The stored maintenance token is verified
+    /// historically (signature and binding to `expected`, no expiry), so an
+    /// interrupted cycle can always be reopened.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the file is absent or a symlink, the lock is held, the node
+    /// has no pending certified maintenance, or any validation fails.
+    pub fn open_existing_with_authority(
         path: impl AsRef<Path>,
-        role: Role,
         identity: Identity<SchemaId>,
         passphrase: &str,
         adapter: A,
-        expected: &crate::recovery::transition::Request,
-        trust: &crate::recovery::transition::TrustStore,
+        expected: &transition::Request,
+        trust: &transition::TrustStore,
         certified_authority: Option<std::sync::Arc<dyn crate::typed::CertifiedAuthority>>,
     ) -> Result<Self> {
         ensure(
@@ -422,46 +669,37 @@ impl<A: ReplicatedSchema> PendingMaintenanceHandle<A> {
         let contract = schema_contract::describe(&scratch, &adapter)?;
         let initial = hash(&adapter.view(&scratch)?)?;
         let readonly = Vesta::open_read_only_with_passphrase(&path, passphrase)?;
-        readonly.with_connection(|c| {
-            Ok((|| -> Result<()> {
+        // The role is a result of the durable marker, never an input. It is
+        // then held to the owner row and everything else by validation.
+        let role = readonly.with_connection(|c| {
+            Ok((|| -> Result<Role> {
                 ensure(
                     pending_present(c)?,
                     "node has no pending certified maintenance",
-                )
+                )?;
+                let marker: Marker =
+                    serde_json::from_str(&singleton_text(c, MARKER, "record", 64 * 1024)?)?;
+                Ok(marker.role)
             })())
         })??;
+        let binding = Binding {
+            adapter: &adapter,
+            contract: &contract,
+            initial: &initial,
+            identity: &identity,
+            role,
+            certified_authority: certified_authority.as_deref(),
+        };
         let (inspection, prepared) = readonly.with_connection(|c| {
             c.pragma_update(None, "query_only", true)?;
-            Ok(validate_pending(
-                c,
-                &adapter,
-                &contract,
-                &initial,
-                &identity,
-                role,
-                expected,
-                trust,
-                certified_authority.as_deref(),
-                None,
-            ))
+            Ok(validate_pending(c, &binding, expected, trust, None))
         })??;
         drop(readonly);
         let db = Vesta::open_existing_read_write_with_passphrase(&path, passphrase)?;
         db.with_connection(|c| {
-            validate_pending(
-                c,
-                &adapter,
-                &contract,
-                &initial,
-                &identity,
-                role,
-                expected,
-                trust,
-                certified_authority.as_deref(),
-                Some(&prepared),
-            )
-            .map(|_| ())
-            .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))
+            validate_pending(c, &binding, expected, trust, Some(&prepared))
+                .map(|_| ())
+                .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
         Ok(Self {
             db,
@@ -478,33 +716,41 @@ impl<A: ReplicatedSchema> PendingMaintenanceHandle<A> {
         })
     }
 
-    pub(crate) fn inspect(&self) -> &PendingInspection {
+    /// What this handle proved about its node when it was opened.
+    pub fn inspect(&self) -> &PendingInspection {
         &self.inspection
+    }
+
+    /// The exact request this node prepared, as held by this handle.
+    pub fn request(&self) -> &transition::Request {
+        &self.prepared.request
+    }
+
+    fn binding(&self) -> Binding<'_, A> {
+        Binding {
+            adapter: &self.adapter,
+            contract: &self.contract,
+            initial: &self.initial,
+            identity: &self.identity,
+            role: self.role,
+            certified_authority: self.certified_authority.as_deref(),
+        }
     }
 
     /// Re-read and re-validate the durable progress row. Used as live
     /// participant evidence, so it never trusts the cached copy.
-    fn live_progress(&self, trust: &crate::recovery::transition::TrustStore) -> Result<Prepared> {
+    fn live_progress(&self, trust: &transition::TrustStore) -> Result<Prepared> {
         self.db.with_connection(|c| {
-            Ok(validate_pending(
-                c,
-                &self.adapter,
-                &self.contract,
-                &self.initial,
-                &self.identity,
-                self.role,
-                &self.prepared.request,
-                trust,
-                self.certified_authority.as_deref(),
-                None,
+            Ok(
+                validate_pending(c, &self.binding(), &self.prepared.request, trust, None)
+                    .map(|(_, prepared)| prepared),
             )
-            .map(|(_, prepared)| prepared))
         })?
     }
 
     fn replace_progress(
         &mut self,
-        trust: &crate::recovery::transition::TrustStore,
+        trust: &transition::TrustStore,
         next: Prepared,
         authorize: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
@@ -516,14 +762,9 @@ impl<A: ReplicatedSchema> PendingMaintenanceHandle<A> {
                 )?;
                 validate_pending(
                     &tx,
-                    &self.adapter,
-                    &self.contract,
-                    &self.initial,
-                    &self.identity,
-                    self.role,
+                    &self.binding(),
                     &self.prepared.request,
                     trust,
-                    self.certified_authority.as_deref(),
                     Some(&self.prepared),
                 )?;
                 authorize()?;
@@ -546,17 +787,20 @@ impl<A: ReplicatedSchema> PendingMaintenanceHandle<A> {
     }
 }
 
+#[cfg(feature = "experimental-recovery")]
 struct PreparedPolicy<'a, P> {
     external: &'a P,
     request: &'a crate::recovery::transition::Request,
     participants: [&'a crate::recovery::transition::Participant; 2],
 }
 
+#[cfg(feature = "experimental-recovery")]
 struct AppliedPolicy<'a, P> {
     external: &'a P,
     participant: &'a crate::recovery::transition::Participant,
 }
 
+#[cfg(feature = "experimental-recovery")]
 impl<P: crate::recovery::transition::Policy> crate::recovery::transition::Policy
     for AppliedPolicy<'_, P>
 {
@@ -591,6 +835,7 @@ impl<P: crate::recovery::transition::Policy> crate::recovery::transition::Policy
     }
 }
 
+#[cfg(feature = "experimental-recovery")]
 impl<P: crate::recovery::transition::Policy> crate::recovery::transition::Policy
     for PreparedPolicy<'_, P>
 {
@@ -626,16 +871,41 @@ impl<P: crate::recovery::transition::Policy> crate::recovery::transition::Policy
     }
 }
 
-/// Persist only the authority decision. Both restricted handles remain in the
-/// PREPARED phase; this does not mutate either node or record an ACK.
-pub(crate) fn decide_prepared<A: ReplicatedSchema>(
+/// Have the authority decide the prepared request. Persists only the
+/// authority decision: both handles stay in phase `prepared`; neither node is
+/// mutated and no acknowledgement is recorded. Follow with [`record_decided`]
+/// on both handles.
+///
+/// Both handles must hold the identical prepared record, `primary` must be the
+/// primary and `secondary` the secondary (their durable roles, checked).
+///
+/// Token time check: the stored maintenance token must still be inside its
+/// issuance window at the **system clock** — checked here and again by the
+/// journal inside its transaction. An expired token cannot be renewed; abort
+/// the maintenance with a signed abort instead ([`begin_abort`]).
+///
+/// # Errors
+///
+/// Fails on a pair or state mismatch, an expired or untrusted token, a policy
+/// refusal, a journal conflict, or a system clock before the Unix epoch.
+#[cfg(feature = "experimental-recovery")]
+pub fn decide_prepared<A: ReplicatedSchema, P: transition::Policy>(
     primary: &PendingMaintenanceHandle<A>,
     secondary: &PendingMaintenanceHandle<A>,
-    journal: &crate::recovery::transition::Journal,
+    authorities: &MaintenanceAuthorities<'_, P>,
+) -> Result<transition::CommittedTransition> {
+    decide_prepared_at(primary, secondary, authorities, system_now()?)
+}
+
+/// [`decide_prepared`] at an explicit instant. Crate-internal: tests only.
+#[cfg(feature = "experimental-recovery")]
+pub(crate) fn decide_prepared_at<A: ReplicatedSchema, P: transition::Policy>(
+    primary: &PendingMaintenanceHandle<A>,
+    secondary: &PendingMaintenanceHandle<A>,
+    authorities: &MaintenanceAuthorities<'_, P>,
     now: u64,
-    trust: &crate::recovery::transition::TrustStore,
-    policy: &impl crate::recovery::transition::Policy,
-) -> Result<crate::recovery::transition::CommittedTransition> {
+) -> Result<transition::CommittedTransition> {
+    let (journal, trust, policy) = (authorities.journal, authorities.trust, authorities.policy);
     ensure(
         primary.role == Role::Primary
             && secondary.role == Role::Secondary
@@ -677,12 +947,22 @@ pub(crate) fn decide_prepared<A: ReplicatedSchema>(
     )
 }
 
-pub(crate) fn record_decided<A: ReplicatedSchema>(
+/// Durably record, on this node, the decision the authority committed for its
+/// prepared request (phase `prepared` -> `decided`). The journal decision is
+/// fetched live and must match the stored token; exact retry converges.
+///
+/// Token time checks: none (the stored token is verified historically).
+///
+/// # Errors
+///
+/// Fails when the node is in another phase, the authority has no matching
+/// decision, the policy refuses, or the durable record changed underneath.
+#[cfg(feature = "experimental-recovery")]
+pub fn record_decided<A: ReplicatedSchema, P: transition::Policy>(
     handle: &mut PendingMaintenanceHandle<A>,
-    journal: &crate::recovery::transition::Journal,
-    trust: &crate::recovery::transition::TrustStore,
-    policy: &impl crate::recovery::transition::Policy,
+    authorities: &MaintenanceAuthorities<'_, P>,
 ) -> Result<()> {
+    let (journal, trust, policy) = (authorities.journal, authorities.trust, authorities.policy);
     let verified = crate::recovery::transition::verify_historical(
         &handle.prepared.token,
         &trust.as_trust(),
@@ -713,12 +993,24 @@ pub(crate) fn record_decided<A: ReplicatedSchema>(
     })
 }
 
-pub(crate) fn apply_decided<A: ReplicatedSchema>(
+/// Apply the decided maintenance on this node (phase `decided` -> `applied`):
+/// prune the log to the certified cut, rebase, and store the certificate, in
+/// one transaction that first re-validates the node and the live decision.
+/// **Irreversible**: an applied node can only be finished forward.
+/// Exact retry converges.
+///
+/// Token time checks: none (the stored token is verified historically).
+///
+/// # Errors
+///
+/// Fails when the node is not decided, the decision does not match, the
+/// publication is pinned, the cut changed, or any validation fails.
+#[cfg(feature = "experimental-recovery")]
+pub fn apply_decided<A: ReplicatedSchema, P: transition::Policy>(
     handle: &mut PendingMaintenanceHandle<A>,
-    journal: &crate::recovery::transition::Journal,
-    trust: &crate::recovery::transition::TrustStore,
-    policy: &impl crate::recovery::transition::Policy,
+    authorities: &MaintenanceAuthorities<'_, P>,
 ) -> Result<()> {
+    let (journal, trust, policy) = (authorities.journal, authorities.trust, authorities.policy);
     if handle.prepared.phase == "applied" {
         journal.fetch(&handle.prepared.request, &trust.as_trust(), policy)?;
         return Ok(());
@@ -738,14 +1030,9 @@ pub(crate) fn apply_decided<A: ReplicatedSchema>(
             )?;
             validate_pending(
                 &tx,
-                &handle.adapter,
-                &handle.contract,
-                &handle.initial,
-                &handle.identity,
-                handle.role,
+                &handle.binding(),
                 &old.request,
                 trust,
-                handle.certified_authority.as_deref(),
                 Some(&old),
             )?;
             let decision = journal.fetch(&old.request, &trust.as_trust(), policy)?;
@@ -846,14 +1133,9 @@ pub(crate) fn apply_decided<A: ReplicatedSchema>(
             )?;
             validate_pending(
                 &tx,
-                &handle.adapter,
-                &handle.contract,
-                &handle.initial,
-                &handle.identity,
-                handle.role,
+                &handle.binding(),
                 &old.request,
                 trust,
-                handle.certified_authority.as_deref(),
                 Some(&next),
             )?;
             tx.commit()?;
@@ -865,12 +1147,22 @@ pub(crate) fn apply_decided<A: ReplicatedSchema>(
     Ok(())
 }
 
-pub(crate) fn acknowledge_applied<A: ReplicatedSchema>(
+/// Record this node's acknowledgement at the authority. The evidence is the
+/// node's own live, re-validated applied state; a node can only acknowledge
+/// for its own participant. Exact retry converges on the journal.
+///
+/// Token time checks: none.
+///
+/// # Errors
+///
+/// Fails when the node is not applied, the decision does not match, or the
+/// policy or journal refuses.
+#[cfg(feature = "experimental-recovery")]
+pub fn acknowledge_applied<A: ReplicatedSchema, P: transition::Policy>(
     handle: &PendingMaintenanceHandle<A>,
-    journal: &crate::recovery::transition::Journal,
-    trust: &crate::recovery::transition::TrustStore,
-    policy: &impl crate::recovery::transition::Policy,
+    authorities: &MaintenanceAuthorities<'_, P>,
 ) -> Result<()> {
+    let (journal, trust, policy) = (authorities.journal, authorities.trust, authorities.policy);
     ensure(
         handle.prepared.phase == "applied",
         "pending node is not applied",
@@ -883,14 +1175,9 @@ pub(crate) fn acknowledge_applied<A: ReplicatedSchema>(
                 rusqlite::Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
             validate_pending(
                 &tx,
-                &handle.adapter,
-                &handle.contract,
-                &handle.initial,
-                &handle.identity,
-                handle.role,
+                &handle.binding(),
                 &handle.prepared.request,
                 trust,
-                handle.certified_authority.as_deref(),
                 Some(&handle.prepared),
             )?;
             let decision = journal.fetch(&handle.prepared.request, &trust.as_trust(), policy)?;
@@ -915,6 +1202,7 @@ pub(crate) fn acknowledge_applied<A: ReplicatedSchema>(
     Ok(())
 }
 
+#[cfg(feature = "experimental-recovery")]
 fn validate_retained<A: ReplicatedSchema>(
     handle: &PendingMaintenanceHandle<A>,
     trust: &crate::recovery::transition::TrustStore,
@@ -922,14 +1210,9 @@ fn validate_retained<A: ReplicatedSchema>(
     handle.db.with_connection(|c| {
         validate_pending(
             c,
-            &handle.adapter,
-            &handle.contract,
-            &handle.initial,
-            &handle.identity,
-            handle.role,
+            &handle.binding(),
             &handle.prepared.request,
             trust,
-            handle.certified_authority.as_deref(),
             Some(&handle.prepared),
         )
         .map(|_| ())
@@ -942,6 +1225,7 @@ fn validate_retained<A: ReplicatedSchema>(
 /// request, the exact issued token and the acknowledgements that authorised it.
 /// Two different transitions can never share one, and a retry always recomputes
 /// the same value.
+#[cfg(feature = "experimental-recovery")]
 pub(crate) fn completion_id(
     request: &crate::recovery::transition::Request,
     token_digest: [u8; 32],
@@ -955,13 +1239,24 @@ pub(crate) fn completion_id(
     ))
 }
 
-pub(crate) fn complete_authority<A: ReplicatedSchema>(
+/// Complete the transition at the authority once both acknowledgements are
+/// recorded. The completion id is **derived** from the request id, the token
+/// digest and the acknowledgements; the caller never chooses it. Both handles
+/// are re-validated first. Exact retry converges.
+///
+/// Token time checks: none.
+///
+/// # Errors
+///
+/// Fails when the pair is not applied, an acknowledgement is missing, or the
+/// policy or journal refuses.
+#[cfg(feature = "experimental-recovery")]
+pub fn complete_authority<A: ReplicatedSchema, P: transition::Policy>(
     primary: &PendingMaintenanceHandle<A>,
     secondary: &PendingMaintenanceHandle<A>,
-    journal: &crate::recovery::transition::Journal,
-    trust: &crate::recovery::transition::TrustStore,
-    policy: &impl crate::recovery::transition::Policy,
+    authorities: &MaintenanceAuthorities<'_, P>,
 ) -> Result<()> {
+    let (journal, trust, policy) = (authorities.journal, authorities.trust, authorities.policy);
     ensure(
         primary.role == Role::Primary
             && secondary.role == Role::Secondary
@@ -986,12 +1281,21 @@ pub(crate) fn complete_authority<A: ReplicatedSchema>(
     Ok(())
 }
 
-pub(crate) fn record_complete<A: ReplicatedSchema>(
+/// Durably record, on this node, the authority's completion (phase `applied`
+/// -> `complete`). The completion is fetched live. Exact retry converges.
+///
+/// Token time checks: none.
+///
+/// # Errors
+///
+/// Fails when the node is in another phase, the authority has not completed
+/// this request, or the completion changed.
+#[cfg(feature = "experimental-recovery")]
+pub fn record_complete<A: ReplicatedSchema, P: transition::Policy>(
     handle: &mut PendingMaintenanceHandle<A>,
-    journal: &crate::recovery::transition::Journal,
-    trust: &crate::recovery::transition::TrustStore,
-    policy: &impl crate::recovery::transition::Policy,
+    authorities: &MaintenanceAuthorities<'_, P>,
 ) -> Result<()> {
+    let (journal, trust, policy) = (authorities.journal, authorities.trust, authorities.policy);
     let completed = journal.fetch_completed(&handle.prepared.request, &trust.as_trust(), policy)?;
     if handle.prepared.phase == "complete" {
         return ensure(
@@ -1019,12 +1323,24 @@ pub(crate) fn record_complete<A: ReplicatedSchema>(
 
 /// Finalize exactly one node. Restartable: if the process dies between the two
 /// nodes, the survivor of that crash finalizes on its own with this call.
-pub(crate) fn finalize_node<A: ReplicatedSchema>(
+/// Finalize exactly one node: archive the completion, drop the pending
+/// tables and reopen ordinary admission (the node then opens with
+/// `Node::open_with_completed_transition`). Restartable per node: if the
+/// process dies between the two nodes, the node left pending finalizes on its
+/// own with this call; a retry on a finalized handle only re-reads the live
+/// completion.
+///
+/// Token time checks: none.
+///
+/// # Errors
+///
+/// Fails when the node is not complete or the live completion does not match.
+#[cfg(feature = "experimental-recovery")]
+pub fn finalize_node<A: ReplicatedSchema, P: transition::Policy>(
     handle: &mut PendingMaintenanceHandle<A>,
-    journal: &crate::recovery::transition::Journal,
-    trust: &crate::recovery::transition::TrustStore,
-    policy: &impl crate::recovery::transition::Policy,
+    authorities: &MaintenanceAuthorities<'_, P>,
 ) -> Result<()> {
+    let (journal, trust, policy) = (authorities.journal, authorities.trust, authorities.policy);
     if handle.finalized {
         journal.fetch_completed(&handle.prepared.request, &trust.as_trust(), policy)?;
         return Ok(());
@@ -1041,14 +1357,9 @@ pub(crate) fn finalize_node<A: ReplicatedSchema>(
             )?;
             validate_pending(
                 &tx,
-                &handle.adapter,
-                &handle.contract,
-                &handle.initial,
-                &handle.identity,
-                handle.role,
+                &handle.binding(),
                 &handle.prepared.request,
                 trust,
-                handle.certified_authority.as_deref(),
                 Some(&handle.prepared),
             )?;
             let completed = journal.fetch_completed(
@@ -1111,12 +1422,20 @@ pub(crate) fn finalize_node<A: ReplicatedSchema>(
     Ok(())
 }
 
-pub(crate) fn finalize_pair<A: ReplicatedSchema>(
+/// Finalize both nodes, secondary first. Equivalent to [`finalize_node`] on
+/// each; prefer that after a crash between the two nodes.
+///
+/// Token time checks: none.
+///
+/// # Errors
+///
+/// Fails when the pair records differ, either node is not complete, or
+/// finalization fails on either node.
+#[cfg(feature = "experimental-recovery")]
+pub fn finalize_pair<A: ReplicatedSchema, P: transition::Policy>(
     primary: &mut PendingMaintenanceHandle<A>,
     secondary: &mut PendingMaintenanceHandle<A>,
-    journal: &crate::recovery::transition::Journal,
-    trust: &crate::recovery::transition::TrustStore,
-    policy: &impl crate::recovery::transition::Policy,
+    authorities: &MaintenanceAuthorities<'_, P>,
 ) -> Result<()> {
     ensure(
         primary.prepared == secondary.prepared
@@ -1124,8 +1443,8 @@ pub(crate) fn finalize_pair<A: ReplicatedSchema>(
             && secondary.prepared.phase == "complete",
         "pending finalization pair mismatch",
     )?;
-    finalize_node(secondary, journal, trust, policy)?;
-    finalize_node(primary, journal, trust, policy)
+    finalize_node(secondary, authorities)?;
+    finalize_node(primary, authorities)
 }
 
 // ---------------------------------------------------------------------------
@@ -1133,15 +1452,42 @@ pub(crate) fn finalize_pair<A: ReplicatedSchema>(
 // ordinary lifecycle is concerned; a signed abort is the way back out.
 // ---------------------------------------------------------------------------
 
-/// Durably mark this node as aborting. One-way: from here no lifecycle call can
-/// ever reach apply, acknowledge or complete, which is exactly the evidence the
-/// authority needs before it records the abort (race R2).
-pub(crate) fn begin_abort<A: ReplicatedSchema>(
+/// Durably mark this node as aborting (phase `prepared`/`decided` ->
+/// `aborting`) under a signed maintenance abort. One-way: from here no
+/// lifecycle call can ever reach apply, acknowledge or complete, which is
+/// exactly the evidence the authority needs before it records the abort
+/// (race R2). The abort must name exactly this node's prepared request, and
+/// its `decided` flag must match whether this node recorded the decision.
+/// An applied node can never be aborted. Exact retry with the same abort and
+/// token converges; a different abort is a conflict.
+///
+/// Token time check: the abort `token` must be inside its issuance window at
+/// the **system clock**; it is also verified against `trust` and bound to
+/// `abort`.
+///
+/// # Errors
+///
+/// Fails on a binding mismatch, an expired or untrusted token, an invalid
+/// phase, a conflicting earlier abort, or a system clock before the Unix
+/// epoch.
+#[cfg(feature = "experimental-recovery")]
+pub fn begin_abort<A: ReplicatedSchema>(
     handle: &mut PendingMaintenanceHandle<A>,
-    abort: &crate::recovery::transition::MaintenanceAbort,
+    abort: &transition::MaintenanceAbort,
+    token: &str,
+    trust: &transition::TrustStore,
+) -> Result<()> {
+    begin_abort_at(handle, abort, token, system_now()?, trust)
+}
+
+/// [`begin_abort`] at an explicit instant. Crate-internal: tests only.
+#[cfg(feature = "experimental-recovery")]
+pub(crate) fn begin_abort_at<A: ReplicatedSchema>(
+    handle: &mut PendingMaintenanceHandle<A>,
+    abort: &transition::MaintenanceAbort,
     token: &str,
     now: u64,
-    trust: &crate::recovery::transition::TrustStore,
+    trust: &transition::TrustStore,
 ) -> Result<()> {
     let request = handle.prepared.request.clone();
     // The token is verified freshly, then again against the durable record, the
@@ -1188,6 +1534,7 @@ pub(crate) fn begin_abort<A: ReplicatedSchema>(
     handle.replace_progress(trust, next, || Ok(()))
 }
 
+#[cfg(feature = "experimental-recovery")]
 fn digest_of_token(token: &str) -> [u8; 32] {
     Sha256::digest(token.as_bytes()).into()
 }
@@ -1196,6 +1543,7 @@ fn digest_of_token(token: &str) -> [u8; 32] {
 /// both nodes must already be durably aborting on exactly this abort, with the
 /// pending runtime still in place. The external policy's own decision runs
 /// first, so the authority's live-head check still gates.
+#[cfg(feature = "experimental-recovery")]
 struct AbortingPolicy<'a, A: ReplicatedSchema, P> {
     external: &'a P,
     primary: &'a PendingMaintenanceHandle<A>,
@@ -1203,6 +1551,7 @@ struct AbortingPolicy<'a, A: ReplicatedSchema, P> {
     trust: &'a crate::recovery::transition::TrustStore,
 }
 
+#[cfg(feature = "experimental-recovery")]
 impl<A: ReplicatedSchema, P: crate::recovery::transition::Policy>
     crate::recovery::transition::Policy for AbortingPolicy<'_, A, P>
 {
@@ -1266,17 +1615,43 @@ impl<A: ReplicatedSchema, P: crate::recovery::transition::Policy>
 }
 
 /// Record the abort at the authority, but only once both nodes are durably
-/// aborting. Exact retry converges on the journal's own retry branch.
-pub(crate) fn abort_authority<A: ReplicatedSchema>(
+/// aborting on exactly this abort: the live, re-validated state of both
+/// handles is the evidence, checked after the integrator's own
+/// `abort_applicable` hook. Exact retry converges on the journal's own retry
+/// branch.
+///
+/// Token time check: the abort `token` must be inside its issuance window at
+/// the **system clock** when the abort is first recorded. An exact retry of an
+/// already recorded abort does not re-check the window (the journal's rule),
+/// so a crash after this step stays resumable with the same token.
+///
+/// # Errors
+///
+/// Fails on a pair mismatch, a node that is not aborting on this abort, an
+/// expired or untrusted token, a policy refusal, a journal conflict, or a
+/// system clock before the Unix epoch.
+#[cfg(feature = "experimental-recovery")]
+pub fn abort_authority<A: ReplicatedSchema, P: transition::Policy>(
     primary: &PendingMaintenanceHandle<A>,
     secondary: &PendingMaintenanceHandle<A>,
-    journal: &crate::recovery::transition::Journal,
-    abort: &crate::recovery::transition::MaintenanceAbort,
+    abort: &transition::MaintenanceAbort,
     token: &str,
-    now: u64,
-    trust: &crate::recovery::transition::TrustStore,
-    policy: &impl crate::recovery::transition::Policy,
+    authorities: &MaintenanceAuthorities<'_, P>,
 ) -> Result<()> {
+    abort_authority_at(primary, secondary, abort, token, authorities, system_now()?)
+}
+
+/// [`abort_authority`] at an explicit instant. Crate-internal: tests only.
+#[cfg(feature = "experimental-recovery")]
+pub(crate) fn abort_authority_at<A: ReplicatedSchema, P: transition::Policy>(
+    primary: &PendingMaintenanceHandle<A>,
+    secondary: &PendingMaintenanceHandle<A>,
+    abort: &transition::MaintenanceAbort,
+    token: &str,
+    authorities: &MaintenanceAuthorities<'_, P>,
+    now: u64,
+) -> Result<()> {
+    let (journal, trust, policy) = (authorities.journal, authorities.trust, authorities.policy);
     ensure(
         primary.role == Role::Primary
             && secondary.role == Role::Secondary
@@ -1294,14 +1669,25 @@ pub(crate) fn abort_authority<A: ReplicatedSchema>(
     Ok(())
 }
 
-/// Roll this node back to the ordinary state it had before PREPARE. Restartable
-/// and per node, like `finalize_node`.
-pub(crate) fn finish_abort<A: ReplicatedSchema>(
+/// Roll this aborting node back to the ordinary state it had before PREPARE:
+/// drop the pending tables and restore the previous runtime, after proving
+/// the authority recorded exactly this node's abort. Data, base, log,
+/// receipts and lineage are untouched; readiness is not restored (the
+/// secondary re-confirms its checkpoint). Restartable and per node, like
+/// [`finalize_node`].
+///
+/// Token time checks: none (the recorded abort is fetched live).
+///
+/// # Errors
+///
+/// Fails when the node is not aborting, the recorded abort does not match, or
+/// the rolled-back state fails ordinary owner-level validation.
+#[cfg(feature = "experimental-recovery")]
+pub fn finish_abort<A: ReplicatedSchema, P: transition::Policy>(
     handle: &mut PendingMaintenanceHandle<A>,
-    journal: &crate::recovery::transition::Journal,
-    trust: &crate::recovery::transition::TrustStore,
-    policy: &impl crate::recovery::transition::Policy,
+    authorities: &MaintenanceAuthorities<'_, P>,
 ) -> Result<()> {
+    let (journal, trust, policy) = (authorities.journal, authorities.trust, authorities.policy);
     if handle.finalized {
         journal.fetch_abort(&handle.prepared.request, &trust.as_trust(), policy)?;
         return Ok(());
@@ -1321,14 +1707,9 @@ pub(crate) fn finish_abort<A: ReplicatedSchema>(
                 rusqlite::Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
             validate_pending(
                 &tx,
-                &handle.adapter,
-                &handle.contract,
-                &handle.initial,
-                &handle.identity,
-                handle.role,
+                &handle.binding(),
                 &handle.prepared.request,
                 trust,
-                handle.certified_authority.as_deref(),
                 Some(&handle.prepared),
             )?;
             let committed =
@@ -1392,6 +1773,7 @@ pub(crate) fn finish_abort<A: ReplicatedSchema>(
 
 /// The owner-level checks an ordinary `Node::open` performs, re-run on the
 /// rolled-back state before the abort transaction commits.
+#[cfg(feature = "experimental-recovery")]
 fn verify_restored<A: ReplicatedSchema>(
     c: &Connection,
     handle: &PendingMaintenanceHandle<A>,
@@ -1444,6 +1826,7 @@ fn verify_restored<A: ReplicatedSchema>(
 // ---------------------------------------------------------------------------
 
 const TERMINATED: &str = "node_maintenance_terminated";
+#[cfg(feature = "experimental-recovery")]
 const TERMINATED_DDL: &str = "CREATE TABLE IF NOT EXISTS main.node_maintenance_terminated(\
      id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL)";
 /// Branch A: nothing was applied and the transition was rolled back.
@@ -1527,11 +1910,13 @@ impl Terminated {
         }
     }
 
+    #[cfg(feature = "experimental-recovery")]
     pub(super) fn is_finished_forward(&self) -> bool {
         self.kind == FINISHED_FORWARD
     }
 
     /// The digest of the request this node abandoned.
+    #[cfg(feature = "experimental-recovery")]
     pub(super) fn abandoned(&self) -> [u8; 32] {
         self.request_digest
     }
@@ -1601,15 +1986,36 @@ pub(super) fn terminated(
     Ok(Some(record))
 }
 
-/// Terminate an in-flight certified maintenance under a signed participant
-/// loss. One `IMMEDIATE` transaction; the branch is decided by this node's own
-/// durable phase and the loss must agree with it.
-pub(crate) fn terminate_by_loss<A: ReplicatedSchema, P: crate::recovery::transition::LossPolicy>(
+/// Terminate an in-flight certified maintenance on the survivor under the
+/// signed participant loss recorded in `authorities.journal`. One `IMMEDIATE`
+/// transaction; the branch is decided by this node's own durable phase and the
+/// loss must agree with it:
+///
+/// - phase `prepared`/`decided`: the maintenance is **rolled back** (the loss
+///   must be founded on the completed certificate);
+/// - phase `applied`: the decided maintenance is **finished forward** (the
+///   loss must be founded on exactly the decided certificate this node
+///   applied). **Experimental — pending independent review before production
+///   use.**
+///
+/// A durable, signature-anchored termination trace is written first. The node
+/// then continues with the participant-loss flow
+/// ([`super::loss::LossSurvivorHandle`]). Exact retry after success re-reads
+/// the live loss and requires the same trace.
+///
+/// Token time checks: none. The loss token is verified historically.
+///
+/// # Errors
+///
+/// Fails when the loss does not abandon this request, does not name this pair,
+/// names the other branch (the error says which step is owed), or any
+/// validation fails.
+#[cfg(feature = "experimental-recovery")]
+pub fn terminate_by_loss<A: ReplicatedSchema, P: transition::LossPolicy>(
     handle: &mut PendingMaintenanceHandle<A>,
-    journal: &crate::recovery::transition::Journal,
-    trust: &crate::recovery::transition::TrustStore,
-    policy: &P,
+    authorities: &MaintenanceAuthorities<'_, P>,
 ) -> Result<()> {
+    let (journal, trust, policy) = (authorities.journal, authorities.trust, authorities.policy);
     if handle.finalized {
         // Exact resume: the pending state is already gone and the trace is
         // durable. The live loss is re-read so a revoked authority still
@@ -1635,14 +2041,9 @@ pub(crate) fn terminate_by_loss<A: ReplicatedSchema, P: crate::recovery::transit
                 rusqlite::Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
             validate_pending(
                 &tx,
-                &handle.adapter,
-                &handle.contract,
-                &handle.initial,
-                &handle.identity,
-                handle.role,
+                &handle.binding(),
                 &request,
                 trust,
-                handle.certified_authority.as_deref(),
                 Some(&handle.prepared),
             )?;
             let committed = journal.fetch_loss(&trust.as_trust(), policy)?;
@@ -1815,30 +2216,41 @@ pub(crate) fn terminate_by_loss<A: ReplicatedSchema, P: crate::recovery::transit
     Ok(())
 }
 
-/// Secondary first, mirroring `finalize_pair`.
-pub(crate) fn abort_pair<A: ReplicatedSchema>(
+/// [`finish_abort`] on both nodes, secondary first, mirroring
+/// [`finalize_pair`]. Prefer [`finish_abort`] per node after a crash between
+/// the two.
+///
+/// Token time checks: none.
+///
+/// # Errors
+///
+/// Fails when [`finish_abort`] fails on either node.
+#[cfg(feature = "experimental-recovery")]
+pub fn abort_pair<A: ReplicatedSchema, P: transition::Policy>(
     primary: &mut PendingMaintenanceHandle<A>,
     secondary: &mut PendingMaintenanceHandle<A>,
-    journal: &crate::recovery::transition::Journal,
-    trust: &crate::recovery::transition::TrustStore,
-    policy: &impl crate::recovery::transition::Policy,
+    authorities: &MaintenanceAuthorities<'_, P>,
 ) -> Result<()> {
-    finish_abort(secondary, journal, trust, policy)?;
-    finish_abort(primary, journal, trust, policy)
+    finish_abort(secondary, authorities)?;
+    finish_abort(primary, authorities)
 }
 
+#[cfg(feature = "experimental-recovery")]
 fn validate_pending<A: ReplicatedSchema>(
     c: &Connection,
-    adapter: &A,
-    contract: &schema_contract::Contract,
-    initial: &str,
-    identity: &Identity<SchemaId>,
-    role: Role,
-    expected: &crate::recovery::transition::Request,
-    trust: &crate::recovery::transition::TrustStore,
-    certified_authority: Option<&dyn crate::typed::CertifiedAuthority>,
+    binding: &Binding<'_, A>,
+    expected: &transition::Request,
+    trust: &transition::TrustStore,
     exact: Option<&Prepared>,
 ) -> Result<(PendingInspection, Prepared)> {
+    let Binding {
+        adapter,
+        contract,
+        initial,
+        identity,
+        role,
+        certified_authority,
+    } = *binding;
     let marker_rows: Vec<(u32, String)> = c
         .prepare(&format!("SELECT id,record FROM {MARKER} ORDER BY id"))?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -2193,7 +2605,7 @@ fn validate_pending<A: ReplicatedSchema>(
     Ok((inspection, progress))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "experimental-recovery"))]
 mod tests {
     use super::*;
     use crate::{envelope_tests::StockSchema, typed::recovery::tests::recovered_pair_for_pending};
@@ -2440,7 +2852,9 @@ mod tests {
         };
         let mut wrong_plan = plan.clone();
         wrong_plan.id = [99; 32];
-        assert!(prepare_pair(&mut p, &mut s, &wrong_plan, &request, &token, 15, &trust).is_err());
+        assert!(
+            prepare_pair_at(&mut p, &mut s, &wrong_plan, &request, &token, 15, &trust).is_err()
+        );
         for n in [&p, &s] {
             n.connection(|c| {
                 ensure(c.query_row("SELECT format FROM node_runtime WHERE id=1",[],|r|r.get::<_,u32>(0))? != 5,"failed preflight changed runtime")?;
@@ -2448,7 +2862,8 @@ mod tests {
             })?;
         }
         s.connection(|c|{c.execute_batch("CREATE TRIGGER fail_pending_runtime BEFORE UPDATE ON node_runtime BEGIN SELECT RAISE(ABORT,'fixture crash'); END;")?;Ok(())})?;
-        let crash = prepare_pair(&mut p, &mut s, &plan, &request, &token, 15, &trust).unwrap_err();
+        let crash =
+            prepare_pair_at(&mut p, &mut s, &plan, &request, &token, 15, &trust).unwrap_err();
         ensure(
             crash.to_string().contains("fixture crash"),
             "pending fixture failed before injected boundary",
@@ -2483,7 +2898,7 @@ mod tests {
             )?;
             Ok(())
         })?;
-        assert!(prepare_pair(&mut p, &mut s, &plan, &request, &token, 15, &trust).is_err());
+        assert!(prepare_pair_at(&mut p, &mut s, &plan, &request, &token, 15, &trust).is_err());
         assert_ne!(
             s.connection(|c| c
                 .query_row("SELECT format FROM node_runtime WHERE id=1", [], |r| r
@@ -2502,15 +2917,15 @@ mod tests {
             c.execute_batch("DROP TRIGGER fail_pending_runtime")?;
             Ok(())
         })?;
-        prepare_pair(&mut p, &mut s, &plan, &request, &token, 15, &trust)?;
+        prepare_pair_at(&mut p, &mut s, &plan, &request, &token, 15, &trust)?;
         let alternate = super::super::certified::tests::sign(&key, &request)?;
         ensure(
             alternate != token,
             "fixture signature unexpectedly repeated",
         )?;
-        assert!(prepare_pair(&mut p, &mut s, &plan, &request, &alternate, 15, &trust).is_err());
-        prepare_pair(&mut p, &mut s, &plan, &request, &token, 15, &trust)?;
-        assert!(prepare_pair(&mut p, &mut s, &plan, &request, &token, 21, &trust).is_err());
+        assert!(prepare_pair_at(&mut p, &mut s, &plan, &request, &alternate, 15, &trust).is_err());
+        prepare_pair_at(&mut p, &mut s, &plan, &request, &token, 15, &trust)?;
+        assert!(prepare_pair_at(&mut p, &mut s, &plan, &request, &token, 21, &trust).is_err());
         let id = p.identity().clone();
         drop(p);
         drop(s);
@@ -2566,33 +2981,73 @@ mod tests {
             current: Cell::new(false),
             revoke_on_check: Cell::new(false),
         };
-        assert!(decide_prepared(&h, &hs, &journal, 15, &trust, &authority).is_err());
+        assert!(decide_prepared_at(
+            &h,
+            &hs,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            15
+        )
+        .is_err());
         assert!(journal.status(&trust.as_trust())?.request.is_none());
         assert_eq!(before, (pending_evidence(&h)?, pending_evidence(&hs)?));
         let saved_prepared = hs.prepared.clone();
         hs.prepared.token = alternate.clone();
-        assert!(decide_prepared(&h, &hs, &journal, 15, &trust, &authority).is_err());
+        assert!(decide_prepared_at(
+            &h,
+            &hs,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            15
+        )
+        .is_err());
         hs.prepared = saved_prepared.clone();
         hs.prepared.request.id = [88; 32];
-        assert!(decide_prepared(&h, &hs, &journal, 15, &trust, &authority).is_err());
+        assert!(decide_prepared_at(
+            &h,
+            &hs,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            15
+        )
+        .is_err());
         hs.prepared = saved_prepared.clone();
         hs.prepared.plan.id = [89; 32];
-        assert!(decide_prepared(&h, &hs, &journal, 15, &trust, &authority).is_err());
+        assert!(decide_prepared_at(
+            &h,
+            &hs,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            15
+        )
+        .is_err());
         hs.prepared = saved_prepared;
         assert!(journal.status(&trust.as_trust())?.request.is_none());
         assert_eq!(before, (pending_evidence(&h)?, pending_evidence(&hs)?));
         authority.current.set(true);
-        let decision = decide_prepared(&h, &hs, &journal, 15, &trust, &authority)?;
+        let decision = decide_prepared_at(
+            &h,
+            &hs,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            15,
+        )?;
         assert_eq!(decision.request(), &request);
         let status = journal.status(&trust.as_trust())?;
         assert_eq!(status.request.as_ref(), Some(&request));
         assert_eq!(status.acknowledgements, [false; 2]);
         assert_eq!(status.completion, None);
         assert_eq!(before, (pending_evidence(&h)?, pending_evidence(&hs)?));
-        let retry = decide_prepared(&h, &hs, &journal, 15, &trust, &authority)?;
+        let retry = decide_prepared_at(
+            &h,
+            &hs,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            15,
+        )?;
         assert_eq!(retry.token_digest(), decision.token_digest());
         authority.current.set(false);
-        assert!(decide_prepared(&h, &hs, &journal, 15, &trust, &authority).is_err());
+        assert!(decide_prepared_at(
+            &h,
+            &hs,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            15
+        )
+        .is_err());
         assert_eq!(before, (pending_evidence(&h)?, pending_evidence(&hs)?));
         authority.current.set(true);
         drop(journal);
@@ -2607,13 +3062,20 @@ mod tests {
         assert_eq!(reopened_status.acknowledgements, [false; 2]);
         assert_eq!(reopened_status.completion, None);
         assert_eq!(before, (pending_evidence(&h)?, pending_evidence(&hs)?));
-        record_decided(&mut h, &reopened, &trust, &authority)?;
+        record_decided(
+            &mut h,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
         let after_primary = (pending_evidence(&h)?, pending_evidence(&hs)?);
         assert_ne!(after_primary.0, before.0);
         assert_eq!(after_primary.1, before.1);
         authority.current.set(true);
         authority.revoke_on_check.set(true);
-        assert!(record_decided(&mut hs, &reopened, &trust, &authority).is_err());
+        assert!(record_decided(
+            &mut hs,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority)
+        )
+        .is_err());
         assert_eq!(
             after_primary,
             (pending_evidence(&h)?, pending_evidence(&hs)?)
@@ -2627,7 +3089,10 @@ mod tests {
         let replacement_before = std::fs::read(&replacement_path)?;
         std::fs::rename(&survivor_path, &moved_path)?;
         std::fs::rename(&replacement_path, &survivor_path)?;
-        let substituted = record_decided(&mut hs, &reopened, &trust, &authority);
+        let substituted = record_decided(
+            &mut hs,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        );
         drop(hs);
         std::fs::rename(&survivor_path, &displaced_path)?;
         std::fs::rename(&moved_path, &survivor_path)?;
@@ -2645,7 +3110,10 @@ mod tests {
             &trust,
         )?;
         if substituted.is_err() {
-            record_decided(&mut hs, &reopened, &trust, &authority)?;
+            record_decided(
+                &mut hs,
+                &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+            )?;
         } else {
             ensure(
                 hs.prepared.phase == "decided",
@@ -2653,58 +3121,105 @@ mod tests {
             )?;
         }
         let both_decided = (pending_evidence(&h)?, pending_evidence(&hs)?);
-        record_decided(&mut h, &reopened, &trust, &authority)?;
-        record_decided(&mut hs, &reopened, &trust, &authority)?;
+        record_decided(
+            &mut h,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
+        record_decided(
+            &mut hs,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
         assert_eq!(
             both_decided,
             (pending_evidence(&h)?, pending_evidence(&hs)?)
         );
-        apply_decided(&mut h, &reopened, &trust, &authority)?;
+        apply_decided(
+            &mut h,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
         let primary_applied = (pending_evidence(&h)?, pending_evidence(&hs)?);
         assert_ne!(primary_applied.0, both_decided.0);
         assert_eq!(primary_applied.1, both_decided.1);
         authority.current.set(true);
         authority.revoke_on_check.set(true);
-        assert!(apply_decided(&mut hs, &reopened, &trust, &authority).is_err());
+        assert!(apply_decided(
+            &mut hs,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority)
+        )
+        .is_err());
         assert_eq!(
             primary_applied,
             (pending_evidence(&h)?, pending_evidence(&hs)?)
         );
         authority.current.set(true);
-        apply_decided(&mut hs, &reopened, &trust, &authority)?;
+        apply_decided(
+            &mut hs,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
         let both_applied = (pending_evidence(&h)?, pending_evidence(&hs)?);
-        apply_decided(&mut h, &reopened, &trust, &authority)?;
-        apply_decided(&mut hs, &reopened, &trust, &authority)?;
+        apply_decided(
+            &mut h,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
+        apply_decided(
+            &mut hs,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
         assert_eq!(
             both_applied,
             (pending_evidence(&h)?, pending_evidence(&hs)?)
         );
-        acknowledge_applied(&h, &reopened, &trust, &authority)?;
+        acknowledge_applied(
+            &h,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
         assert_eq!(
             reopened.status(&trust.as_trust())?.acknowledgements,
             [true, false]
         );
         authority.current.set(true);
         authority.revoke_on_check.set(true);
-        assert!(acknowledge_applied(&hs, &reopened, &trust, &authority).is_err());
+        assert!(acknowledge_applied(
+            &hs,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority)
+        )
+        .is_err());
         assert_eq!(
             reopened.status(&trust.as_trust())?.acknowledgements,
             [true, false]
         );
         authority.current.set(true);
-        acknowledge_applied(&hs, &reopened, &trust, &authority)?;
+        acknowledge_applied(
+            &hs,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
         assert_eq!(
             reopened.status(&trust.as_trust())?.acknowledgements,
             [true, true]
         );
-        acknowledge_applied(&h, &reopened, &trust, &authority)?;
-        acknowledge_applied(&hs, &reopened, &trust, &authority)?;
+        acknowledge_applied(
+            &h,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
+        acknowledge_applied(
+            &hs,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
         authority.current.set(true);
         authority.revoke_on_check.set(true);
-        assert!(complete_authority(&h, &hs, &reopened, &trust, &authority,).is_err());
+        assert!(complete_authority(
+            &h,
+            &hs,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority)
+        )
+        .is_err());
         assert_eq!(reopened.status(&trust.as_trust())?.completion, None);
         authority.current.set(true);
-        complete_authority(&h, &hs, &reopened, &trust, &authority)?;
+        complete_authority(
+            &h,
+            &hs,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
         // The completion id is derived from the request, the issued token and
         // the acknowledgements, so it is stable across retries and restarts.
         let decided = reopened.fetch(&request, &trust.as_trust(), &authority)?;
@@ -2717,7 +3232,11 @@ mod tests {
             reopened.status(&trust.as_trust())?.completion,
             Some(derived)
         );
-        complete_authority(&h, &hs, &reopened, &trust, &authority)?;
+        complete_authority(
+            &h,
+            &hs,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
         assert_eq!(
             reopened.status(&trust.as_trust())?.completion,
             Some(derived)
@@ -2726,20 +3245,36 @@ mod tests {
         assert!(reopened
             .complete(&decided, [91; 32], &trust.as_trust(), &authority)
             .is_err());
-        record_complete(&mut h, &reopened, &trust, &authority)?;
+        record_complete(
+            &mut h,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
         let primary_complete = (pending_evidence(&h)?, pending_evidence(&hs)?);
         authority.current.set(true);
         authority.revoke_on_check.set(true);
-        assert!(record_complete(&mut hs, &reopened, &trust, &authority).is_err());
+        assert!(record_complete(
+            &mut hs,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority)
+        )
+        .is_err());
         assert_eq!(
             primary_complete,
             (pending_evidence(&h)?, pending_evidence(&hs)?)
         );
         authority.current.set(true);
-        record_complete(&mut hs, &reopened, &trust, &authority)?;
+        record_complete(
+            &mut hs,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
         let both_complete = (pending_evidence(&h)?, pending_evidence(&hs)?);
-        record_complete(&mut h, &reopened, &trust, &authority)?;
-        record_complete(&mut hs, &reopened, &trust, &authority)?;
+        record_complete(
+            &mut h,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
+        record_complete(
+            &mut hs,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
         assert_eq!(
             both_complete,
             (pending_evidence(&h)?, pending_evidence(&hs)?)
@@ -2765,7 +3300,7 @@ mod tests {
         )
         .is_err());
         assert_eq!(peer_before_capacity_corruption, pending_evidence(&hs)?);
-        let raw = Vesta::open(&dir.path().join("candidate1"), "fixture")?;
+        let raw = Vesta::open(dir.path().join("candidate1"), "fixture")?;
         raw.with_connection(|c| {
             c.execute(
                 "UPDATE receipt_capacity SET receipt_bytes=receipt_bytes-1 WHERE id=1",
@@ -2809,7 +3344,7 @@ mod tests {
         )
         .is_err());
         assert_eq!(peer_before_capacity_corruption, pending_evidence(&hs)?);
-        let raw = Vesta::open(&dir.path().join("candidate1"), "fixture")?;
+        let raw = Vesta::open(dir.path().join("candidate1"), "fixture")?;
         raw.with_connection(|c| {
             c.execute_batch("DROP TRIGGER receipt_capacity_insert")?;
             c.execute_batch(&insert_trigger)?;
@@ -2951,7 +3486,10 @@ mod tests {
             &request,
             &trust,
         )?;
-        finalize_node(&mut hs, &reopened, &trust, &authority)?;
+        finalize_node(
+            &mut hs,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
         ensure(
             h.db.with_connection(|c| c.query_row(
                 "SELECT format=5 AND NOT EXISTS(SELECT 1 FROM replication_readiness) FROM node_runtime WHERE id=1",
@@ -2960,7 +3498,11 @@ mod tests {
             ))?,
             "primary admitted before finalization",
         )?;
-        finalize_pair(&mut h, &mut hs, &reopened, &trust, &authority)?;
+        finalize_pair(
+            &mut h,
+            &mut hs,
+            &MaintenanceAuthorities::new(&reopened, &trust, &authority),
+        )?;
         drop(h);
         drop(hs);
         let writer_authority = Arc::new(WriterAuthority {
@@ -3061,7 +3603,7 @@ mod tests {
             ],
         };
         let second_token = super::super::certified::tests::sign(&key, &second_request)?;
-        prepare_pair(
+        prepare_pair_at(
             &mut primary,
             &mut secondary,
             &second_plan,
@@ -3074,7 +3616,6 @@ mod tests {
         drop(secondary);
         let mut second_primary = PendingMaintenanceHandle::open_existing_with_authority(
             &path,
-            Role::Primary,
             identity.clone(),
             "fixture",
             StockSchema,
@@ -3084,7 +3625,6 @@ mod tests {
         )?;
         let mut second_secondary = PendingMaintenanceHandle::open_existing_with_authority(
             dir.path().join("survivor"),
-            Role::Secondary,
             identity.clone(),
             "fixture",
             StockSchema,
@@ -3098,83 +3638,59 @@ mod tests {
             journal_scope,
             &trust.as_trust(),
         )?;
-        decide_prepared(
+        decide_prepared_at(
             &second_primary,
             &second_secondary,
-            &second_journal,
+            &MaintenanceAuthorities::new(&second_journal, &trust, writer_authority.as_ref()),
             15,
-            &trust,
-            writer_authority.as_ref(),
         )?;
         writer_authority.current.store(false, Ordering::SeqCst);
         assert!(record_decided(
             &mut second_primary,
-            &second_journal,
-            &trust,
-            writer_authority.as_ref(),
+            &MaintenanceAuthorities::new(&second_journal, &trust, writer_authority.as_ref())
         )
         .is_err());
         writer_authority.current.store(true, Ordering::SeqCst);
         record_decided(
             &mut second_primary,
-            &second_journal,
-            &trust,
-            writer_authority.as_ref(),
+            &MaintenanceAuthorities::new(&second_journal, &trust, writer_authority.as_ref()),
         )?;
         record_decided(
             &mut second_secondary,
-            &second_journal,
-            &trust,
-            writer_authority.as_ref(),
+            &MaintenanceAuthorities::new(&second_journal, &trust, writer_authority.as_ref()),
         )?;
         apply_decided(
             &mut second_primary,
-            &second_journal,
-            &trust,
-            writer_authority.as_ref(),
+            &MaintenanceAuthorities::new(&second_journal, &trust, writer_authority.as_ref()),
         )?;
         apply_decided(
             &mut second_secondary,
-            &second_journal,
-            &trust,
-            writer_authority.as_ref(),
+            &MaintenanceAuthorities::new(&second_journal, &trust, writer_authority.as_ref()),
         )?;
         acknowledge_applied(
             &second_primary,
-            &second_journal,
-            &trust,
-            writer_authority.as_ref(),
+            &MaintenanceAuthorities::new(&second_journal, &trust, writer_authority.as_ref()),
         )?;
         acknowledge_applied(
             &second_secondary,
-            &second_journal,
-            &trust,
-            writer_authority.as_ref(),
+            &MaintenanceAuthorities::new(&second_journal, &trust, writer_authority.as_ref()),
         )?;
         complete_authority(
             &second_primary,
             &second_secondary,
-            &second_journal,
-            &trust,
-            writer_authority.as_ref(),
+            &MaintenanceAuthorities::new(&second_journal, &trust, writer_authority.as_ref()),
         )?;
         record_complete(
             &mut second_primary,
-            &second_journal,
-            &trust,
-            writer_authority.as_ref(),
+            &MaintenanceAuthorities::new(&second_journal, &trust, writer_authority.as_ref()),
         )?;
         record_complete(
             &mut second_secondary,
-            &second_journal,
-            &trust,
-            writer_authority.as_ref(),
+            &MaintenanceAuthorities::new(&second_journal, &trust, writer_authority.as_ref()),
         )?;
         finalize_node(
             &mut second_secondary,
-            &second_journal,
-            &trust,
-            writer_authority.as_ref(),
+            &MaintenanceAuthorities::new(&second_journal, &trust, writer_authority.as_ref()),
         )?;
         drop(second_primary);
         drop(second_secondary);
@@ -3200,7 +3716,6 @@ mod tests {
         drop(restarted_secondary);
         let mut restarted_primary = PendingMaintenanceHandle::open_existing_with_authority(
             &path,
-            Role::Primary,
             identity.clone(),
             "fixture",
             StockSchema,
@@ -3210,9 +3725,7 @@ mod tests {
         )?;
         finalize_node(
             &mut restarted_primary,
-            &second_journal,
-            &trust,
-            writer_authority.as_ref(),
+            &MaintenanceAuthorities::new(&second_journal, &trust, writer_authority.as_ref()),
         )?;
         drop(restarted_primary);
         let mut reopened_primary = Node::open_with_completed_transition(
@@ -3384,7 +3897,7 @@ mod tests {
 
     impl Lifecycle {
         fn prepare(&mut self) -> Result<()> {
-            prepare_pair(
+            prepare_pair_at(
                 &mut self.pair.p,
                 &mut self.pair.s,
                 &self.pair.plan,
@@ -3585,7 +4098,7 @@ mod tests {
         let mut fixture = lifecycle("swapped-roles")?;
         let Lifecycle { pair, .. } = &mut fixture;
         refused(
-            prepare_pair(
+            prepare_pair_at(
                 &mut pair.s,
                 &mut pair.p,
                 &pair.plan,
@@ -3768,73 +4281,147 @@ mod tests {
 
         // prepared: nothing downstream of the decision may run yet.
         refused(
-            record_decided(&mut h, &journal, &trust, &authority),
+            record_decided(
+                &mut h,
+                &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            ),
             "transition missing",
         );
         refused(
-            apply_decided(&mut h, &journal, &trust, &authority),
+            apply_decided(
+                &mut h,
+                &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            ),
             "invalid pending apply transition",
         );
         refused(
-            acknowledge_applied(&h, &journal, &trust, &authority),
+            acknowledge_applied(
+                &h,
+                &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            ),
             "pending node is not applied",
         );
         refused(
-            record_complete(&mut h, &journal, &trust, &authority),
+            record_complete(
+                &mut h,
+                &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            ),
             "transition missing",
         );
         refused(
-            finalize_node(&mut h, &journal, &trust, &authority),
+            finalize_node(
+                &mut h,
+                &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            ),
             "pending node is not complete",
         );
         refused(
-            complete_authority(&h, &hs, &journal, &trust, &authority),
+            complete_authority(
+                &h,
+                &hs,
+                &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            ),
             "pending completion pair mismatch",
         );
 
         // decided: apply is now legal, acknowledge still is not.
-        decide_prepared(&h, &hs, &journal, 15, &trust, &authority)?;
-        record_decided(&mut h, &journal, &trust, &authority)?;
-        record_decided(&mut hs, &journal, &trust, &authority)?;
+        decide_prepared_at(
+            &h,
+            &hs,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            15,
+        )?;
+        record_decided(
+            &mut h,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+        )?;
+        record_decided(
+            &mut hs,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+        )?;
         refused(
-            acknowledge_applied(&h, &journal, &trust, &authority),
+            acknowledge_applied(
+                &h,
+                &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            ),
             "pending node is not applied",
         );
         refused(
-            finalize_node(&mut h, &journal, &trust, &authority),
+            finalize_node(
+                &mut h,
+                &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            ),
             "pending node is not complete",
         );
 
         // applied: acknowledgement opens, completion needs both nodes.
-        apply_decided(&mut h, &journal, &trust, &authority)?;
-        apply_decided(&mut hs, &journal, &trust, &authority)?;
+        apply_decided(
+            &mut h,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+        )?;
+        apply_decided(
+            &mut hs,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+        )?;
         refused(
-            record_complete(&mut h, &journal, &trust, &authority),
+            record_complete(
+                &mut h,
+                &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            ),
             "transition acknowledgements incomplete",
         );
         refused(
-            finalize_node(&mut h, &journal, &trust, &authority),
+            finalize_node(
+                &mut h,
+                &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            ),
             "pending node is not complete",
         );
 
         // acked-one: completion at the authority is still refused.
-        acknowledge_applied(&h, &journal, &trust, &authority)?;
+        acknowledge_applied(
+            &h,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+        )?;
         refused(
-            complete_authority(&h, &hs, &journal, &trust, &authority),
+            complete_authority(
+                &h,
+                &hs,
+                &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            ),
             "acknowledgements incomplete",
         );
         // acked-both, then completed.
-        acknowledge_applied(&hs, &journal, &trust, &authority)?;
-        complete_authority(&h, &hs, &journal, &trust, &authority)?;
+        acknowledge_applied(
+            &hs,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+        )?;
+        complete_authority(
+            &h,
+            &hs,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+        )?;
         refused(
-            finalize_node(&mut h, &journal, &trust, &authority),
+            finalize_node(
+                &mut h,
+                &MaintenanceAuthorities::new(&journal, &trust, &authority),
+            ),
             "pending node is not complete",
         );
 
         // recorded-complete on one node only, then a crash-equivalent restart.
-        record_complete(&mut h, &journal, &trust, &authority)?;
-        record_complete(&mut hs, &journal, &trust, &authority)?;
-        finalize_node(&mut hs, &journal, &trust, &authority)?;
+        record_complete(
+            &mut h,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+        )?;
+        record_complete(
+            &mut hs,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+        )?;
+        finalize_node(
+            &mut hs,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+        )?;
         drop(h);
         drop(hs);
 
@@ -3849,10 +4436,16 @@ mod tests {
             "complete"
         );
         let mut h = open(&primary_path, Role::Primary)?;
-        finalize_node(&mut h, &journal, &trust, &authority)?;
+        finalize_node(
+            &mut h,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+        )?;
         // Repeating on the same handle is a clean no-op, and reopening a
         // finalised node is the typed non-pending error, never a missing table.
-        finalize_node(&mut h, &journal, &trust, &authority)?;
+        finalize_node(
+            &mut h,
+            &MaintenanceAuthorities::new(&journal, &trust, &authority),
+        )?;
         drop(h);
         refused(
             open(&primary_path, Role::Primary),
@@ -3872,7 +4465,8 @@ mod tests {
 
     /// Everything an abort scenario needs, with both handles already open.
     struct Aborting {
-        dir: tempfile::TempDir,
+        /// Keeps the fixture directory alive for the scenario; never read.
+        _dir: tempfile::TempDir,
         identity: Identity<SchemaId>,
         request: crate::recovery::transition::Request,
         trust: crate::recovery::transition::TrustStore,
@@ -3950,23 +4544,36 @@ mod tests {
             let token = self.token(decided);
             let (mut h, mut hs) = self.handles()?;
             if decided && h.prepared.phase == "prepared" {
-                decide_prepared(&h, &hs, &self.journal, 15, &self.trust, &self.authority)?;
-                record_decided(&mut h, &self.journal, &self.trust, &self.authority)?;
-                record_decided(&mut hs, &self.journal, &self.trust, &self.authority)?;
+                decide_prepared_at(
+                    &h,
+                    &hs,
+                    &MaintenanceAuthorities::new(&self.journal, &self.trust, &self.authority),
+                    15,
+                )?;
+                record_decided(
+                    &mut h,
+                    &MaintenanceAuthorities::new(&self.journal, &self.trust, &self.authority),
+                )?;
+                record_decided(
+                    &mut hs,
+                    &MaintenanceAuthorities::new(&self.journal, &self.trust, &self.authority),
+                )?;
             }
-            begin_abort(&mut h, &abort, &token, 15, &self.trust)?;
-            begin_abort(&mut hs, &abort, &token, 15, &self.trust)?;
-            abort_authority(
+            begin_abort_at(&mut h, &abort, &token, 15, &self.trust)?;
+            begin_abort_at(&mut hs, &abort, &token, 15, &self.trust)?;
+            abort_authority_at(
                 &h,
                 &hs,
-                &self.journal,
                 &abort,
                 &token,
+                &MaintenanceAuthorities::new(&self.journal, &self.trust, &self.authority),
                 15,
-                &self.trust,
-                &self.authority,
             )?;
-            abort_pair(&mut h, &mut hs, &self.journal, &self.trust, &self.authority)?;
+            abort_pair(
+                &mut h,
+                &mut hs,
+                &MaintenanceAuthorities::new(&self.journal, &self.trust, &self.authority),
+            )?;
             Ok(())
         }
     }
@@ -3988,7 +4595,7 @@ mod tests {
             trust,
             key,
         } = pair;
-        prepare_pair(&mut p, &mut s, &plan, &request, &token, 15, &trust)?;
+        prepare_pair_at(&mut p, &mut s, &plan, &request, &token, 15, &trust)?;
         let identity = p.identity().clone();
         let primary_path = dir.path().join("candidate1");
         let secondary_path = dir.path().join("survivor");
@@ -4007,7 +4614,7 @@ mod tests {
             (abort, token)
         };
         Ok(Aborting {
-            dir,
+            _dir: dir,
             identity,
             request,
             trust,
@@ -4066,7 +4673,12 @@ mod tests {
         // The token is only valid in [10, 20); the decision now fails for ever.
         let (h, hs) = f.handles()?;
         refused(
-            decide_prepared(&h, &hs, &f.journal, 999, &f.trust, &f.authority),
+            decide_prepared_at(
+                &h,
+                &hs,
+                &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+                999,
+            ),
             "time window",
         );
         drop(h);
@@ -4159,7 +4771,7 @@ mod tests {
             },
         ];
         let token = super::super::certified::tests::sign(&f.key, &fresh)?;
-        prepare_pair(&mut p, &mut s, &plan, &fresh, &token, 15, &f.trust)?;
+        prepare_pair_at(&mut p, &mut s, &plan, &fresh, &token, 15, &f.trust)?;
         drop(p);
         drop(s);
         let mut h = PendingMaintenanceHandle::open_existing(
@@ -4180,17 +4792,54 @@ mod tests {
             &fresh,
             &f.trust,
         )?;
-        decide_prepared(&h, &hs, &f.journal, 15, &f.trust, &f.authority)?;
-        record_decided(&mut h, &f.journal, &f.trust, &f.authority)?;
-        record_decided(&mut hs, &f.journal, &f.trust, &f.authority)?;
-        apply_decided(&mut h, &f.journal, &f.trust, &f.authority)?;
-        apply_decided(&mut hs, &f.journal, &f.trust, &f.authority)?;
-        acknowledge_applied(&h, &f.journal, &f.trust, &f.authority)?;
-        acknowledge_applied(&hs, &f.journal, &f.trust, &f.authority)?;
-        complete_authority(&h, &hs, &f.journal, &f.trust, &f.authority)?;
-        record_complete(&mut h, &f.journal, &f.trust, &f.authority)?;
-        record_complete(&mut hs, &f.journal, &f.trust, &f.authority)?;
-        finalize_pair(&mut h, &mut hs, &f.journal, &f.trust, &f.authority)?;
+        decide_prepared_at(
+            &h,
+            &hs,
+            &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+            15,
+        )?;
+        record_decided(
+            &mut h,
+            &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+        )?;
+        record_decided(
+            &mut hs,
+            &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+        )?;
+        apply_decided(
+            &mut h,
+            &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+        )?;
+        apply_decided(
+            &mut hs,
+            &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+        )?;
+        acknowledge_applied(
+            &h,
+            &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+        )?;
+        acknowledge_applied(
+            &hs,
+            &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+        )?;
+        complete_authority(
+            &h,
+            &hs,
+            &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+        )?;
+        record_complete(
+            &mut h,
+            &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+        )?;
+        record_complete(
+            &mut hs,
+            &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+        )?;
+        finalize_pair(
+            &mut h,
+            &mut hs,
+            &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+        )?;
         drop(h);
         drop(hs);
         // The previously aborted request can never be decided again.
@@ -4212,40 +4861,38 @@ mod tests {
         let other_token = support::sign_abort(&f.key, &other, (10, 20))?;
         let (mut h, mut hs) = f.handles()?;
         refused(
-            begin_abort(&mut h, &other, &other_token, 15, &f.trust),
+            begin_abort_at(&mut h, &other, &other_token, 15, &f.trust),
             "pending abort binding mismatch",
         );
         // An expired or foreign token never starts an abort.
         refused(
-            begin_abort(&mut h, &abort, &token, 999, &f.trust),
+            begin_abort_at(&mut h, &abort, &token, 999, &f.trust),
             "time window",
         );
         let attacker = super::super::certified::tests::signer()?.0;
         let forged = support::sign_abort(&attacker, &abort, (10, 20))?;
         refused(
-            begin_abort(&mut h, &abort, &forged, 15, &f.trust),
+            begin_abort_at(&mut h, &abort, &forged, 15, &f.trust),
             "signature",
         );
         // `decided: true` while the node is only prepared is refused.
         let wrong_phase = support::abort_of(&f.request, 66, true, f.request.revision)?;
         let wrong_phase_token = support::sign_abort(&f.key, &wrong_phase, (10, 20))?;
         refused(
-            begin_abort(&mut h, &wrong_phase, &wrong_phase_token, 15, &f.trust),
+            begin_abort_at(&mut h, &wrong_phase, &wrong_phase_token, 15, &f.trust),
             "invalid pending abort transition",
         );
 
         // One node aborting is not evidence: the journal records nothing.
-        begin_abort(&mut h, &abort, &token, 15, &f.trust)?;
+        begin_abort_at(&mut h, &abort, &token, 15, &f.trust)?;
         refused(
-            abort_authority(
+            abort_authority_at(
                 &h,
                 &hs,
-                &f.journal,
                 &abort,
                 &token,
+                &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
                 15,
-                &f.trust,
-                &f.authority,
             ),
             "pending node is not aborting",
         );
@@ -4256,46 +4903,64 @@ mod tests {
         );
         // `finish_abort` before the journal abort is refused.
         refused(
-            finish_abort(&mut h, &f.journal, &f.trust, &f.authority),
+            finish_abort(
+                &mut h,
+                &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+            ),
             "maintenance abort missing",
         );
 
         // From `aborting` no lifecycle call may roll forward.
         refused(
-            record_decided(&mut h, &f.journal, &f.trust, &f.authority),
+            record_decided(
+                &mut h,
+                &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+            ),
             "invalid pending decision transition",
         );
         refused(
-            apply_decided(&mut h, &f.journal, &f.trust, &f.authority),
+            apply_decided(
+                &mut h,
+                &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+            ),
             "invalid pending apply transition",
         );
         refused(
-            acknowledge_applied(&h, &f.journal, &f.trust, &f.authority),
+            acknowledge_applied(
+                &h,
+                &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+            ),
             "pending node is not applied",
         );
         refused(
-            record_complete(&mut h, &f.journal, &f.trust, &f.authority),
+            record_complete(
+                &mut h,
+                &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+            ),
             "transition missing",
         );
         refused(
-            finalize_node(&mut h, &f.journal, &f.trust, &f.authority),
+            finalize_node(
+                &mut h,
+                &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+            ),
             "pending node is not complete",
         );
         // A different abort on an already aborting node is a conflict, and an
         // abort for another request is still a binding mismatch.
         refused(
-            begin_abort(&mut h, &wrong_phase, &wrong_phase_token, 15, &f.trust),
+            begin_abort_at(&mut h, &wrong_phase, &wrong_phase_token, 15, &f.trust),
             "pending abort conflict",
         );
         refused(
-            begin_abort(&mut h, &other, &other_token, 15, &f.trust),
+            begin_abort_at(&mut h, &other, &other_token, 15, &f.trust),
             "pending abort binding mismatch",
         );
         let same_request_other_id = support::abort_of(&f.request, 67, false, f.request.revision)?;
         let same_request_other_token =
             support::sign_abort(&f.key, &same_request_other_id, (10, 20))?;
         refused(
-            begin_abort(
+            begin_abort_at(
                 &mut h,
                 &same_request_other_id,
                 &same_request_other_token,
@@ -4305,22 +4970,24 @@ mod tests {
             "pending abort conflict",
         );
         // Exact retry on an aborting node is a no-op.
-        begin_abort(&mut h, &abort, &token, 15, &f.trust)?;
+        begin_abort_at(&mut h, &abort, &token, 15, &f.trust)?;
 
         // With both aborting the authority records it, and only then does
         // `finish_abort` succeed.
-        begin_abort(&mut hs, &abort, &token, 15, &f.trust)?;
-        abort_authority(
+        begin_abort_at(&mut hs, &abort, &token, 15, &f.trust)?;
+        abort_authority_at(
             &h,
             &hs,
-            &f.journal,
             &abort,
             &token,
+            &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
             15,
-            &f.trust,
-            &f.authority,
         )?;
-        abort_pair(&mut h, &mut hs, &f.journal, &f.trust, &f.authority)?;
+        abort_pair(
+            &mut h,
+            &mut hs,
+            &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+        )?;
         drop(h);
         drop(hs);
         assert_pair_usable(&f)?;
@@ -4332,29 +4999,41 @@ mod tests {
     fn abort_is_refused_after_apply() -> Result<()> {
         let f = aborting("abort-after-apply")?;
         let (mut h, mut hs) = f.handles()?;
-        decide_prepared(&h, &hs, &f.journal, 15, &f.trust, &f.authority)?;
-        record_decided(&mut h, &f.journal, &f.trust, &f.authority)?;
-        record_decided(&mut hs, &f.journal, &f.trust, &f.authority)?;
-        apply_decided(&mut h, &f.journal, &f.trust, &f.authority)?;
+        decide_prepared_at(
+            &h,
+            &hs,
+            &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+            15,
+        )?;
+        record_decided(
+            &mut h,
+            &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+        )?;
+        record_decided(
+            &mut hs,
+            &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+        )?;
+        apply_decided(
+            &mut h,
+            &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
+        )?;
         let abort = f.abort(true);
         let token = f.token(true);
         refused(
-            begin_abort(&mut h, &abort, &token, 15, &f.trust),
+            begin_abort_at(&mut h, &abort, &token, 15, &f.trust),
             "invalid pending abort transition",
         );
         // The still-decided peer may begin, but the authority refuses because
         // the applied node is not aborting.
-        begin_abort(&mut hs, &abort, &token, 15, &f.trust)?;
+        begin_abort_at(&mut hs, &abort, &token, 15, &f.trust)?;
         refused(
-            abort_authority(
+            abort_authority_at(
                 &h,
                 &hs,
-                &f.journal,
                 &abort,
                 &token,
+                &MaintenanceAuthorities::new(&f.journal, &f.trust, &f.authority),
                 15,
-                &f.trust,
-                &f.authority,
             ),
             "pending node is not aborting",
         );
@@ -4394,10 +5073,17 @@ mod tests {
         let abort = f.abort(false);
         let token = f.token(false);
         let (mut h, mut hs) = f.handles()?;
-        begin_abort(&mut h, &abort, &token, 15, &f.trust)?;
-        begin_abort(&mut hs, &abort, &token, 15, &f.trust)?;
+        begin_abort_at(&mut h, &abort, &token, 15, &f.trust)?;
+        begin_abort_at(&mut hs, &abort, &token, 15, &f.trust)?;
         refused(
-            abort_authority(&h, &hs, &f.journal, &abort, &token, 15, &f.trust, &Bare),
+            abort_authority_at(
+                &h,
+                &hs,
+                &abort,
+                &token,
+                &MaintenanceAuthorities::new(&f.journal, &f.trust, &Bare),
+                15,
+            ),
             "maintenance abort evidence missing",
         );
         Ok(())
@@ -4414,7 +5100,7 @@ mod tests {
         // After the first begin_abort only.
         {
             let mut h = f.open(Role::Primary)?;
-            begin_abort(&mut h, &abort, &token, 15, &f.trust)?;
+            begin_abort_at(&mut h, &abort, &token, 15, &f.trust)?;
         }
         assert_eq!(
             peek_pending(&f.primary_path, &f.identity, "fixture")?.phase,

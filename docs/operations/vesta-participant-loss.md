@@ -26,11 +26,16 @@ rejected for ever, across restarts and partial failures (I8).
 
 1. The pair is **certified**: the survivor's newest durable artefact is a completed
    certified maintenance (compaction) certificate, or — for a second loss — a **completed
-   format-2 loss recovery**. `validate` derives the survivor's role from that signed
+   format-2 loss recovery**. The certificate is produced by the certified maintenance
+   lifecycle, public under the same feature in `typed::maintenance::pending`
+   (`prepare_pair` … `finalize_node`; see its module documentation). `validate` derives the survivor's role from that signed
    document; a survivor that is not named in it fails with `loss survivor not certified`.
 2. Maintenance is **idle**. Any pending certified maintenance on the survivor is refused:
    `loss survivor has pending certified maintenance`. On a loss-recovered pair the message
-   is `certified maintenance cannot be pending on a loss-recovered pair`.
+   is `certified maintenance cannot be pending on a loss-recovered pair`. A loss that
+   deliberately abandons an in-flight maintenance (`abandoned_request`) is a separate,
+   experimental path: `pending::terminate_by_loss` first, see
+   [loss during maintenance](vesta-loss-during-maintenance.md).
 3. The survivor holds a current **frozen publication** covering `survivor_cut`, produced by
    `Node::rotate_snapshot` *before* the loss is decided. There is no export guard that will
    make one for you.
@@ -141,7 +146,7 @@ until the completion receipt exists on both nodes.
 | `recovery_loss_completion` | Singleton local completion receipt. Only this **plus** a live completed-successor proof reopens admission. |
 | `recovery_loss_cycles` | Append-only, hash-linked history of recoveries this survivor has already been through (max 1024 rows). |
 | `recovery_loss_aborted` | Append-only, hash-linked tombstones of successor memberships installed and then un-installed under a signed abort. |
-| `node_maintenance_terminated` | Singleton trace of a maintenance terminated by a loss; consumed into the cycle row on retirement. Only relevant to the not-enabled path. |
+| `node_maintenance_terminated` | Singleton trace of a maintenance terminated by a loss; consumed into the cycle row on retirement. Only relevant to the experimental [loss-during-maintenance](vesta-loss-during-maintenance.md) path. |
 
 ## Journal tables
 
@@ -172,8 +177,14 @@ format-1 journal.
 
 ## Integrator contract — `LossPolicy` hooks
 
-These are **not** implemented by the library. Every one below defaults to deny except the
-first two, which have no default at all. Quoted obligations are from
+These are **not** implemented by the library, with one exception: for the three
+survivor-side hooks `survivor_prepared` (under `source_kind = Decided` only),
+`maintenance_rollback_authorized` and `maintenance_finish_forward_authorized`, the
+library provides the adapter
+`maintenance::loss::SurvivorEvidence`, which wraps the integrator's `LossPolicy`, proves
+those three from the survivor's durable state read-only (without taking the node lock),
+and delegates every other hook to the wrapped policy. Every one below defaults to deny
+except the first two, which have no default at all. Quoted obligations are from
 `recovery/src/transition/loss.rs`.
 
 | Hook | Documented obligation |
@@ -184,8 +195,8 @@ first two, which have no default at all. Quoted obligations are from
 | `loss_successor_continuity` | "Check the current external authority head for the exact successor." Default error: `loss successor continuity missing`. |
 | `successor_abort_authorized` | Must "prove that the replacement member and generation named by `successor` are **durably fenced** under `abort.fencing_ref`… an abort that is not backed by durable fencing leaves a live node that believes it is a member of the pair" and must "consult the **live** external authority head, not the signature." Default error: `loss successor abort evidence missing`. |
 | `superseded_successor_aborted` | Must "verify, against the live successor journal of `previous_loss`, that an abort with exactly `supersedes.abort_certificate` and `supersedes.abort_token_digest` is **recorded** there… this hook is the only thing standing between a superseding loss and a replacement that was never actually cancelled." Default error: `superseded loss abort evidence missing`. |
-| `maintenance_rollback_authorized` | Loss-during-maintenance only; see that runbook. Default error: `maintenance rollback evidence missing`. |
-| `maintenance_finish_forward_authorized` | Loss-during-maintenance only; see that runbook. Default error: `maintenance finish-forward evidence missing`. |
+| `maintenance_rollback_authorized` | Loss-during-maintenance only; see that runbook. Default error: `maintenance rollback evidence missing`. Provided by `SurvivorEvidence`. |
+| `maintenance_finish_forward_authorized` | Loss-during-maintenance only (finish-forward branch: experimental — pending independent review before production use); see that runbook. Default error: `maintenance finish-forward evidence missing`. Provided by `SurvivorEvidence`. |
 
 `CertifiedAuthority::fetch_completed_loss_successor` must also be implemented, against the
 live authority, or no recovered node ever reopens.

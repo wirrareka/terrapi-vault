@@ -93,6 +93,7 @@ pub(crate) fn create_node_lock(path: &Path) -> Result<File> {
 }
 
 /// Take an existing lock only. Used by every restricted handle.
+#[cfg(feature = "experimental-recovery")]
 pub(crate) fn open_node_lock(path: &Path) -> Result<File> {
     lock_regular_file(&node_lock_path(path), false)
 }

@@ -1,9 +1,17 @@
 # Vesta certified-maintenance abort
 
-Status: local qualification. The abort path is crate-internal
-(`typed::maintenance::pending`, `pub(crate)`); it is exercised by in-crate tests and has no
-public operator API in this release. This is not a remote operator RPC, a scheduler, or an
-authority backend. Verified on macOS arm64 only.
+Status: local qualification of an experimental library path. The abort API is public
+only with the `experimental-recovery` feature, in `typed::maintenance::pending`:
+`peek_pending`, `PendingMaintenanceHandle::open_existing_with_authority`, `begin_abort`,
+`abort_authority`, `finish_abort`, `abort_pair`, with the authority grouped in
+`MaintenanceAuthorities { journal, trust, policy }`. Without the feature it is
+crate-internal. It is exercised by in-crate tests and by one end-to-end test through the
+public API only (`fixed-pair/tests/certified_maintenance.rs`). This is not a remote operator
+RPC, a scheduler, or an authority backend. Verified on macOS arm64 only.
+
+No public function takes a timestamp: the abort token's issuance window is checked against
+the system clock (Unix seconds; a clock before the Unix epoch is an error). Keep the host
+clock synchronised with the authority that issues abort tokens.
 
 ## What this aborts
 
@@ -27,6 +35,12 @@ will never supply it. See [loss during maintenance](vesta-loss-during-maintenanc
    proves only that the marker, the progress record and the owner row agree.
    A node without pending maintenance fails with
    `node has no pending certified maintenance`.
+   Then open each node with
+   `PendingMaintenanceHandle::open_existing_with_authority(path, identity, passphrase,
+   adapter, &summary.request, &trust, certified_authority)`. The role is read from the
+   durable marker and checked against the owner row; it is never an argument.
+   `certified_authority` is required only when the pair already went through an earlier
+   certified cycle.
 3. Both nodes must report the same `request`, roles Primary and Secondary, and phase
    `prepared` or `decided` — identically. `abort.decided` must equal
    `(phase == "decided")`, or `invalid pending abort transition`.
@@ -47,18 +61,21 @@ An open decided transition must be cancelled on **its own** revision, never step
 
 ## Sequence
 
-1. `begin_abort(&mut handle, &abort, token, now, &trust)` on **each** node. This verifies
-   the token freshly, binds it to the durable request, and moves the node to phase
+1. `begin_abort(&mut handle, &abort, token, &trust)` on **each** node. This verifies
+   the token freshly (issuance window at the system clock), binds it to the durable
+   request, and moves the node to phase
    `aborting`. It is **one-way**: from here no call can reach apply, acknowledge or
    complete. An exact retry converges; a different abort is `pending abort conflict`.
-2. `abort_authority(&primary, &secondary, &journal, &abort, token, now, &trust, &policy)`.
+2. `abort_authority(&primary, &secondary, &abort, token, &authorities)` where
+   `authorities = MaintenanceAuthorities::new(&journal, &trust, &policy)`. The token window
+   is checked at the system clock when the abort is first recorded.
    The journal records the abort only once **both** nodes are durably aborting on exactly
    this abort with the pending runtime still in place; otherwise
    `pending node is not aborting`. The nodes must be Primary and Secondary of the same
    identity and request, or `pending abort pair mismatch`.
    `Policy::abort_applicable` runs first and still gates on the live authority head.
-3. `finish_abort(&mut handle, &journal, &trust, &policy)` per node — **secondary first**
-   (`abort_pair` does exactly that order). Each call re-fetches the committed abort, checks
+3. `finish_abort(&mut handle, &authorities)` per node — **secondary first**
+   (`abort_pair(&mut primary, &mut secondary, &authorities)` does exactly that order). Each call re-fetches the committed abort, checks
    it against the local `AbortLocal` record (`pending abort proof mismatch`), then in one
    transaction drops `node_pending_certified_progress` and
    `node_pending_certified_maintenance` and restores `node_runtime` from 5 to the recorded
@@ -119,7 +136,9 @@ fails while decoding the scope row). Downgrade after that point is unsupported.
 
 ## What the library does not provide
 
-Authority head/reservation management, token issuance or renewal, a public operator API for
-this flow, proof that no node applied the transition (that is
-`Policy::abort_applicable`'s duty — default error: `maintenance abort evidence missing`),
-rollback of an applied transition, or any repair of a half-rolled-back node.
+Authority head/reservation management, token issuance or renewal, an operator CLI or RPC
+for this flow (the public API above is a library surface), the live authority check for
+`abort.aborted_revision` (that is `Policy::abort_applicable`'s duty — default error:
+`maintenance abort evidence missing`; `abort_authority` adds the live node-side evidence
+that both nodes are aborting after that hook), rollback of an applied transition, or any
+repair of a half-rolled-back node.

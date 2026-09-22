@@ -115,6 +115,7 @@ fn maintenance_upgrade_failure_is_atomic() -> Result<()> {
 /// participant-loss flow: a recovered, maintenance-enabled pair with one
 /// committed entry, a fresh publication on each node and a signed certified
 /// request that has NOT yet been prepared.
+#[cfg(feature = "experimental-recovery")]
 pub(super) mod support {
     use super::*;
     use crate::recovery::transition;

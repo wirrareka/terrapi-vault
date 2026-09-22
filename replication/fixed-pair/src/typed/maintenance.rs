@@ -6,6 +6,9 @@ pub mod compaction;
 pub mod loss;
 #[cfg(not(feature = "experimental-recovery"))]
 pub(super) mod loss;
+#[cfg(feature = "experimental-recovery")]
+pub mod pending;
+#[cfg(not(feature = "experimental-recovery"))]
 mod pending;
 mod restores;
 #[cfg(test)]

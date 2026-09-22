@@ -2,22 +2,22 @@
 //! the atomic local installation of the signed successor membership.
 use super::*;
 use crate::recovery::transition;
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 use crate::recovery::transition::roles;
 use sha2::{Digest, Sha256};
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 use std::{
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
-#[cfg(test)]
+#[cfg(all(test, feature = "experimental-recovery"))]
 mod tests;
 
 /// Singleton install marker. It is inert evidence of a decided successor
 /// membership; it never opens admission (I6) and is only ever written once.
 const INSTALL_TABLE: &str = "recovery_loss_active";
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 const INSTALL_DDL: &str = "CREATE TABLE IF NOT EXISTS main.recovery_loss_active(\
      id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL)";
 /// The install record now carries the issued successor token as well, so the
@@ -29,7 +29,7 @@ const COMPLETION_LIMIT: usize = 64 * 1024;
 /// Mirror of the recovery crate's private `MAX_TOKEN`: every token this module
 /// stores or replays is bounded before it is decoded or verified.
 const MAX_TOKEN: usize = 64 * 1024;
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 /// Recovery metadata a certified survivor legitimately carries: its membership
 /// came from a completed recovery. Anything else under `recovery_` fails closed.
 const SURVIVOR_RECOVERY_TABLES: &[&str] = &[
@@ -43,13 +43,13 @@ const SURVIVOR_RECOVERY_TABLES: &[&str] = &[
     "recovery_loss_cycles",
     "recovery_seal",
 ];
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 /// A bootstrap replacement has no recovery history of its own.
 const REPLACEMENT_RECOVERY_TABLES: &[&str] = &["recovery_loss_active", "recovery_loss_completion"];
 /// Append-only, hash-linked history of the loss recoveries this survivor has
 /// already been through. Rows are only ever appended, never rewritten.
 const CYCLES_TABLE: &str = "recovery_loss_cycles";
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 const CYCLES_DDL: &str = "CREATE TABLE IF NOT EXISTS main.recovery_loss_cycles(\
      revision INTEGER PRIMARY KEY,record TEXT NOT NULL,digest TEXT NOT NULL)";
 const MAX_CYCLE_ROWS: u64 = 1024;
@@ -58,13 +58,13 @@ const MAX_CYCLE_ROWS: u64 = 1024;
 /// A successor named here can never be installed again, and its replacement
 /// identity can never come back (S10).
 const ABORTED_TABLE: &str = "recovery_loss_aborted";
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 const ABORTED_DDL: &str = "CREATE TABLE IF NOT EXISTS main.recovery_loss_aborted(\
      revision INTEGER PRIMARY KEY,record TEXT NOT NULL,digest TEXT NOT NULL)";
 /// Singleton local completion receipt. Only its presence *together with* a live
 /// completed-successor proof can reopen ordinary admission (I6).
 const COMPLETION_TABLE: &str = "recovery_loss_completion";
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 const COMPLETION_DDL: &str = "CREATE TABLE IF NOT EXISTS main.recovery_loss_completion(\
      id INTEGER PRIMARY KEY CHECK(id=1),receipt TEXT NOT NULL)";
 /// The single error every closed participant-loss path reports.
@@ -72,7 +72,7 @@ pub(super) const CLOSED: &str = "participant-loss recovery not complete; data ad
 /// Entry points this release keeps shut on a loss-recovered node.
 pub(super) const RETIRED: &str = "closed after participant-loss recovery in this release";
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 /// The live authorities every loss entry point must consult before and after
 /// its durable step (I2). Borrowed, so nothing is cached across a call.
 pub struct Authorities<'a, P: transition::LossPolicy> {
@@ -81,7 +81,7 @@ pub struct Authorities<'a, P: transition::LossPolicy> {
     pub policy: &'a P,
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 /// Everything `validate` derives from signed evidence. The survivor role is a
 /// result, never a parameter: it exists only inside this module and is rebuilt
 /// from the durable certificate on every validation.
@@ -123,7 +123,7 @@ pub(crate) struct Installed {
     publication: [u8; 32],
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 /// Restricted capability: it owns the normal node lock, opens SQLite read-only,
 /// and exposes only the exact loss-bound frozen publication. The installer
 /// opens a second, read-write connection to the same file for the duration of
@@ -148,7 +148,7 @@ pub struct LossSurvivorHandle<A: ReplicatedSchema> {
     _lock: std::fs::File,
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
     pub fn open_existing(
         path: impl AsRef<Path>,
@@ -712,7 +712,7 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
 
 /// The tombstone a signed abort commits this survivor to, hash-linked to the
 /// tombstones already recorded.
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 fn aborted_record(
     c: &Connection,
     loss: &transition::CommittedLoss,
@@ -793,7 +793,7 @@ fn singleton(c: &Connection, table: &str, column: &str, limit: usize) -> Result<
 /// The `recovery_*` tables this node kind may legitimately carry. The kind is
 /// decided by comparing this node's position with the successor's own
 /// `survivor_index`, never by assuming a fixed slot.
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 fn recovery_tables_for(record: &Installed) -> Result<&'static [&'static str]> {
     // Which participant this node is, never which slot it occupies: format 2
     // orders participants canonically, so the survivor may sit at either index.
@@ -806,7 +806,7 @@ fn recovery_tables_for(record: &Installed) -> Result<&'static [&'static str]> {
     )
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 /// Only the recovery metadata this kind of node is allowed to carry may exist.
 /// An unexpected `recovery_*` table — including a completion record this slice
 /// never writes — fails closed instead of being ignored.
@@ -962,7 +962,7 @@ fn visit_cycles(
 }
 
 /// Every member, generation and membership one recovery burns for good.
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 fn retired_of(record: &Installed) -> [[u8; 32]; 8] {
     [
         record.member,
@@ -976,7 +976,7 @@ fn retired_of(record: &Installed) -> [[u8; 32]; 8] {
     ]
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 /// Every member, generation and membership this node has already retired —
 /// through a completed recovery *or* through an aborted successor. A
 /// replacement may never reuse any of them, whatever the journal says.
@@ -1119,7 +1119,7 @@ pub(super) fn termination_traces(
 /// validated, or to a loss this file already knows about — the active install
 /// record's loss, or any loss named by the retired cycle history. Anything
 /// else is a trace this node cannot account for and fails closed.
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 fn require_known_termination(
     c: &Connection,
     trust: &transition::TrustStore,
@@ -1143,7 +1143,6 @@ fn require_known_termination(
 /// own certificate binding is on this file (every `Installed` carries it), a
 /// superseding claim must name it exactly (L8); a retired row's `next` has no
 /// such binding here, so it falls back to the lineage rule.
-#[cfg(any(test, feature = "experimental-recovery"))]
 fn matches_known_loss(
     c: &Connection,
     trust: &transition::TrustStore,
@@ -1170,7 +1169,7 @@ fn matches_known_loss(
     Ok(known)
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 fn require_maintenance_terminated(
     c: &Connection,
     trust: &transition::TrustStore,
@@ -1301,7 +1300,7 @@ fn supersedes_exactly(
 
 /// A successor membership that was un-installed under a signed abort can never
 /// be installed again — not from a rolled-back journal file, not ever.
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 fn require_not_aborted(
     c: &Connection,
     trust: &transition::TrustStore,
@@ -1339,7 +1338,7 @@ fn require_not_aborted(
 /// The tombstone that authorises `loss` to supersede an earlier attempt, read
 /// from this node's own append-only history. The authority's journal ran the
 /// same rule set; this file is a different trust domain and runs it again.
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 fn require_supersession(
     c: &Connection,
     trust: &transition::TrustStore,
@@ -1415,7 +1414,7 @@ fn successor_binds(
 /// The role the canonical participant order implies for `index`. Format 1
 /// ordered participants `[survivor, replacement]` and carries no role, so it
 /// has none; format 2 orders them `[primary, secondary]`.
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 fn canonical_role(
     successor: &transition::LossSuccessorRequest,
     index: usize,
@@ -1434,7 +1433,7 @@ fn canonical_role(
 /// A format-2 successor states each participant's role twice: once through the
 /// canonical order and once through the evidence the install derived it from.
 /// They must agree, or the successor is not describing this pair.
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 fn require_canonical_role(
     successor: &transition::LossSuccessorRequest,
     index: usize,
@@ -1446,7 +1445,7 @@ fn require_canonical_role(
     )
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 /// Installation-aware owner expectation for a survivor file. The pre-loss role
 /// always comes from signed evidence (I1) and is never an input; a durable
 /// install may additionally have promoted the owner row, and only then must the
@@ -1494,17 +1493,11 @@ fn survivor_owner_role(
     Ok(record.installed_role)
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
-/// The role the replacement inherits, derived from the signed source
-/// certificate named by the signed loss decision. The certificate is pinned by
-/// `source_certificate` + `source_token_digest`, so a caller cannot substitute
-/// one; the index of the lost member inside it decides the role, exactly as I1
-/// decides the survivor's. No caller-supplied role or boolean is involved.
 /// The signed document a loss is founded on, supplied by the operator exactly
 /// as the authority issued it. Both arms are authenticated by signature and
 /// pinned to the loss's `source_certificate`/`source_token_digest`; neither
 /// carries a role, so the role is always read out of the participant order.
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 pub enum Founding {
     /// The certified compaction that founded an ordinary pair.
     Certificate(transition::Request, String),
@@ -1512,7 +1505,7 @@ pub enum Founding {
     Successor(transition::LossSuccessorRequest, String),
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 impl Founding {
     /// Authenticate the document and pin it to this loss, then return the role
     /// the *lost* member held. The replacement inherits exactly that role.
@@ -1596,7 +1589,7 @@ impl Founding {
 }
 
 /// Exactly one participant may carry this member and generation.
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 fn sole_participant(
     participants: &[transition::Participant; 2],
     member: [u8; 32],
@@ -1615,7 +1608,7 @@ fn sole_participant(
     Ok(index)
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 /// Durable installation of the same signed successor membership on the
 /// replacement, which takes over the lost member's role. It depends only on
 /// signed data, this node and the journals: in production the survivor is a
@@ -1807,7 +1800,7 @@ pub fn install_replacement<A: ReplicatedSchema, P: transition::LossPolicy>(
     Ok(())
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 /// Local bridge for a co-located pair: survivor first, then replacement.
 /// In production the two installs run on their own machines against their own
 /// journals; neither depends on the other's object.
@@ -1823,7 +1816,7 @@ pub fn install_pair<A: ReplicatedSchema, P: transition::LossPolicy>(
     install_replacement(replacement, founding, successor, authorities)
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 /// Idempotently transfer the exact loss-bound publication into an empty
 /// replacement. The replacement stays a normal non-primary bootstrap node;
 /// this function neither installs membership nor grants admission.
@@ -1872,7 +1865,7 @@ pub fn bootstrap_replacement<A: ReplicatedSchema>(
     Ok(checkpoint)
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 /// Read-only precondition for the future atomic local membership install.
 /// The opaque proof is intentionally consumed only as installation authority;
 /// it is not a completed writer capability and this function performs no ACK.
@@ -1932,7 +1925,7 @@ pub fn validate_successor_installation<A: ReplicatedSchema>(
 /// append-only cycle history, then remove its active record and completion
 /// receipt so the new install can take their place. All inside the caller's
 /// transaction, so the retirement and the new record are one atomic step.
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 fn retire_founding(
     c: &Connection,
     trust: &transition::TrustStore,
@@ -2005,7 +1998,7 @@ fn retire_founding(
 /// pair is founded by its latest compaction certificate; a pair that already
 /// survived a loss is founded by that recovery's completed successor, which the
 /// node authenticated by signature when it installed it.
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 enum SurvivorFounding {
     Certificate {
         request: transition::Request,
@@ -2015,7 +2008,7 @@ enum SurvivorFounding {
     },
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 impl SurvivorFounding {
     /// `(local role, local participant)` derived from the founding document.
     fn survivor_evidence(
@@ -2053,7 +2046,7 @@ impl SurvivorFounding {
 }
 
 /// Read and pin the survivor's founding document from its own durable state.
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 fn survivor_founding(
     c: &Connection,
     trust: &transition::TrustStore,
@@ -2167,7 +2160,7 @@ fn survivor_founding(
     })
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 pub(super) fn validate<A: ReplicatedSchema>(
     c: &Connection,
     adapter: &A,
@@ -2544,7 +2537,7 @@ pub(crate) fn require_no_loss_recovery(c: &Connection) -> Result<()> {
     ensure(state(c, None)?.is_none(), RETIRED)
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 /// Durable local completion evidence, written on the ordinary `Node` (the
 /// survivor's read-write install handle is dropped before this runs). Exact
 /// retry converges; a different completion is a conflict, never a repair.
@@ -2613,7 +2606,7 @@ pub fn record_completion<A: ReplicatedSchema>(node: &Node<A>) -> Result<()> {
     })
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 /// Live read of the replacement's durable install, repeating the state checks
 /// `install_replacement` made. Used only as acknowledgement evidence (I7).
 fn replacement_installed<A: ReplicatedSchema>(
@@ -2665,7 +2658,7 @@ fn replacement_installed<A: ReplicatedSchema>(
     })
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
     /// Live read of the survivor's durable install through the retained
     /// read-only connection, re-running the full evidence validation.
@@ -2704,7 +2697,7 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
     }
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 /// I7: fixed-pair acknowledges a participant only after live-reading **both**
 /// durable installs from the actual node databases. Every other decision is
 /// delegated to the external policy unchanged.
@@ -2714,7 +2707,7 @@ struct InstalledParticipants<'a, A: ReplicatedSchema, P: transition::LossPolicy>
     policy: &'a P,
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 impl<A: ReplicatedSchema, P: transition::LossPolicy> transition::LossPolicy
     for InstalledParticipants<'_, A, P>
 {
@@ -2768,14 +2761,10 @@ impl<A: ReplicatedSchema, P: transition::LossPolicy> transition::LossPolicy
     }
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
-/// Local bridge from two durable installs to a completed successor membership:
-/// acknowledge the survivor, then the replacement, then complete. Every step is
-/// idempotent and converges on retry; a different completion id is refused.
 /// The completion id is derived, never chosen: a function of the exact
 /// successor request, the exact issued token and the acknowledgements that
 /// authorised it. A retry always recomputes the same value.
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 pub(crate) fn completion_id(
     request: &transition::LossSuccessorRequest,
     token_digest: [u8; 32],
@@ -2789,7 +2778,10 @@ pub(crate) fn completion_id(
     ))
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+/// Local bridge from two durable installs to a completed successor membership:
+/// acknowledge the survivor, then the replacement, then complete. Every step is
+/// idempotent and converges on retry; a different completion id is refused.
+#[cfg(feature = "experimental-recovery")]
 pub fn complete_successor<A: ReplicatedSchema, P: transition::LossPolicy>(
     survivor: &LossSurvivorHandle<A>,
     replacement: &Node<A>,
@@ -2850,7 +2842,7 @@ pub fn complete_successor<A: ReplicatedSchema, P: transition::LossPolicy>(
 // L4: production survivor evidence for the participant-loss policy hooks.
 // ---------------------------------------------------------------------------
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 /// Live, read-only survivor evidence for the three hooks the authority's
 /// journal cannot check for itself: whether an in-flight certified maintenance
 /// may be rolled back, whether it may be finished forward, and whether the
@@ -2879,7 +2871,7 @@ pub struct SurvivorEvidence<'a, A: ReplicatedSchema, P: transition::LossPolicy> 
     policy: &'a P,
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 impl<'a, A: ReplicatedSchema, P: transition::LossPolicy> SurvivorEvidence<'a, A, P> {
     pub fn new(
         path: impl AsRef<Path>,
@@ -2977,7 +2969,7 @@ impl<'a, A: ReplicatedSchema, P: transition::LossPolicy> SurvivorEvidence<'a, A,
     }
 }
 
-#[cfg(any(test, feature = "experimental-recovery"))]
+#[cfg(feature = "experimental-recovery")]
 impl<A: ReplicatedSchema, P: transition::LossPolicy> transition::LossPolicy
     for SurvivorEvidence<'_, A, P>
 {

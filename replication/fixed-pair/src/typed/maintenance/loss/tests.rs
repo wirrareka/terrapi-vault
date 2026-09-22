@@ -467,7 +467,7 @@ fn fixture_of(lost: Role, tail: bool, format: u32) -> Result<Fixture> {
         trust,
         key,
     } = support::certified_pair("loss-fixture-seed", [41; 32], "loss-fixture")?;
-    pending::prepare_pair(&mut p, &mut s, &plan, &certificate, &token, 15, &trust)?;
+    pending::prepare_pair_at(&mut p, &mut s, &plan, &certificate, &token, 15, &trust)?;
     let identity = p.identity().clone();
     let primary_path = dir.path().join("candidate1");
     let secondary_path = dir.path().join("survivor");
@@ -506,21 +506,46 @@ fn fixture_of(lost: Role, tail: bool, format: u32) -> Result<Fixture> {
         &certificate,
         &trust,
     )?;
-    pending::decide_prepared(&hp, &hs, &journal, 15, &trust, gate.as_ref())?;
+    pending::decide_prepared_at(
+        &hp,
+        &hs,
+        &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+        15,
+    )?;
     for handle in [&mut hp, &mut hs] {
-        pending::record_decided(handle, &journal, &trust, gate.as_ref())?;
+        pending::record_decided(
+            handle,
+            &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+        )?;
     }
     for handle in [&mut hp, &mut hs] {
-        pending::apply_decided(handle, &journal, &trust, gate.as_ref())?;
+        pending::apply_decided(
+            handle,
+            &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+        )?;
     }
     for handle in [&hp, &hs] {
-        pending::acknowledge_applied(handle, &journal, &trust, gate.as_ref())?;
+        pending::acknowledge_applied(
+            handle,
+            &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+        )?;
     }
-    pending::complete_authority(&hp, &hs, &journal, &trust, gate.as_ref())?;
+    pending::complete_authority(
+        &hp,
+        &hs,
+        &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+    )?;
     for handle in [&mut hp, &mut hs] {
-        pending::record_complete(handle, &journal, &trust, gate.as_ref())?;
+        pending::record_complete(
+            handle,
+            &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+        )?;
     }
-    pending::finalize_pair(&mut hp, &mut hs, &journal, &trust, gate.as_ref())?;
+    pending::finalize_pair(
+        &mut hp,
+        &mut hs,
+        &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+    )?;
     drop(hp);
     drop(hs);
 
@@ -6554,16 +6579,20 @@ struct Interrupted {
 impl Interrupted {
     /// The pending handle for the survivor's half of the in-flight request.
     fn pending(&self) -> Result<pending::PendingMaintenanceHandle<StockSchema>> {
-        pending::PendingMaintenanceHandle::open_existing_with_authority(
+        let handle = pending::PendingMaintenanceHandle::open_existing_with_authority(
             &self.survivor_path,
-            self.survivor_role,
             self.identity.clone(),
             "fixture",
             StockSchema,
             &self.second,
             &self.trust,
             Some(self.live.clone()),
-        )
+        )?;
+        ensure(
+            handle.inspect().role == self.survivor_role,
+            "pending marker owner mismatch",
+        )?;
+        Ok(handle)
     }
     fn handle(&self) -> Result<LossSurvivorHandle<StockSchema>> {
         LossSurvivorHandle::open_existing(
@@ -6687,16 +6716,20 @@ impl Undecided {
         path: &Path,
         role: Role,
     ) -> Result<pending::PendingMaintenanceHandle<StockSchema>> {
-        pending::PendingMaintenanceHandle::open_existing_with_authority(
+        let handle = pending::PendingMaintenanceHandle::open_existing_with_authority(
             path,
-            role,
             self.identity.clone(),
             "fixture",
             StockSchema,
             &self.second,
             &self.trust,
             Some(self.live.clone()),
-        )
+        )?;
+        ensure(
+            handle.inspect().role == role,
+            "pending marker owner mismatch",
+        )?;
+        Ok(handle)
     }
 
     /// Decide the in-flight request at the authority and record the decision
@@ -6708,9 +6741,21 @@ impl Undecided {
         };
         let mut hp = self.pending_at(primary, Role::Primary)?;
         let mut hs = self.pending_at(secondary, Role::Secondary)?;
-        pending::decide_prepared(&hp, &hs, &self.journal, 15, &self.trust, self.gate.as_ref())?;
+        pending::decide_prepared_at(
+            &hp,
+            &hs,
+            &pending::MaintenanceAuthorities::new(&self.journal, &self.trust, self.gate.as_ref()),
+            15,
+        )?;
         for handle in [&mut hp, &mut hs] {
-            pending::record_decided(handle, &self.journal, &self.trust, self.gate.as_ref())?;
+            pending::record_decided(
+                handle,
+                &pending::MaintenanceAuthorities::new(
+                    &self.journal,
+                    &self.trust,
+                    self.gate.as_ref(),
+                ),
+            )?;
         }
         Ok(())
     }
@@ -6853,7 +6898,7 @@ fn in_flight(lost: Role, phase: InFlight) -> Result<Undecided> {
         trust,
         key,
     } = support::certified_pair("s11-fixture-seed", [52; 32], "s11-fixture")?;
-    pending::prepare_pair(&mut p, &mut s, &plan, &first, &first_token, 15, &trust)?;
+    pending::prepare_pair_at(&mut p, &mut s, &plan, &first, &first_token, 15, &trust)?;
     let identity = p.identity().clone();
     let primary_path = dir.path().join("candidate1");
     let secondary_path = dir.path().join("survivor");
@@ -6893,21 +6938,46 @@ fn in_flight(lost: Role, phase: InFlight) -> Result<Undecided> {
         &first,
         &trust,
     )?;
-    pending::decide_prepared(&hp, &hs, &journal, 15, &trust, gate.as_ref())?;
+    pending::decide_prepared_at(
+        &hp,
+        &hs,
+        &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+        15,
+    )?;
     for handle in [&mut hp, &mut hs] {
-        pending::record_decided(handle, &journal, &trust, gate.as_ref())?;
+        pending::record_decided(
+            handle,
+            &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+        )?;
     }
     for handle in [&mut hp, &mut hs] {
-        pending::apply_decided(handle, &journal, &trust, gate.as_ref())?;
+        pending::apply_decided(
+            handle,
+            &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+        )?;
     }
     for handle in [&hp, &hs] {
-        pending::acknowledge_applied(handle, &journal, &trust, gate.as_ref())?;
+        pending::acknowledge_applied(
+            handle,
+            &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+        )?;
     }
-    pending::complete_authority(&hp, &hs, &journal, &trust, gate.as_ref())?;
+    pending::complete_authority(
+        &hp,
+        &hs,
+        &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+    )?;
     for handle in [&mut hp, &mut hs] {
-        pending::record_complete(handle, &journal, &trust, gate.as_ref())?;
+        pending::record_complete(
+            handle,
+            &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+        )?;
     }
-    pending::finalize_pair(&mut hp, &mut hs, &journal, &trust, gate.as_ref())?;
+    pending::finalize_pair(
+        &mut hp,
+        &mut hs,
+        &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+    )?;
     drop(hp);
     drop(hs);
 
@@ -6993,14 +7063,13 @@ fn in_flight(lost: Role, phase: InFlight) -> Result<Undecided> {
     };
     // Maintenance #2, stopped exactly at `phase`. APPLY and the ACK are the
     // survivor's alone: the lost member never gets that far.
-    pending::prepare_pair(&mut p, &mut s, &plan2, &second, &second_token, 15, &trust)?;
+    pending::prepare_pair_at(&mut p, &mut s, &plan2, &second, &second_token, 15, &trust)?;
     drop(p);
     drop(s);
     // This pair already carries a completed certificate, so the pending
     // capability needs the live certified authority to open at all.
     let mut hp = pending::PendingMaintenanceHandle::open_existing_with_authority(
         &primary_path,
-        Role::Primary,
         identity.clone(),
         "fixture",
         StockSchema,
@@ -7010,7 +7079,6 @@ fn in_flight(lost: Role, phase: InFlight) -> Result<Undecided> {
     )?;
     let mut hs = pending::PendingMaintenanceHandle::open_existing_with_authority(
         &secondary_path,
-        Role::Secondary,
         identity.clone(),
         "fixture",
         StockSchema,
@@ -7019,9 +7087,17 @@ fn in_flight(lost: Role, phase: InFlight) -> Result<Undecided> {
         Some(live.clone()),
     )?;
     if phase != InFlight::Prepared {
-        pending::decide_prepared(&hp, &hs, &journal, 15, &trust, gate.as_ref())?;
+        pending::decide_prepared_at(
+            &hp,
+            &hs,
+            &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+            15,
+        )?;
         for handle in [&mut hp, &mut hs] {
-            pending::record_decided(handle, &journal, &trust, gate.as_ref())?;
+            pending::record_decided(
+                handle,
+                &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+            )?;
         }
     }
     if phase == InFlight::Applied {
@@ -7030,8 +7106,14 @@ fn in_flight(lost: Role, phase: InFlight) -> Result<Undecided> {
         } else {
             &mut hs
         };
-        pending::apply_decided(survivor_handle, &journal, &trust, gate.as_ref())?;
-        pending::acknowledge_applied(survivor_handle, &journal, &trust, gate.as_ref())?;
+        pending::apply_decided(
+            survivor_handle,
+            &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+        )?;
+        pending::acknowledge_applied(
+            survivor_handle,
+            &pending::MaintenanceAuthorities::new(&journal, &trust, gate.as_ref()),
+        )?;
     }
     drop(hp);
     drop(hs);
@@ -7095,7 +7177,10 @@ fn loss_during_maintenance(lost: Role, phase: InFlight) -> Result<()> {
     // A loss that names the *other* branch is refused with the step the
     // operator actually owes, from the durable phase alone.
     let mut handle = it.pending()?;
-    pending::terminate_by_loss(&mut handle, &it.journal, &it.trust, it.gate.as_ref())?;
+    pending::terminate_by_loss(
+        &mut handle,
+        &pending::MaintenanceAuthorities::new(&it.journal, &it.trust, it.gate.as_ref()),
+    )?;
     drop(handle);
 
     // The trace is durable, and for branch B the decided certificate is
@@ -7230,7 +7315,10 @@ fn replay_termination(
     // tables are gone and the pending capability cannot be opened again.
     if it.trace(&it.survivor_path)?.is_none() {
         let mut handle = it.pending()?;
-        pending::terminate_by_loss(&mut handle, &it.journal, &it.trust, it.gate.as_ref())?;
+        pending::terminate_by_loss(
+            &mut handle,
+            &pending::MaintenanceAuthorities::new(&it.journal, &it.trust, it.gate.as_ref()),
+        )?;
     } else {
         assert_err_contains(it.pending(), "node has no pending certified maintenance");
     }
@@ -7629,7 +7717,10 @@ fn survivor_evidence_refuses_a_rollback_the_survivor_cannot_prove() -> Result<()
     // survivor's durable phase does not.
     u.decide_in_flight()?;
     let mut handle = u.pending_at(&u.survivor_path, u.survivor_role)?;
-    pending::apply_decided(&mut handle, &u.journal, &u.trust, u.gate.as_ref())?;
+    pending::apply_decided(
+        &mut handle,
+        &pending::MaintenanceAuthorities::new(&u.journal, &u.trust, u.gate.as_ref()),
+    )?;
     drop(handle);
     let rollback = u.loss(transition::SourceKind::Completed)?;
     assert_err_contains(
@@ -7658,8 +7749,14 @@ fn survivor_evidence_refuses_a_finish_forward_the_survivor_cannot_prove() -> Res
     let at_decided = dir.join("survivor-at-decided");
     swap_database(&u.survivor_path, &at_decided)?;
     let mut handle = u.pending_at(&u.survivor_path, u.survivor_role)?;
-    pending::apply_decided(&mut handle, &u.journal, &u.trust, u.gate.as_ref())?;
-    pending::acknowledge_applied(&handle, &u.journal, &u.trust, u.gate.as_ref())?;
+    pending::apply_decided(
+        &mut handle,
+        &pending::MaintenanceAuthorities::new(&u.journal, &u.trust, u.gate.as_ref()),
+    )?;
+    pending::acknowledge_applied(
+        &handle,
+        &pending::MaintenanceAuthorities::new(&u.journal, &u.trust, u.gate.as_ref()),
+    )?;
     drop(handle);
     let loss = u.loss(transition::SourceKind::Decided)?;
     let token = u.sign(&loss)?;
@@ -7751,7 +7848,10 @@ fn survivor_evidence_refuses_a_finish_forward_the_survivor_cannot_prove() -> Res
         before,
         "the survivor evidence adapter changed the survivor file"
     );
-    pending::terminate_by_loss(&mut handle, &u.journal, &u.trust, u.gate.as_ref())?;
+    pending::terminate_by_loss(
+        &mut handle,
+        &pending::MaintenanceAuthorities::new(&u.journal, &u.trust, u.gate.as_ref()),
+    )?;
     drop(handle);
 
     // L3: a trace of the right shape — same loss, same certificate, a digest
@@ -7809,7 +7909,10 @@ fn a_loss_terminated_archive_is_refused_without_its_termination_trace() -> Resul
     let it = interrupted(Role::Secondary, InFlight::Applied)?;
     let survivor = it.survivor_path.clone();
     let mut handle = it.pending()?;
-    pending::terminate_by_loss(&mut handle, &it.journal, &it.trust, it.gate.as_ref())?;
+    pending::terminate_by_loss(
+        &mut handle,
+        &pending::MaintenanceAuthorities::new(&it.journal, &it.trust, it.gate.as_ref()),
+    )?;
     drop(handle);
     let trace = it.trace(&survivor)?.ok_or("termination trace missing")?;
     let archive = it.archive(&survivor)?.ok_or("archive missing")?;
@@ -7910,7 +8013,10 @@ fn a_rolled_back_maintenance_needs_its_trace_to_found_the_loss() -> Result<()> {
     let it = interrupted(Role::Primary, InFlight::Decided)?;
     let survivor = it.survivor_path.clone();
     let mut handle = it.pending()?;
-    pending::terminate_by_loss(&mut handle, &it.journal, &it.trust, it.gate.as_ref())?;
+    pending::terminate_by_loss(
+        &mut handle,
+        &pending::MaintenanceAuthorities::new(&it.journal, &it.trust, it.gate.as_ref()),
+    )?;
     drop(handle);
     let trace = it.trace(&survivor)?.ok_or("termination trace missing")?;
     it.handle()?;
@@ -7958,7 +8064,10 @@ fn second_loss_after_a_terminated_maintenance(phase: InFlight) -> Result<()> {
     let it = interrupted(Role::Primary, phase)?;
     let survivor = it.survivor_path.clone();
     let mut handle = it.pending()?;
-    pending::terminate_by_loss(&mut handle, &it.journal, &it.trust, it.gate.as_ref())?;
+    pending::terminate_by_loss(
+        &mut handle,
+        &pending::MaintenanceAuthorities::new(&it.journal, &it.trust, it.gate.as_ref()),
+    )?;
     drop(handle);
     assert!(it.trace(&survivor)?.is_some());
     let (journal, successor) = recover_after_termination(&it)?;

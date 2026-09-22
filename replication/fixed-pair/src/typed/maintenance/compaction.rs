@@ -68,6 +68,7 @@ impl PairPlan {
         )
     }
 
+    #[cfg(any(test, feature = "experimental-recovery"))]
     pub(super) fn validate_certified(&self) -> Result<()> {
         self.validate_structural()?;
         ensure(

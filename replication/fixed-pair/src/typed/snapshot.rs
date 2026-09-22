@@ -599,6 +599,7 @@ impl<A: ReplicatedSchema> Node<A> {
     /// already carry it, and that value was produced by `fresh_generation` when
     /// the file was created, exactly as in the ordinary flow. This entry only
     /// preserves it across the restore instead of rolling it again.
+    #[cfg(feature = "experimental-recovery")]
     pub(super) fn finish_snapshot_retaining_generation(
         &mut self,
         manifest: &Manifest,
