@@ -91,14 +91,66 @@ pub(super) fn verify_certified(
             &trust.as_trust(),
             &certificate.request,
         )?;
+        // Format 1 is a completion: the authority completed this transition and
+        // `record.3` is its completion id. That path is byte-for-byte unchanged.
+        //
+        // Format 2 (S11 branch B) is the opposite statement: this certificate
+        // was *never* completed, because the member that would have had to
+        // acknowledge it was lost, and `record.3` is the id of the signed loss
+        // that authenticates it instead. It is accepted only when this node's
+        // own durable termination trace accounts for exactly that archive and
+        // the loss state it names still agrees.
         ensure(
-            record == (1, certificate.request.id, verified.token_digest(), record.3)
+            matches!(record.0, 1 | 2)
+                && record
+                    == (
+                        record.0,
+                        certificate.request.id,
+                        verified.token_digest(),
+                        record.3,
+                    )
                 && record.3 != [0; 32]
                 && lineage.last_revision == certificate.request.revision,
             "certified completion archive mismatch",
         )?;
+        if record.0 == 2 {
+            let trace = pending::terminated(c)?.ok_or("certified completion archive mismatch")?;
+            ensure(
+                trace.accounts_for(record.1, record.2, record.3)
+                    && trace.loss().source_certificate == verified.certificate_id(),
+                "certified completion archive mismatch",
+            )?;
+            // Once the loss recovery has installed — or has itself been retired
+            // into the cycle history — that record must name the same loss.
+            loss::require_terminating_loss(c, trace.loss())?;
+        }
     }
     Ok(())
+}
+
+/// Is this node's completion archive the format-2, loss-authenticated one? Such
+/// a node has no completed revision at the authority and can never satisfy the
+/// live completion check; only the participant-loss path may open it.
+pub(super) fn loss_terminated_archive(c: &Connection) -> Result<bool> {
+    if maintenance_version(c)? != 3 {
+        return Ok(false);
+    }
+    let archived: Option<String> = c
+        .query_row(
+            "SELECT record FROM node_compaction_completion WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(archived) = archived else {
+        return Ok(false);
+    };
+    ensure(
+        archived.len() <= 64 * 1024,
+        "certified completion row limit",
+    )?;
+    let record: (u32, [u8; 32], [u8; 32], [u8; 32]) = serde_json::from_str(&archived)?;
+    Ok(record.0 == 2)
 }
 
 pub(super) fn verify_current_certified(
@@ -124,6 +176,15 @@ fn verify_live_certified(
     if version != 3 {
         return ensure(authority.is_none(), "unexpected certified authority");
     }
+    // A loss-terminated certificate has no completed revision at the authority
+    // and never will: asking for one would be asking the authority to complete
+    // a transition the lost member can never acknowledge. Such a node is only
+    // ever openable through the participant-loss path, which relies on the live
+    // completed successor instead.
+    ensure(
+        !loss_terminated_archive(c)?,
+        "certified transition was terminated by a participant loss",
+    )?;
     let authority = authority.ok_or("live certified authority required")?;
     let certificate_json: String = c.query_row(
         "SELECT record FROM node_compaction_certificates ORDER BY sequence DESC LIMIT 1",

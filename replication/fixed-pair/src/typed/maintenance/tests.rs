@@ -167,6 +167,53 @@ pub(super) mod support {
         })
     }
 
+    /// A second certified request against the same pair, chained to the one it
+    /// follows. `Journal::chain` requires every participant's `old_base` to be
+    /// the previous request's primary target, the same member/generation pair
+    /// and the scope's original anchor, so all of that is derived here rather
+    /// than restated by callers.
+    pub(crate) fn next_request(
+        p: &mut Node<StockSchema>,
+        s: &mut Node<StockSchema>,
+        previous: &transition::Request,
+        plan_id: [u8; 32],
+        request_id: [u8; 32],
+    ) -> Result<(compaction::PairPlan, transition::Request)> {
+        let plan = compaction::PairPlan {
+            id: plan_id,
+            primary: p.plan_compaction()?,
+            secondary: s.plan_compaction()?,
+        };
+        plan.validate_certified()?;
+        let old_base = Some(previous.participants[0].target.clone());
+        let mut participants = [
+            participant(p, &plan.primary, &plan)?,
+            participant(s, &plan.secondary, &plan)?,
+        ];
+        for (next, before) in participants.iter_mut().zip(&previous.participants) {
+            next.old_base = old_base.clone();
+            ensure(
+                next.member == before.member && next.generation == before.generation,
+                "fixture membership drifted between requests",
+            )?;
+        }
+        let request = transition::Request {
+            format: 1,
+            id: request_id,
+            authority_id: previous.authority_id,
+            revision: previous.revision + 1,
+            install: previous.install.clone(),
+            region: previous.region.clone(),
+            scope: previous.scope,
+            schema: previous.schema,
+            membership: previous.membership,
+            source_anchor: previous.source_anchor.clone(),
+            participants,
+        };
+        request.validate()?;
+        Ok((plan, request))
+    }
+
     /// Build the pair and sign the request. `seed` names the single committed
     /// operation so callers can keep their fixtures distinguishable.
     pub(crate) fn certified_pair(seed: &str, id: [u8; 32], install: &str) -> Result<CertifiedPair> {

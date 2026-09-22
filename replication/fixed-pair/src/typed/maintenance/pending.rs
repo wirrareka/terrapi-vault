@@ -1368,6 +1368,348 @@ fn verify_restored<A: ReplicatedSchema>(
     sql_snapshot::verify_binding(c, &handle.adapter, &snapshot::scope(&handle.identity))
 }
 
+// ---------------------------------------------------------------------------
+// S11: an in-flight certified maintenance terminated by a participant loss.
+//
+// A maintenance abort needs proof that *both* nodes are durably rolling back
+// (R2). A lost member can never give it, so when a participant is lost mid
+// maintenance the signed loss decision itself has to end the transition. Which
+// way it ends is not a caller's choice and not a flag: it follows from the
+// survivor's own durable phase.
+//
+//   phase `prepared`/`decided` — nothing was applied, so the transition rolls
+//   **back**; data, base, log, receipts and lineage are untouched.
+//   phase `applied`            — history is already pruned, so rolling back is
+//   impossible and the transition is finished **forward**: the decided
+//   certificate stays, and a format-2 completion archive records that it was
+//   never completed and that a signed loss is its provenance.
+//
+// Both write the same durable trace first. Nothing else authorises the shape
+// the node is left in, and `verify_certified` refuses a format-2 archive that
+// this trace does not account for.
+// ---------------------------------------------------------------------------
+
+const TERMINATED: &str = "node_maintenance_terminated";
+const TERMINATED_DDL: &str = "CREATE TABLE IF NOT EXISTS main.node_maintenance_terminated(\
+     id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL)";
+/// Branch A: nothing was applied and the transition was rolled back.
+const ROLLED_BACK: &str = "rolled_back";
+/// Branch B: the decided transition was applied and is finished forward.
+const FINISHED_FORWARD: &str = "finished_forward";
+
+/// Durable local proof that a signed participant loss terminated an in-flight
+/// certified maintenance, and of exactly which way it was terminated.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Terminated {
+    format: u32,
+    kind: String,
+    /// The abandoned request in full, so every binding below is checkable on
+    /// this file alone, with no journal and no authority.
+    request: crate::recovery::transition::Request,
+    request_digest: [u8; 32],
+    /// The loss decision that terminated it, and its certificate.
+    loss: crate::recovery::transition::LossRequest,
+    loss_certificate: [u8; 32],
+    loss_token_digest: [u8; 32],
+    /// Branch B only: the certificate APPLY durably stored for `request`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    certificate: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token_digest: Option<[u8; 32]>,
+}
+
+impl Terminated {
+    /// Internal consistency, independent of anything outside the record.
+    fn validate(&self) -> Result<()> {
+        ensure(
+            self.format == 2
+                && self.request_digest == digest(&self.request)?
+                && self.loss_certificate != [0; 32]
+                && self.loss_token_digest != [0; 32]
+                && self.loss.abandoned_request == Some(self.request_digest),
+            "maintenance termination trace mismatch",
+        )?;
+        // The loss must fence one of the two participants of exactly this
+        // request and leave the other standing. Role is never read from here.
+        let fenced = self
+            .request
+            .participants
+            .iter()
+            .position(|p| {
+                p.member == self.loss.lost_member && p.generation == self.loss.lost_generation
+            })
+            .ok_or("maintenance termination participant mismatch")?;
+        let survivor = &self.request.participants[1 - fenced];
+        ensure(
+            survivor.member == self.loss.survivor.member
+                && survivor.generation == self.loss.survivor.generation,
+            "maintenance termination participant mismatch",
+        )?;
+        match self.kind.as_str() {
+            ROLLED_BACK => ensure(
+                self.certificate.is_none()
+                    && self.token_digest.is_none()
+                    && self.loss.kind() == crate::recovery::transition::SourceKind::Completed,
+                "maintenance rollback trace mismatch",
+            ),
+            FINISHED_FORWARD => ensure(
+                self.loss.kind() == crate::recovery::transition::SourceKind::Decided
+                    && self.certificate == Some(self.loss.source_certificate)
+                    && self.token_digest == Some(self.loss.source_token_digest)
+                    && self.loss.source_cut == self.request.participants[0].target,
+                "maintenance finish-forward trace mismatch",
+            ),
+            _ => Err("maintenance termination trace mismatch".into()),
+        }
+    }
+
+    pub(super) fn is_finished_forward(&self) -> bool {
+        self.kind == FINISHED_FORWARD
+    }
+
+    /// The digest of the request this node abandoned.
+    pub(super) fn abandoned(&self) -> [u8; 32] {
+        self.request_digest
+    }
+
+    /// The loss decision this node was terminated by.
+    pub(super) fn loss(&self) -> &crate::recovery::transition::LossRequest {
+        &self.loss
+    }
+
+    /// Does this trace account for exactly the format-2 completion archive
+    /// `(2, id, token_digest, loss_certificate)`?
+    pub(super) fn accounts_for(&self, id: [u8; 32], token: [u8; 32], loss: [u8; 32]) -> bool {
+        self.kind == FINISHED_FORWARD
+            && self.request.id == id
+            && self.token_digest == Some(token)
+            && self.certificate.is_some()
+            && self.loss_certificate == loss
+    }
+}
+
+/// The singleton termination trace, bounded and validated before use.
+pub(super) fn terminated(c: &Connection) -> Result<Option<Terminated>> {
+    let present: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name=?1)",
+        [TERMINATED],
+        |r| r.get(0),
+    )?;
+    if !present {
+        return Ok(None);
+    }
+    // A view or trigger under this name is never acceptable evidence.
+    let shadows: u64 = c.query_row(
+        "SELECT count(*) FROM main.sqlite_schema WHERE type<>'table' AND name=?1",
+        [TERMINATED],
+        |r| r.get(0),
+    )?;
+    ensure(shadows == 0, "maintenance termination trace shadowed")?;
+    let json = singleton_text(c, TERMINATED, "record", 256 * 1024)?;
+    let record: Terminated = serde_json::from_str(&json)?;
+    record.validate()?;
+    Ok(Some(record))
+}
+
+/// Terminate an in-flight certified maintenance under a signed participant
+/// loss. One `IMMEDIATE` transaction; the branch is decided by this node's own
+/// durable phase and the loss must agree with it.
+pub(crate) fn terminate_by_loss<A: ReplicatedSchema, P: crate::recovery::transition::LossPolicy>(
+    handle: &mut PendingMaintenanceHandle<A>,
+    journal: &crate::recovery::transition::Journal,
+    trust: &crate::recovery::transition::TrustStore,
+    policy: &P,
+) -> Result<()> {
+    if handle.finalized {
+        // Exact resume: the pending state is already gone and the trace is
+        // durable. The live loss is re-read so a revoked authority still
+        // refuses, and the trace must still be the one this loss wrote.
+        let committed = journal.fetch_loss(&trust.as_trust(), policy)?;
+        let durable = handle
+            .db
+            .with_connection(|c| Ok(terminated(c)))??
+            .ok_or("maintenance termination trace missing")?;
+        return ensure(
+            durable.loss() == committed.request()
+                && durable.loss_certificate == committed.certificate_id()
+                && durable.loss_token_digest == committed.token_digest(),
+            "maintenance termination conflict",
+        );
+    }
+    let request = handle.prepared.request.clone();
+    let phase = handle.prepared.phase.clone();
+    let local = if handle.role == Role::Primary { 0 } else { 1 };
+    handle.db.with_connection(|c| {
+        let run = || -> Result<()> {
+            let tx =
+                rusqlite::Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
+            validate_pending(
+                &tx,
+                &handle.adapter,
+                &handle.contract,
+                &handle.initial,
+                &handle.identity,
+                handle.role,
+                &request,
+                trust,
+                handle.certified_authority.as_deref(),
+                Some(&handle.prepared),
+            )?;
+            let committed = journal.fetch_loss(&trust.as_trust(), policy)?;
+            let loss = committed.request();
+            ensure(
+                loss.abandoned_request == Some(digest(&request)?),
+                "loss does not abandon this maintenance",
+            )?;
+            ensure(
+                loss.survivor.member == request.participants[local].member
+                    && loss.survivor.generation == request.participants[local].generation
+                    && loss.lost_member == request.participants[1 - local].member
+                    && loss.lost_generation == request.participants[1 - local].generation,
+                "loss participants are not this maintenance pair",
+            )?;
+            // The branch follows the durable phase. A loss that names the other
+            // branch is refused with the step the operator actually owes.
+            let (kind, certificate, token_digest) = match (phase.as_str(), loss.kind()) {
+                ("prepared" | "decided", crate::recovery::transition::SourceKind::Completed) => {
+                    (ROLLED_BACK, None, None)
+                }
+                ("prepared" | "decided", _) => {
+                    return Err("loss survivor must roll back abandoned maintenance instead".into())
+                }
+                ("applied", crate::recovery::transition::SourceKind::Decided) => {
+                    // The certificate APPLY committed for this very request is
+                    // the loss's signed provenance; it is re-verified here.
+                    let json: String = tx.query_row(
+                        "SELECT record FROM node_compaction_certificates \
+                         ORDER BY sequence DESC LIMIT 1",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    ensure(json.len() <= 256 * 1024, "certificate record limit")?;
+                    let stored: certified::CertificateRecord = serde_json::from_str(&json)?;
+                    let verified = crate::recovery::transition::verify_historical(
+                        &stored.token,
+                        &trust.as_trust(),
+                        &stored.request,
+                    )?;
+                    ensure(
+                        stored.request == request
+                            && verified.certificate_id() == loss.source_certificate
+                            && verified.token_digest() == loss.source_token_digest
+                            && loss.source_cut == request.participants[0].target,
+                        "loss finish-forward certificate mismatch",
+                    )?;
+                    (
+                        FINISHED_FORWARD,
+                        Some(verified.certificate_id()),
+                        Some(verified.token_digest()),
+                    )
+                }
+                ("applied", _) => {
+                    return Err(
+                        "loss survivor must finish forward abandoned maintenance instead".into(),
+                    )
+                }
+                _ => return Err("invalid pending termination transition".into()),
+            };
+            let trace = Terminated {
+                format: 2,
+                kind: kind.into(),
+                request_digest: digest(&request)?,
+                request: request.clone(),
+                loss: loss.clone(),
+                loss_certificate: committed.certificate_id(),
+                loss_token_digest: committed.token_digest(),
+                certificate,
+                token_digest,
+            };
+            trace.validate()?;
+            let json = serde_json::to_string(&trace)?;
+            ensure(
+                json.len() <= 256 * 1024,
+                "maintenance termination trace too large",
+            )?;
+            let marker_json = singleton_text(
+                &tx,
+                "node_pending_certified_maintenance",
+                "record",
+                64 * 1024,
+            )?;
+            let marker: Marker = serde_json::from_str(&marker_json)?;
+            // The trace is written before anything depends on it: the format-2
+            // archive below is only acceptable because this row exists.
+            tx.execute_batch(TERMINATED_DDL)?;
+            ensure(
+                tx.execute(
+                    "INSERT INTO main.node_maintenance_terminated VALUES(1,?1)",
+                    [&json],
+                )? == 1,
+                "maintenance termination trace write failed",
+            )?;
+            if kind == FINISHED_FORWARD {
+                // Not a completion: a statement that this certificate was never
+                // completed and that a signed loss authenticates it instead. No
+                // acknowledgement and no completion id is ever fabricated.
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS node_compaction_completion(\
+                     id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL)",
+                )?;
+                // The archive is the archive *of the current certificate*, and
+                // that is now the decided one this loss authenticates. The
+                // previous completion is superseded exactly as a completion
+                // would supersede it.
+                ensure(
+                    tx.execute(
+                        "INSERT INTO node_compaction_completion VALUES(1,?1)
+                         ON CONFLICT(id) DO UPDATE SET record=excluded.record",
+                        [serde_json::to_string(&(
+                            2u32,
+                            request.id,
+                            token_digest.ok_or("finish-forward token digest")?,
+                            committed.certificate_id(),
+                        ))?],
+                    )? == 1,
+                    "loss finish-forward archive failed",
+                )?;
+            }
+            // Exactly the PREPARE transaction undone. Readiness is deliberately
+            // not restored; the peer re-confirms its checkpoint.
+            tx.execute_batch(
+                "DROP TABLE main.node_pending_certified_progress;
+                 DROP TABLE main.node_pending_certified_maintenance;",
+            )?;
+            ensure(
+                tx.execute(
+                    "UPDATE node_runtime SET format=?1 WHERE id=1 AND format=5",
+                    [marker.previous_runtime],
+                )? == 1,
+                "pending termination runtime restoration failed",
+            )?;
+            let runtime: u32 =
+                tx.query_row("SELECT format FROM node_runtime WHERE id=1", [], |r| {
+                    r.get(0)
+                })?;
+            ensure(
+                matches!(runtime, 3 | 4)
+                    && runtime == marker.previous_runtime
+                    && !pending_present(&tx)?
+                    && terminated(&tx)?.as_ref() == Some(&trace),
+                "pending termination post-state mismatch",
+            )?;
+            // The restored node must pass the ordinary owner-level validation
+            // inside the same transaction that terminated the maintenance.
+            verify_restored(&tx, handle, trust)?;
+            tx.commit()?;
+            Ok(())
+        };
+        run().map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))
+    })?;
+    handle.finalized = true;
+    Ok(())
+}
+
 /// Secondary first, mirroring `finalize_pair`.
 pub(crate) fn abort_pair<A: ReplicatedSchema>(
     primary: &mut PendingMaintenanceHandle<A>,

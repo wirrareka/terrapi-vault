@@ -152,6 +152,30 @@ impl transition::LossPolicy for Gate {
             "test supersession evidence revoked",
         )
     }
+    fn maintenance_rollback_authorized(
+        &self,
+        _: &transition::JournalScope,
+        _: &transition::LossRequest,
+        _: &[u8; 32],
+    ) -> terrapi_vesta_recovery::Result<()> {
+        // S11 branch A. The production adapter must live-read the survivor;
+        // here it is faked but really runs, so revocation is observable.
+        ensure(
+            self.live.load(Ordering::SeqCst),
+            "test maintenance rollback revoked",
+        )
+    }
+    fn maintenance_finish_forward_authorized(
+        &self,
+        _: &transition::JournalScope,
+        _: &transition::LossRequest,
+        _: &[u8; 32],
+    ) -> terrapi_vesta_recovery::Result<()> {
+        ensure(
+            self.live.load(Ordering::SeqCst),
+            "test maintenance finish-forward revoked",
+        )
+    }
     // `loss_successor_applied` is deliberately left at its default deny: these
     // tests never acknowledge a participant.
 }
@@ -4705,7 +4729,9 @@ fn second_loss_evidence_rejects_every_founding_mismatch() -> Result<()> {
         "loss founding participant mismatch",
     );
 
-    // S11 evidence is refused outright, ahead of every founding check.
+    // S11 `abandoned_request` is honoured now, but it can never be padding:
+    // this survivor never had that request, so there is no local trace of
+    // having terminated it and the loss is refused either way round.
     for loss in [
         transition::LossRequest {
             source_kind: Some(transition::SourceKind::Decided),
@@ -4718,7 +4744,10 @@ fn second_loss_evidence_rejects_every_founding_mismatch() -> Result<()> {
             ..s.loss.clone()
         },
     ] {
-        assert_err_contains(s.f.derive_role_at(&survivor, &loss), NOT_ENABLED);
+        assert_err_contains(
+            s.f.derive_role_at(&survivor, &loss),
+            "loss survivor never abandoned that maintenance",
+        );
     }
     // S10 supersession is honoured now, but this survivor has never aborted
     // anything, so it has no local authority for one.
@@ -5905,7 +5934,8 @@ fn superseding_loss_evidence_rejects_every_mismatch() -> Result<()> {
     let good = install_state(&survivor)?.0.ok_or("record missing")?;
     let record = decode_install(&good)?;
 
-    // S11 evidence is still refused, ahead of everything else.
+    // An `abandoned_request` this survivor never had is refused: the field can
+    // never be padding, whichever branch it claims.
     for loss in [
         transition::LossRequest {
             abandoned_request: Some([143; 32]),
@@ -5917,7 +5947,10 @@ fn superseding_loss_evidence_rejects_every_mismatch() -> Result<()> {
             ..a.f.loss.clone()
         },
     ] {
-        assert_err_contains(a.f.derive_role_at(&survivor, &loss), NOT_ENABLED);
+        assert_err_contains(
+            a.f.derive_role_at(&survivor, &loss),
+            "loss survivor never abandoned that maintenance",
+        );
     }
 
     // A supersession with no tombstone on this node is refused: the authority's
@@ -6456,5 +6489,817 @@ fn superseded_recovery_converges_after_a_crash_at_every_boundary() -> Result<()>
     drop(primary);
     drop(secondary);
     drop(a);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// S11: a participant lost while a certified maintenance is in flight.
+//
+// A maintenance abort needs both nodes durably rolling back; a lost member can
+// never give that, so the signed loss itself ends the transition. Which way is
+// not a choice: the survivor's durable phase decides. Nothing was applied ⇒
+// roll back (branch A). APPLY already committed ⇒ finish forward (branch B),
+// and the decided certificate is archived in format 2 as "never completed, and
+// this signed loss is its provenance".
+// ---------------------------------------------------------------------------
+
+/// How far the in-flight maintenance got before the loss.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InFlight {
+    /// Prepared on both nodes, never decided at the authority (journal A2).
+    Prepared,
+    /// Decided at the authority, not applied by the survivor (journal A1).
+    Decided,
+    /// Applied and acknowledged by the survivor (journal B).
+    Applied,
+}
+
+/// `(format, request id, token digest, completion or loss certificate)`.
+type Archive = (u32, [u8; 32], [u8; 32], [u8; 32]);
+
+/// A certified pair that completed one maintenance, started a second, and then
+/// lost a participant part-way through it.
+struct Interrupted {
+    dir: tempfile::TempDir,
+    identity: Identity<SchemaId>,
+    trust: transition::TrustStore,
+    journal: transition::Journal,
+    gate: Arc<Gate>,
+    live: Arc<Live>,
+    signer: EcdsaKeyPair,
+    /// The completed maintenance and the in-flight one.
+    first: transition::Request,
+    first_token: String,
+    second: transition::Request,
+    second_token: String,
+    phase: InFlight,
+    loss: transition::LossRequest,
+    loss_certificate_id: [u8; 32],
+    loss_token_digest: [u8; 32],
+    survivor_path: PathBuf,
+    lost_path: PathBuf,
+    replacement_path: PathBuf,
+    survivor_role: Role,
+    lost_role: Role,
+    survivor_checkpoint: Prefix,
+    survivor_manifest: snapshot::Manifest,
+    survivor_receipts: Vec<String>,
+}
+
+impl Interrupted {
+    /// The pending handle for the survivor's half of the in-flight request.
+    fn pending(&self) -> Result<pending::PendingMaintenanceHandle<StockSchema>> {
+        pending::PendingMaintenanceHandle::open_existing_with_authority(
+            &self.survivor_path,
+            self.survivor_role,
+            self.identity.clone(),
+            "fixture",
+            StockSchema,
+            &self.second,
+            &self.trust,
+            Some(self.live.clone()),
+        )
+    }
+    fn handle(&self) -> Result<LossSurvivorHandle<StockSchema>> {
+        LossSurvivorHandle::open_existing(
+            &self.survivor_path,
+            self.identity.clone(),
+            "fixture",
+            StockSchema,
+            &self.trust,
+            &self.journal,
+            self.gate.as_ref(),
+        )
+    }
+    fn replacement(&self) -> Result<Node<StockSchema>> {
+        let installed = install_state(&self.replacement_path)?.0.is_some();
+        let role = if installed {
+            self.lost_role
+        } else {
+            Role::Secondary
+        };
+        if installed {
+            Node::open_with_completed_transition(
+                &self.replacement_path,
+                role,
+                self.identity.clone(),
+                "fixture",
+                StockSchema,
+                self.trust.clone(),
+                self.live.clone(),
+            )
+        } else {
+            Node::open_with_transition_trust(
+                &self.replacement_path,
+                role,
+                self.identity.clone(),
+                "fixture",
+                StockSchema,
+                self.trust.clone(),
+            )
+        }
+    }
+    fn open(&self, path: &Path, role: Role) -> Result<Node<StockSchema>> {
+        Node::open_with_completed_transition(
+            path,
+            role,
+            self.identity.clone(),
+            "fixture",
+            StockSchema,
+            self.trust.clone(),
+            self.live.clone(),
+        )
+    }
+    /// Raw termination trace of a node, read outside every guard.
+    fn trace(&self, path: &Path) -> Result<Option<String>> {
+        let db = Vesta::open_read_only_with_passphrase(path, "fixture")?;
+        db.with_connection(|c| {
+            Ok((|| -> Result<Option<String>> {
+                if !table_exists(c, "node_maintenance_terminated")? {
+                    return Ok(None);
+                }
+                Ok(c.query_row(
+                    "SELECT record FROM node_maintenance_terminated WHERE id=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?)
+            })())
+        })?
+    }
+    /// Raw completion archive of a node.
+    fn archive(&self, path: &Path) -> Result<Option<Archive>> {
+        let db = Vesta::open_read_only_with_passphrase(path, "fixture")?;
+        db.with_connection(|c| {
+            Ok((|| -> Result<Option<Archive>> {
+                if !table_exists(c, "node_compaction_completion")? {
+                    return Ok(None);
+                }
+                let json: Option<String> = c
+                    .query_row(
+                        "SELECT record FROM node_compaction_completion WHERE id=1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                json.map(|j| Ok(serde_json::from_str(&j)?)).transpose()
+            })())
+        })?
+    }
+}
+
+/// Build a certified pair, complete one maintenance, start a second and stop it
+/// at `phase`, then decide the loss of `lost` against exactly that in-flight
+/// request. Nothing here tells the production code which branch applies.
+fn interrupted(lost: Role, phase: InFlight) -> Result<Interrupted> {
+    let support::CertifiedPair {
+        dir,
+        mut p,
+        mut s,
+        plan,
+        request: first,
+        token: first_token,
+        trust,
+        key,
+    } = support::certified_pair("s11-fixture-seed", [52; 32], "s11-fixture")?;
+    pending::prepare_pair(&mut p, &mut s, &plan, &first, &first_token, 15, &trust)?;
+    let identity = p.identity().clone();
+    let primary_path = dir.path().join("candidate1");
+    let secondary_path = dir.path().join("survivor");
+    drop(p);
+    drop(s);
+
+    let journal_path = dir.path().join("loss-journal");
+    let scope = transition::JournalScope {
+        install: first.install.clone(),
+        region: first.region.clone(),
+        profile: trust.profile.clone(),
+        scope: first.scope,
+        schema: first.schema,
+        membership: first.membership,
+        source_anchor: first.source_anchor.clone(),
+        authority_id: first.authority_id,
+        initial_revision: first.revision,
+    };
+    let journal = transition::Journal::create(&journal_path, "journal-fixture", scope.clone())?;
+    let gate = Gate::new();
+    // Maintenance #1, all the way to a completed certificate on both nodes.
+    let mut hp = pending::PendingMaintenanceHandle::open_existing(
+        &primary_path,
+        Role::Primary,
+        identity.clone(),
+        "fixture",
+        StockSchema,
+        &first,
+        &trust,
+    )?;
+    let mut hs = pending::PendingMaintenanceHandle::open_existing(
+        &secondary_path,
+        Role::Secondary,
+        identity.clone(),
+        "fixture",
+        StockSchema,
+        &first,
+        &trust,
+    )?;
+    pending::decide_prepared(&hp, &hs, &journal, 15, &trust, gate.as_ref())?;
+    for handle in [&mut hp, &mut hs] {
+        pending::record_decided(handle, &journal, &trust, gate.as_ref())?;
+    }
+    for handle in [&mut hp, &mut hs] {
+        pending::apply_decided(handle, &journal, &trust, gate.as_ref())?;
+    }
+    for handle in [&hp, &hs] {
+        pending::acknowledge_applied(handle, &journal, &trust, gate.as_ref())?;
+    }
+    pending::complete_authority(&hp, &hs, &journal, &trust, gate.as_ref())?;
+    for handle in [&mut hp, &mut hs] {
+        pending::record_complete(handle, &journal, &trust, gate.as_ref())?;
+    }
+    pending::finalize_pair(&mut hp, &mut hs, &journal, &trust, gate.as_ref())?;
+    drop(hp);
+    drop(hs);
+
+    let live = Arc::new(Live {
+        journal: Mutex::new(transition::Journal::open(
+            &journal_path,
+            "journal-fixture",
+            scope,
+            &trust.as_trust(),
+        )?),
+        successor: Mutex::new(None),
+        trust: trust.clone(),
+        gate: gate.clone(),
+    });
+    let mut p = Node::open_with_completed_transition(
+        &primary_path,
+        Role::Primary,
+        identity.clone(),
+        "fixture",
+        StockSchema,
+        trust.clone(),
+        live.clone(),
+    )?;
+    let mut s = Node::open_with_completed_transition(
+        &secondary_path,
+        Role::Secondary,
+        identity.clone(),
+        "fixture",
+        StockSchema,
+        trust.clone(),
+        live.clone(),
+    )?;
+    // A tail for the second maintenance to compact, then a fresh frozen
+    // publication on both nodes: the survivor's is the one the loss binds.
+    let old_p = p
+        .published_snapshot()?
+        .ok_or("primary publication missing")?;
+    let old_s = s
+        .published_snapshot()?
+        .ok_or("secondary publication missing")?;
+    let mut batch = stock_entry().batch;
+    batch.operation_id = "s11-fixture-tail".into();
+    commit(&mut p, &mut s, batch)?;
+    p.rotate_snapshot(&old_p)?;
+    s.rotate_snapshot(&old_s)?;
+    let (plan2, second) = support::next_request(&mut p, &mut s, &first, [53; 32], [54; 32])?;
+    let second_token = certified::tests::sign(&key, &second)?;
+
+    let survivor_index = match lost {
+        Role::Primary => 1usize,
+        Role::Secondary => 0usize,
+    };
+    let survivor_role = if survivor_index == 0 {
+        Role::Primary
+    } else {
+        Role::Secondary
+    };
+    let lost_role = lost;
+    let survivor: &mut Node<StockSchema> = if survivor_index == 0 { &mut p } else { &mut s };
+    let survivor_manifest = survivor
+        .published_snapshot()?
+        .ok_or("survivor publication missing")?;
+    let survivor_checkpoint = survivor.checkpoint()?;
+    ensure(
+        survivor_manifest.checkpoint == survivor_checkpoint,
+        "s11 fixture publication is not current",
+    )?;
+    let survivor_receipts = receipt_rows(survivor)?;
+    let replacement_path = dir.path().join("replacement");
+    let replacement_generation = {
+        let replacement = Node::open(
+            &replacement_path,
+            Role::Secondary,
+            identity.clone(),
+            "fixture",
+            StockSchema,
+        )?;
+        replacement.connection(checkpoint::generation)?
+    };
+    let (survivor_path, lost_path) = match lost {
+        Role::Primary => (secondary_path.clone(), primary_path.clone()),
+        Role::Secondary => (primary_path.clone(), secondary_path.clone()),
+    };
+    // Maintenance #2, stopped exactly at `phase`. APPLY and the ACK are the
+    // survivor's alone: the lost member never gets that far.
+    pending::prepare_pair(&mut p, &mut s, &plan2, &second, &second_token, 15, &trust)?;
+    drop(p);
+    drop(s);
+    // This pair already carries a completed certificate, so the pending
+    // capability needs the live certified authority to open at all.
+    let mut hp = pending::PendingMaintenanceHandle::open_existing_with_authority(
+        &primary_path,
+        Role::Primary,
+        identity.clone(),
+        "fixture",
+        StockSchema,
+        &second,
+        &trust,
+        Some(live.clone()),
+    )?;
+    let mut hs = pending::PendingMaintenanceHandle::open_existing_with_authority(
+        &secondary_path,
+        Role::Secondary,
+        identity.clone(),
+        "fixture",
+        StockSchema,
+        &second,
+        &trust,
+        Some(live.clone()),
+    )?;
+    if phase != InFlight::Prepared {
+        pending::decide_prepared(&hp, &hs, &journal, 15, &trust, gate.as_ref())?;
+        for handle in [&mut hp, &mut hs] {
+            pending::record_decided(handle, &journal, &trust, gate.as_ref())?;
+        }
+    }
+    if phase == InFlight::Applied {
+        let survivor_handle = if survivor_index == 0 {
+            &mut hp
+        } else {
+            &mut hs
+        };
+        pending::apply_decided(survivor_handle, &journal, &trust, gate.as_ref())?;
+        pending::acknowledge_applied(survivor_handle, &journal, &trust, gate.as_ref())?;
+    }
+    drop(hp);
+    drop(hs);
+
+    // The loss. Branch A is anchored to the last COMPLETED certificate, branch
+    // B to the DECIDED one that APPLY stored.
+    let verified_first = transition::verify_historical(&first_token, &trust.as_trust(), &first)?;
+    let verified_second = transition::verify_historical(&second_token, &trust.as_trust(), &second)?;
+    let source = if phase == InFlight::Applied {
+        (
+            verified_second.certificate_id(),
+            verified_second.token_digest(),
+            second.participants[0].target.clone(),
+        )
+    } else {
+        (
+            verified_first.certificate_id(),
+            verified_first.token_digest(),
+            first.participants[0].target.clone(),
+        )
+    };
+    let revision = journal.status(&trust.as_trust())?.last_revision + 1;
+    // The loss's survivor participant must be the one the record it is
+    // anchored to carries: maintenance #1's for a `Completed` loss, the decided
+    // maintenance #2's for a `Decided` one. `old_base` differs between them.
+    let anchor = if phase == InFlight::Applied {
+        &second
+    } else {
+        &first
+    };
+    let lost_participant = &anchor.participants[1 - survivor_index];
+    let survivor_participant = &anchor.participants[survivor_index];
+    let loss = transition::LossRequest {
+        format: 2,
+        id: [55; 32],
+        authority_id: first.authority_id,
+        revision,
+        install: first.install.clone(),
+        region: first.region.clone(),
+        scope: first.scope,
+        schema: first.schema,
+        membership: first.membership,
+        replacement_membership: [56; 32],
+        source_certificate: source.0,
+        source_token_digest: source.1,
+        source_cut: source.2,
+        lost_member: lost_participant.member,
+        lost_generation: lost_participant.generation,
+        survivor: transition::Participant {
+            target: cut(&survivor_checkpoint)?,
+            publication: id(&survivor_manifest)?,
+            ..survivor_participant.clone()
+        },
+        survivor_cut: cut(&survivor_checkpoint)?,
+        survivor_publication: id(&survivor_manifest)?,
+        replacement_member: [57; 32],
+        replacement_generation,
+        fencing_ref: [58; 32],
+        source_kind: Some(if phase == InFlight::Applied {
+            transition::SourceKind::Decided
+        } else {
+            transition::SourceKind::Completed
+        }),
+        abandoned_request: Some(second.digest()?),
+        supersedes: None,
+    };
+    loss.validate()?;
+    let loss_token = sign_loss(&key, &loss, &trust, [59; 32])?;
+    let committed = journal.decide_loss(
+        loss.clone(),
+        &loss_token,
+        15,
+        &trust.as_trust(),
+        gate.as_ref(),
+    )?;
+    let loss_certificate_id = committed.certificate_id();
+    let loss_token_digest = committed.token_digest();
+    Ok(Interrupted {
+        dir,
+        identity,
+        trust,
+        journal,
+        gate,
+        live,
+        signer: key,
+        first,
+        first_token,
+        second,
+        second_token,
+        phase,
+        loss,
+        loss_certificate_id,
+        loss_token_digest,
+        survivor_path,
+        lost_path,
+        replacement_path,
+        survivor_role,
+        lost_role,
+        survivor_checkpoint,
+        survivor_manifest,
+        survivor_receipts,
+    })
+}
+
+/// From a loss decided mid-maintenance to a writing recovered pair. The branch
+/// is never chosen by the caller: the survivor's own durable phase decides, and
+/// the loss has to agree with it.
+fn loss_during_maintenance(lost: Role, phase: InFlight) -> Result<()> {
+    let it = interrupted(lost, phase)?;
+    let survivor = it.survivor_path.clone();
+    // The branch comes from the fixture's recorded phase, never from a flag.
+    let forward = it.phase == InFlight::Applied;
+    assert_eq!(it.phase, phase);
+    assert_eq!(it.survivor_manifest.checkpoint, it.survivor_checkpoint);
+    assert_eq!(cut(&it.survivor_checkpoint)?, it.loss.survivor_cut);
+    assert_eq!(
+        it.loss.kind(),
+        if forward {
+            transition::SourceKind::Decided
+        } else {
+            transition::SourceKind::Completed
+        }
+    );
+    // Until the maintenance is terminated the loss cannot even be validated,
+    // and the survivor is told which step it owes.
+    assert_err_contains(
+        it.handle(),
+        if forward {
+            "loss survivor must finish forward abandoned maintenance first"
+        } else {
+            "loss survivor must roll back abandoned maintenance first"
+        },
+    );
+    assert_eq!(it.trace(&survivor)?, None);
+
+    // A loss that names the *other* branch is refused with the step the
+    // operator actually owes, from the durable phase alone.
+    let mut handle = it.pending()?;
+    pending::terminate_by_loss(&mut handle, &it.journal, &it.trust, it.gate.as_ref())?;
+    drop(handle);
+
+    // The trace is durable, and for branch B the decided certificate is
+    // archived in format 2 with the loss as its provenance.
+    let trace = it.trace(&survivor)?.ok_or("termination trace missing")?;
+    assert!(trace.contains(if forward {
+        "finished_forward"
+    } else {
+        "rolled_back"
+    }));
+    let archive = it.archive(&survivor)?;
+    if forward {
+        let archive = archive.ok_or("completion archive missing")?;
+        assert_eq!(archive.0, 2);
+        assert_eq!(archive.1, it.second.id);
+        assert_eq!(archive.3, it.loss_certificate_id);
+    } else {
+        // Branch A never applied, so the archive is still maintenance #1's.
+        assert_eq!(archive.map(|a| a.0), Some(1));
+    }
+    // The pending state is gone, so the pending capability cannot be opened
+    // again: the termination is a one-way door.
+    assert!(it.pending().is_err(), "pending handle after termination");
+
+    // Ordinary admission stays shut either way, and a format-2 archive can
+    // never be opened outside the participant-loss path at all.
+    let opened = it.open(&survivor, it.survivor_role);
+    if forward {
+        assert_err_contains(
+            opened,
+            "certified transition was terminated by a participant loss",
+        );
+    } else {
+        // Branch A left an ordinary certified pair whose head the loss has
+        // superseded, so the live authority refuses it.
+        assert!(opened.is_err());
+    }
+
+    // The ordinary loss flow now runs unchanged.
+    let handle = it.handle()?;
+    assert_eq!(handle.role, it.survivor_role);
+    let mut replacement = it.replacement()?;
+    let checkpoint =
+        bootstrap_replacement(&handle, &mut replacement, &it.journal, it.gate.as_ref())?;
+    // APPLY moves the base but not the checkpoint, so the frozen publication
+    // the loss bound is still exactly the survivor's current cut in both
+    // branches, and the replacement is restored to it.
+    assert_eq!(checkpoint, it.survivor_checkpoint);
+    assert_eq!(cut(&checkpoint)?, it.loss.survivor_cut);
+    let successor = successor_for(
+        &it.loss,
+        it.loss_certificate_id,
+        it.loss_token_digest,
+        it.survivor_role,
+        2,
+        [60; 32],
+    );
+    let successor_journal = transition::Journal::create_loss_successor(
+        &it.dir.path().join("successor-journal"),
+        "successor-fixture",
+        transition::JournalScope {
+            install: it.loss.install.clone(),
+            region: it.loss.region.clone(),
+            profile: it.trust.profile.clone(),
+            scope: it.loss.scope,
+            schema: it.loss.schema,
+            membership: it.loss.replacement_membership,
+            source_anchor: it.loss.source_cut.clone(),
+            authority_id: it.loss.authority_id,
+            initial_revision: it.loss.revision + 1,
+        },
+        &it.journal,
+        &it.trust.as_trust(),
+        it.gate.as_ref(),
+    )?;
+    successor_journal.decide_loss_successor(
+        successor.clone(),
+        &sign_successor(&it.signer, &successor, &it.trust, [61; 32])?,
+        15,
+        &it.trust.as_trust(),
+        it.gate.as_ref(),
+    )?;
+    let live = Authorities {
+        source: &it.journal,
+        successor: &successor_journal,
+        policy: it.gate.as_ref(),
+    };
+    // The replacement's role comes from the signed certificate the loss names:
+    // maintenance #1's for branch A, the decided one for branch B.
+    let founding = if forward {
+        Founding::Certificate(it.second.clone(), it.second_token.clone())
+    } else {
+        Founding::Certificate(it.first.clone(), it.first_token.clone())
+    };
+    install_pair(
+        &handle,
+        &mut replacement,
+        "fixture",
+        &founding,
+        &successor,
+        &live,
+    )?;
+    it.live.attach_successor(transition::Journal::open(
+        &it.dir.path().join("successor-journal"),
+        "successor-fixture",
+        transition::JournalScope {
+            install: it.loss.install.clone(),
+            region: it.loss.region.clone(),
+            profile: it.trust.profile.clone(),
+            scope: it.loss.scope,
+            schema: it.loss.schema,
+            membership: it.loss.replacement_membership,
+            source_anchor: it.loss.source_cut.clone(),
+            authority_id: it.loss.authority_id,
+            initial_revision: it.loss.revision + 1,
+        },
+        &it.trust.as_trust(),
+    )?)?;
+    complete_successor(&handle, &replacement, &successor, &live)?;
+    drop(replacement);
+    drop(handle);
+    let survivor_node = it.open(&survivor, it.survivor_role)?;
+    let replacement_node = it.open(&it.replacement_path, it.lost_role)?;
+    record_completion(&survivor_node)?;
+    record_completion(&replacement_node)?;
+    assert!(survivor_node.checkpoint().is_ok());
+    assert!(replacement_node.checkpoint().is_ok());
+    // The format-2 archive is still there and still accepted, now with the
+    // loss record present as well.
+    if forward {
+        assert_eq!(it.archive(&survivor)?.map(|a| a.0), Some(2));
+    }
+    // First write of the recovered pair, continuing from the survivor cut.
+    let before = it.survivor_receipts.len() as u64;
+    let (mut primary, mut secondary) = match it.survivor_role {
+        Role::Primary => (survivor_node, replacement_node),
+        Role::Secondary => (replacement_node, survivor_node),
+    };
+    let mut batch = stock_entry().batch;
+    batch.operation_id = "after-loss-during-maintenance".into();
+    assert_eq!(
+        commit(&mut primary, &mut secondary, batch)?.sequence,
+        before + 1
+    );
+    let receipts = receipt_rows(&primary)?;
+    assert_eq!(receipts.len() as u64, before + 1);
+    assert_eq!(receipts[..before as usize], it.survivor_receipts[..]);
+    assert_eq!(receipt_rows(&secondary)?, receipts);
+    // Maintenance and compaction stay shut on the recovered pair.
+    for node in [&mut primary, &mut secondary] {
+        assert!(node.plan_compaction().is_err());
+        assert!(node.enable_maintenance().is_err());
+    }
+    // The lost member never becomes admissible again.
+    let stale = it.open(&it.lost_path, it.lost_role);
+    assert!(stale.is_err() || stale?.checkpoint().is_err());
+    drop(primary);
+    drop(secondary);
+    drop(successor_journal);
+    drop(it);
+    Ok(())
+}
+
+#[test]
+fn loss_while_maintenance_is_prepared_rolls_back_and_recovers() -> Result<()> {
+    loss_during_maintenance(Role::Primary, InFlight::Prepared)
+}
+
+#[test]
+fn loss_while_maintenance_is_decided_rolls_back_and_recovers() -> Result<()> {
+    loss_during_maintenance(Role::Secondary, InFlight::Decided)
+}
+
+#[test]
+fn loss_while_maintenance_is_applied_finishes_forward_and_recovers() -> Result<()> {
+    loss_during_maintenance(Role::Primary, InFlight::Applied)
+}
+
+/// The format-2 completion archive is only ever acceptable together with the
+/// durable trace that explains it. Without that trace the node is closed — to
+/// the ordinary path and to the loss path alike — because an unfinished
+/// certificate must never become provenance outside the loss that authorised
+/// it. This is the reviewed guard; these are its negatives.
+#[test]
+fn a_loss_terminated_archive_is_refused_without_its_termination_trace() -> Result<()> {
+    let it = interrupted(Role::Secondary, InFlight::Applied)?;
+    let survivor = it.survivor_path.clone();
+    let mut handle = it.pending()?;
+    pending::terminate_by_loss(&mut handle, &it.journal, &it.trust, it.gate.as_ref())?;
+    drop(handle);
+    let trace = it.trace(&survivor)?.ok_or("termination trace missing")?;
+    let archive = it.archive(&survivor)?.ok_or("archive missing")?;
+    assert_eq!(archive.0, 2);
+    // The genuine state validates.
+    it.handle()?;
+
+    // No trace at all: the archive explains nothing. The loss path refuses it
+    // at its own, earlier gate; the ordinary path refuses it at the reviewed
+    // archive guard, which is the one that must never be bypassable.
+    tamper(&survivor, "DROP TABLE node_maintenance_terminated")?;
+    assert_err_contains(
+        it.handle(),
+        "loss survivor never abandoned that maintenance",
+    );
+    assert_err_contains(
+        it.open(&survivor, it.survivor_role),
+        "certified completion archive mismatch",
+    );
+    let restore = format!(
+        "CREATE TABLE IF NOT EXISTS node_maintenance_terminated(id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL);
+         DELETE FROM node_maintenance_terminated;
+         INSERT INTO node_maintenance_terminated VALUES(1,'{}');",
+        trace.replace('\'', "''")
+    );
+    tamper(&survivor, &restore)?;
+    it.handle()?;
+
+    // A trace for a different loss certificate no longer accounts for the
+    // archive, and the internal consistency check catches a rewritten one.
+    let mut rewritten: serde_json::Value = serde_json::from_str(&trace)?;
+    rewritten["loss_certificate"] = serde_json::to_value([99u8; 32])?;
+    tamper(
+        &survivor,
+        &format!(
+            "UPDATE node_maintenance_terminated SET record='{}' WHERE id=1",
+            serde_json::to_string(&rewritten)?.replace('\'', "''")
+        ),
+    )?;
+    // The trace still names this loss, so the loss path's own gate passes and
+    // the reviewed archive guard is what refuses it — on both paths.
+    assert_err_contains(it.handle(), "certified completion archive mismatch");
+    assert_err_contains(
+        it.open(&survivor, it.survivor_role),
+        "certified completion archive mismatch",
+    );
+    // Claiming the other branch is refused by the trace's own shape.
+    let mut relabelled: serde_json::Value = serde_json::from_str(&trace)?;
+    relabelled["kind"] = "rolled_back".into();
+    tamper(
+        &survivor,
+        &format!(
+            "UPDATE node_maintenance_terminated SET record='{}' WHERE id=1",
+            serde_json::to_string(&relabelled)?.replace('\'', "''")
+        ),
+    )?;
+    assert_err_contains(it.handle(), "maintenance rollback trace mismatch");
+    tamper(&survivor, &restore)?;
+    it.handle()?;
+
+    // A tampered archive is refused too: it must name the stored certificate.
+    tamper(
+        &survivor,
+        &format!(
+            "UPDATE node_compaction_completion SET record='{}' WHERE id=1",
+            serde_json::to_string(&(2u32, [88u8; 32], archive.2, archive.3))?.replace('\'', "''")
+        ),
+    )?;
+    assert_err_contains(it.handle(), "certified completion archive mismatch");
+    tamper(
+        &survivor,
+        &format!(
+            "UPDATE node_compaction_completion SET record='{}' WHERE id=1",
+            serde_json::to_string(&archive)?.replace('\'', "''")
+        ),
+    )?;
+    it.handle()?;
+
+    // And the trace alone never re-opens the ordinary path: a loss-terminated
+    // certificate has no completed revision and never will.
+    assert_err_contains(
+        it.open(&survivor, it.survivor_role),
+        "certified transition was terminated by a participant loss",
+    );
+    drop(it);
+    Ok(())
+}
+
+/// Branch A leaves no archive to argue about, but it does leave the trace, and
+/// the loss is only valid while that trace proves this node terminated exactly
+/// the request the loss abandons.
+#[test]
+fn a_rolled_back_maintenance_needs_its_trace_to_found_the_loss() -> Result<()> {
+    let it = interrupted(Role::Primary, InFlight::Decided)?;
+    let survivor = it.survivor_path.clone();
+    let mut handle = it.pending()?;
+    pending::terminate_by_loss(&mut handle, &it.journal, &it.trust, it.gate.as_ref())?;
+    drop(handle);
+    let trace = it.trace(&survivor)?.ok_or("termination trace missing")?;
+    it.handle()?;
+    // Branch A never applied, so maintenance #1's completion archive stands.
+    assert_eq!(it.archive(&survivor)?.map(|a| a.0), Some(1));
+
+    // Without the trace the loss cannot be founded at all: nothing proves this
+    // node ever had the request it claims to have abandoned.
+    tamper(&survivor, "DROP TABLE node_maintenance_terminated")?;
+    assert_err_contains(
+        it.handle(),
+        "loss survivor never abandoned that maintenance",
+    );
+    // A trace for another request does not stand in for it either.
+    let mut other: serde_json::Value = serde_json::from_str(&trace)?;
+    other["request_digest"] = serde_json::to_value([87u8; 32])?;
+    tamper(
+        &survivor,
+        &format!(
+            "CREATE TABLE IF NOT EXISTS node_maintenance_terminated(id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL);
+             DELETE FROM node_maintenance_terminated;
+             INSERT INTO node_maintenance_terminated VALUES(1,'{}');",
+            serde_json::to_string(&other)?.replace('\'', "''")
+        ),
+    )?;
+    assert_err_contains(it.handle(), "maintenance termination trace mismatch");
+    tamper(
+        &survivor,
+        &format!(
+            "UPDATE node_maintenance_terminated SET record='{}' WHERE id=1",
+            trace.replace('\'', "''")
+        ),
+    )?;
+    it.handle()?;
+    drop(it);
     Ok(())
 }

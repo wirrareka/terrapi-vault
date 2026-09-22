@@ -61,10 +61,6 @@ const ABORTED_TABLE: &str = "recovery_loss_aborted";
 #[cfg(any(test, feature = "experimental-recovery"))]
 const ABORTED_DDL: &str = "CREATE TABLE IF NOT EXISTS main.recovery_loss_aborted(\
      revision INTEGER PRIMARY KEY,record TEXT NOT NULL,digest TEXT NOT NULL)";
-#[cfg(any(test, feature = "experimental-recovery"))]
-/// S10/S11 are not implemented on the node side yet; a loss that needs them is
-/// refused rather than partially honoured.
-const NOT_ENABLED: &str = "participant-loss feature not enabled on this node yet";
 /// Singleton local completion receipt. Only its presence *together with* a live
 /// completed-successor proof can reopen ordinary admission (I6).
 const COMPLETION_TABLE: &str = "recovery_loss_completion";
@@ -1040,6 +1036,83 @@ fn visit_aborted(
     Ok(())
 }
 
+/// An in-flight certified maintenance would be wedged for ever once the loss
+/// gates close, so it has to be resolved *before* the irreversible install and
+/// never discovered afterwards (S11).
+///
+/// A loss that abandons one names it with `abandoned_request`, and the node
+/// must carry the durable trace of having terminated exactly that request —
+/// rolled back for `Completed`, finished forward for `Decided`. While the
+/// pending tables are still there the operator is told which step it owes, and
+/// an `abandoned_request` on a node that never had that request is refused:
+/// the field can never be padding.
+#[cfg(any(test, feature = "experimental-recovery"))]
+fn require_maintenance_terminated(c: &Connection, loss: &transition::LossRequest) -> Result<()> {
+    let pending = table_exists(c, "node_pending_certified_maintenance")?
+        || table_exists(c, "node_pending_certified_progress")?;
+    let trace = super::pending::terminated(c)?;
+    let Some(abandoned) = loss.abandoned_request else {
+        // No abandonment claimed: the old rule, unchanged. A node with pending
+        // maintenance is refused outright, and a stale trace from an earlier,
+        // unrelated termination may not stand in for this loss.
+        ensure(!pending, "loss survivor has pending certified maintenance")?;
+        return ensure(
+            trace
+                .as_ref()
+                .is_none_or(|t| same_attempt(t.loss(), loss) || t.loss() == loss),
+            "loss survivor has an unrelated terminated maintenance",
+        );
+    };
+    if pending {
+        return Err(match loss.kind() {
+            transition::SourceKind::Decided => {
+                "loss survivor must finish forward abandoned maintenance first"
+            }
+            _ => "loss survivor must roll back abandoned maintenance first",
+        }
+        .into());
+    }
+    // The trace is the only local proof that this node ever had that request
+    // and that it was terminated by this very loss.
+    let trace = trace.ok_or("loss survivor never abandoned that maintenance")?;
+    ensure(
+        trace.abandoned() == abandoned,
+        "loss survivor never abandoned that maintenance",
+    )?;
+    ensure(
+        trace.loss() == loss || same_attempt(trace.loss(), loss),
+        "loss survivor abandoned maintenance for another loss",
+    )?;
+    ensure(
+        trace.is_finished_forward() == (loss.kind() == transition::SourceKind::Decided),
+        "loss survivor terminated that maintenance the other way",
+    )
+}
+
+/// A node whose completion archive is the format-2, loss-authenticated one
+/// names exactly one loss. Once that loss has installed — or has itself been
+/// retired into the cycle history — the durable record must be the same loss.
+/// Before the install there is no record at all and the termination trace
+/// stands alone; that is exactly the window in which the survivor is
+/// export-only and ordinary admission is shut.
+pub(super) fn require_terminating_loss(
+    c: &Connection,
+    loss: &transition::LossRequest,
+) -> Result<()> {
+    let mut known = Vec::new();
+    if let Some((_, record)) = read_install(c)? {
+        known.push(record.loss);
+    }
+    visit_cycles(c, |row| {
+        known.push(row.installed.loss.clone());
+        Ok(())
+    })?;
+    ensure(
+        known.is_empty() || known.iter().any(|l| same_attempt(loss, l)),
+        "participant-loss termination record mismatch",
+    )
+}
+
 /// Everything a superseding loss must keep identical to the loss it replaces.
 /// This is the recovery crate's own rule set, mirrored so the node can never
 /// accept a "supersession" the journal would have refused, and so a tombstone
@@ -1362,17 +1435,6 @@ fn sole_participant(
     Ok(index)
 }
 
-/// S11 evidence is refused until its node side exists. `supersedes` is now
-/// honoured (S10); `abandoned_request` and `source_kind = Decided` are not.
-#[cfg(any(test, feature = "experimental-recovery"))]
-fn require_supported_loss(loss: &transition::LossRequest) -> Result<()> {
-    ensure(loss.abandoned_request.is_none(), NOT_ENABLED)?;
-    ensure(
-        !matches!(loss.source_kind, Some(transition::SourceKind::Decided)),
-        NOT_ENABLED,
-    )
-}
-
 #[cfg(any(test, feature = "experimental-recovery"))]
 /// Durable installation of the same signed successor membership on the
 /// replacement, which takes over the lost member's role. It depends only on
@@ -1408,7 +1470,9 @@ pub fn install_replacement<A: ReplicatedSchema, P: transition::LossPolicy>(
             && successor_binds(request, parent),
         "loss replacement installation mismatch",
     )?;
-    require_supported_loss(parent)?;
+    // An abandoned in-flight maintenance is the *survivor's* business: this
+    // file is a fresh replacement and never had that request. The lost role
+    // still comes only from the signed founding document below.
     let installed_role = founding.lost_role(trust, parent)?;
     require_canonical_role(request, roles(request)?.1, installed_role)?;
     ensure(
@@ -1939,18 +2003,16 @@ pub(super) fn validate<A: ReplicatedSchema>(
         runtime.len() == 1 && runtime[0].1 == initial,
         "loss survivor runtime mismatch",
     )?;
+    // Ahead of everything else: a node still inside a certified maintenance is
+    // in the pending runtime, which no shape below can even describe, and the
+    // operator needs to be told which termination step it owes (S11).
+    require_maintenance_terminated(c, loss)?;
     let history = history_format(c, runtime[0].0)?;
     recovery::verify_history(c, history)?;
     verify_certified(c, Some(trust))?;
-    // An in-flight compaction or a pending certified maintenance transaction
-    // would be wedged for ever once the loss gates close, so it must be
-    // resolved *before* the irreversible install, not discovered afterwards.
+    // An in-flight compaction would be wedged for ever once the loss gates
+    // close, so it must be resolved before the irreversible install.
     compaction::require_idle(c)?;
-    ensure(
-        !table_exists(c, "node_pending_certified_maintenance")?
-            && !table_exists(c, "node_pending_certified_progress")?,
-        "loss survivor has pending certified maintenance",
-    )?;
     capacity::verify_schema(c)?;
     capacity::verify_accounting(c)?;
     schema_contract::verify(c, adapter, contract)?;
@@ -1959,7 +2021,6 @@ pub(super) fn validate<A: ReplicatedSchema>(
         loss.membership != loss.replacement_membership,
         "loss membership reused",
     )?;
-    require_supported_loss(loss)?;
     // A superseding decision needs this node's own tombstone for the attempt
     // it replaces: the authority's journal cannot read this file, and this
     // file cannot read the abort's journal, so both check independently.
@@ -2243,7 +2304,12 @@ pub(crate) fn verify_certified_history(
     authority: Option<&dyn crate::typed::CertifiedAuthority>,
 ) -> Result<()> {
     let authority = authority.ok_or(CLOSED)?;
-    if super::maintenance_version(c)? == 3 {
+    // A certificate terminated by this very loss (S11 branch B) was never
+    // completed, so there is no completed revision to fetch. Its provenance is
+    // the signed loss itself, which `verify_certified` has already bound to the
+    // durable termination trace; admission still needs the live completed
+    // successor of the recovery, which `admission` checks below.
+    if super::maintenance_version(c)? == 3 && !super::loss_terminated_archive(c)? {
         super::verify_historical_certified(c, Some(authority))?;
     }
     Ok(())
