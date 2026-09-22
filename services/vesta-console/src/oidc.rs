@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use vesta_transport::lock::MutexExt;
 
 use base64::Engine as _;
-use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::jwk::{Jwk, JwkSet};
 use jsonwebtoken::{
     decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
 };
@@ -39,6 +39,10 @@ const ASSERTION_TTL_SECS: u64 = 300;
 /// Minimum spacing between JWKS (re)fetches on a `kid` miss — mirrors `vesta-broker::jwt`, so a
 /// flood of unknown-`kid` id_tokens can't amplify 1:1 into outbound fetches against identity.
 const MIN_JWKS_REFETCH: Duration = Duration::from_secs(30);
+/// Maximum age of a cached JWKS before a hit also refetches — mirrors `vesta-broker::jwt`, so a
+/// key identity has retired after a rotation stops verifying (id_token / logout token) instead of
+/// staying trusted until a restart. Longer than identity's cutover→retire wait (600 s).
+const JWKS_MAX_AGE: Duration = Duration::from_secs(600);
 /// id_token signature algs we will verify — **asymmetric only**. This is the allow-list that keeps
 /// us safe from alg-confusion (`none`, or an HMAC alg verified against the public key): a header
 /// alg outside this set is rejected before any key lookup. Intersected with the OP's advertised
@@ -193,10 +197,42 @@ struct TokenResponse {
     id_token: String,
 }
 
+/// Cached JWKS + the last (attempted) fetch time (refetch throttle) and the last *successful*
+/// fetch time (staleness).
 #[derive(Default)]
 struct JwksCache {
     set: Option<JwkSet>,
     last_fetch: Option<Instant>,
+    fetched_at: Option<Instant>,
+}
+
+/// What [`OidcClient::key_for`] does for a `kid`, given the cache. Pure — unit-tested.
+enum Plan<'a> {
+    /// Cached key usable as is.
+    Use(&'a Jwk),
+    /// Fetch the JWKS (a miss, or a stale set) outside the throttle window.
+    Refetch,
+    /// Unknown `kid` inside the throttle window — reject without a fetch.
+    Reject,
+}
+
+impl JwksCache {
+    fn plan(&self, kid: &str) -> Plan<'_> {
+        let throttled = self
+            .last_fetch
+            .is_some_and(|t| t.elapsed() < MIN_JWKS_REFETCH);
+        let fresh = self.fetched_at.is_some_and(|t| t.elapsed() < JWKS_MAX_AGE);
+        match self.set.as_ref().and_then(|s| s.find(kid)) {
+            // A stale hit inside the throttle window (the last refetch failed) keeps working.
+            Some(jwk) if fresh || throttled => Plan::Use(jwk),
+            None if throttled => Plan::Reject,
+            _ => Plan::Refetch,
+        }
+    }
+}
+
+fn from_jwk(jwk: &Jwk) -> Result<DecodingKey, OidcError> {
+    DecodingKey::from_jwk(jwk).map_err(|e| OidcError::Jwks(e.to_string()))
 }
 
 /// The OIDC RP. One per console process (`AppState`).
@@ -345,8 +381,7 @@ impl OidcClient {
         check_logout_claims(&claims, now_unix())
     }
 
-    /// Resolve a token's signing key from identity's JWKS (cache + refetch-on-miss, throttled like
-    /// `vesta-broker::jwt`) and the alg to verify it with. Used for both the id_token and the
+    /// Resolve a token's signing key from identity's JWKS ([`Self::key_for`]) and the alg to verify it with. Used for both the id_token and the
     /// Back-Channel Logout Token (identity signs both with the same ES256 key/JWKS). The header alg
     /// must be in [`SUPPORTED_ID_TOKEN_ALGS`] (asymmetric only — rejects `none`/HMAC alg-confusion)
     /// and, when the OP advertises `id_token_signing_alg_values_supported`, must be one of those —
@@ -360,31 +395,41 @@ impl OidcClient {
         let kid = header
             .kid
             .ok_or_else(|| OidcError::IdToken("missing kid".into()))?;
+        Ok((self.key_for(&kid).await?, alg))
+    }
+
+    /// A `DecodingKey` for `kid` from the cached JWKS (throttled like `vesta-broker::jwt`). A miss
+    /// — or a set older than [`JWKS_MAX_AGE`] — refetches, at most once per [`MIN_JWKS_REFETCH`];
+    /// inside that window an unknown `kid` is rejected without a fetch. If the refetch of a stale
+    /// set fails, the cached key is still used (identity's JWKS briefly down must not block
+    /// logins); a successful refetch drops retired keys.
+    async fn key_for(&self, kid: &str) -> Result<DecodingKey, OidcError> {
+        // Fast path + refetch throttle. Guard dropped before any await.
         {
             let cache = self.jwks.lock_recover();
-            if let Some(set) = cache.set.as_ref() {
-                if let Some(jwk) = set.find(&kid) {
-                    let key =
-                        DecodingKey::from_jwk(jwk).map_err(|e| OidcError::Jwks(e.to_string()))?;
-                    return Ok((key, alg));
-                }
-            }
-            if let Some(last) = cache.last_fetch {
-                if last.elapsed() < MIN_JWKS_REFETCH {
-                    return Err(OidcError::UnknownKid);
-                }
+            match cache.plan(kid) {
+                Plan::Use(jwk) => return from_jwk(jwk),
+                Plan::Reject => return Err(OidcError::UnknownKid),
+                Plan::Refetch => {}
             }
         }
         let fetched = self.fetch_jwks().await;
         let mut cache = self.jwks.lock_recover();
-        cache.last_fetch = Some(Instant::now());
-        let set = fetched?;
-        let key = match set.find(&kid) {
-            Some(jwk) => DecodingKey::from_jwk(jwk).map_err(|e| OidcError::Jwks(e.to_string())),
-            None => Err(OidcError::UnknownKid),
-        };
-        cache.set = Some(set);
-        Ok((key?, alg))
+        let now = Instant::now();
+        cache.last_fetch = Some(now);
+        match fetched {
+            Ok(set) => {
+                let key = set.find(kid).map_or(Err(OidcError::UnknownKid), from_jwk);
+                cache.set = Some(set);
+                cache.fetched_at = Some(now);
+                key
+            }
+            Err(e) => cache
+                .set
+                .as_ref()
+                .and_then(|s| s.find(kid))
+                .map_or(Err(e), from_jwk),
+        }
     }
 
     async fn fetch_jwks(&self) -> Result<JwkSet, OidcError> {
@@ -1067,5 +1112,50 @@ mod tests {
             ),
             Err(OidcError::LogoutToken(_))
         ));
+    }
+
+    fn jwks_cache(kids: &[&str], fetched_ago: Duration, attempted_ago: Duration) -> JwksCache {
+        let keys: Vec<_> = kids
+            .iter()
+            .map(|k| {
+                serde_json::json!({"kty":"EC","crv":"P-256","kid":k,
+                    "x":"MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4",
+                    "y":"4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM"})
+            })
+            .collect();
+        let now = Instant::now();
+        JwksCache {
+            set: Some(serde_json::from_value(serde_json::json!({ "keys": keys })).unwrap()),
+            fetched_at: now.checked_sub(fetched_ago),
+            last_fetch: now.checked_sub(attempted_ago),
+        }
+    }
+
+    /// Fresh set: a hit is used, a miss refetches once, then is throttled.
+    #[test]
+    fn jwks_plan_fresh_cache() {
+        let secs = Duration::from_secs;
+        let c = jwks_cache(&["k1"], secs(60), secs(60));
+        assert!(matches!(c.plan("k1"), Plan::Use(_)));
+        assert!(matches!(c.plan("new"), Plan::Refetch));
+        let c = jwks_cache(&["k1"], secs(1), secs(1));
+        assert!(matches!(c.plan("new"), Plan::Reject));
+    }
+
+    /// Stale set (past JWKS_MAX_AGE): even a hit refetches, so a retired kid is dropped — unless
+    /// a refetch was just attempted (and failed), then the stale key keeps working.
+    #[test]
+    fn jwks_plan_stale_cache() {
+        let stale = JWKS_MAX_AGE + Duration::from_secs(1);
+        let c = jwks_cache(&["old"], stale, stale);
+        assert!(matches!(c.plan("old"), Plan::Refetch));
+        let c = jwks_cache(&["old"], stale, Duration::from_secs(1));
+        assert!(matches!(c.plan("old"), Plan::Use(_)));
+        assert!(matches!(c.plan("new"), Plan::Reject));
+    }
+
+    #[test]
+    fn jwks_plan_empty_cache_fetches() {
+        assert!(matches!(JwksCache::default().plan("k1"), Plan::Refetch));
     }
 }

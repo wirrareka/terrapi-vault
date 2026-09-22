@@ -8,8 +8,9 @@
 //!
 //! 1. header `alg` MUST be `ES256` (reject `none`/alg-confusion) and carry a `kid`;
 //! 2. signature against identity's JWKS — fetched from the issuer's
-//!    `/.well-known/openid-configuration` → `jwks_uri` (or an explicit override), cached and
-//!    refetched on a `kid` miss (handles identity key rotation);
+//!    `/.well-known/openid-configuration` → `jwks_uri` (or an explicit override), cached,
+//!    refetched on a `kid` miss (picks up a new key) and once the cache is older than
+//!    [`JWKS_MAX_AGE`] (drops a retired key);
 //! 3. `iss` (pinned, exact incl. trailing slash) + `aud` (`"vault"`) + `exp` via jsonwebtoken;
 //! 4. `scope ⊇ "kms"` (RFC 6749 space-delimited) and `residency_group == this instance's
 //!    group` — belt-and-suspenders cross-region replay defence (the caller then enforces
@@ -18,7 +19,7 @@
 //! Disabled unless `VESTA_KMS_JWT_ISSUER` is set; when off, kms ops stay cap-based
 //! (`Capability::Kms` via the cert-SAN role — the existing aether fleet-backup path).
 
-use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::jwk::{Jwk, JwkSet};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use std::sync::Mutex;
@@ -31,11 +32,43 @@ use vesta_transport::lock::MutexExt;
 /// up within this bound (identity's kid-rotation overlap must outlast it — see `jwt-claims.md`).
 const MIN_JWKS_REFETCH: Duration = Duration::from_secs(30);
 
-/// Cached JWKS + the last (attempted) fetch time, so refetch-on-miss can be rate-limited.
+/// Maximum age of a cached JWKS before a hit also refetches. Without it a key identity has
+/// *retired* (removed from its JWKS after a rotation) would stay trusted in-process until a
+/// restart. Longer than identity's cutover→retire wait (600 s) so a rotation never races it.
+const JWKS_MAX_AGE: Duration = Duration::from_secs(600);
+
+/// Cached JWKS + the last (attempted) fetch time, so refetch-on-miss can be rate-limited, and
+/// the last *successful* fetch time, so a stale set is refreshed.
 #[derive(Default)]
 struct JwksCache {
     set: Option<JwkSet>,
     last_fetch: Option<Instant>,
+    fetched_at: Option<Instant>,
+}
+
+/// What [`JwtVerifier::key_for`] does for a `kid`, given the cache. Pure — unit-tested.
+enum Plan<'a> {
+    /// Cached key usable as is.
+    Use(&'a Jwk),
+    /// Fetch the JWKS (a miss, or a stale set) outside the throttle window.
+    Refetch,
+    /// Unknown `kid` inside the throttle window — reject without a fetch.
+    Reject,
+}
+
+impl JwksCache {
+    fn plan(&self, kid: &str) -> Plan<'_> {
+        let throttled = self
+            .last_fetch
+            .is_some_and(|t| t.elapsed() < MIN_JWKS_REFETCH);
+        let fresh = self.fetched_at.is_some_and(|t| t.elapsed() < JWKS_MAX_AGE);
+        match self.set.as_ref().and_then(|s| s.find(kid)) {
+            // A stale hit inside the throttle window (the last refetch failed) keeps working.
+            Some(jwk) if fresh || throttled => Plan::Use(jwk),
+            None if throttled => Plan::Reject,
+            _ => Plan::Refetch,
+        }
+    }
 }
 
 /// Why a kms bearer token was rejected. Mapped to HTTP status by the handler (`http::map_jwt_err`).
@@ -165,38 +198,40 @@ impl JwtVerifier {
         check_claims(&data.claims, &self.expected_group)
     }
 
-    /// A `DecodingKey` for `kid` from the cached JWKS. A miss refetches (a signing key may have
-    /// rotated), but at most once per [`MIN_JWKS_REFETCH`]: within that window an unknown `kid`
-    /// returns `UnknownKid` WITHOUT a fetch, so a flood of bogus `kid`s can't drive one outbound
-    /// JWKS call per request against identity.
+    /// A `DecodingKey` for `kid` from the cached JWKS. A miss — or a set older than
+    /// [`JWKS_MAX_AGE`] — refetches (a signing key may have rotated or been retired), but at most
+    /// once per [`MIN_JWKS_REFETCH`]: within that window an unknown `kid` returns `UnknownKid`
+    /// WITHOUT a fetch, so a flood of bogus `kid`s can't drive one outbound JWKS call per request
+    /// against identity. If the refetch of a stale set fails, the cached key is still used
+    /// (identity unreachable must not take kms down); a successful refetch drops retired keys.
     async fn key_for(&self, kid: &str) -> Result<DecodingKey, JwtError> {
         // Fast path + refetch throttle. Guard dropped before any await.
         {
             let cache = self.cache.lock_recover();
-            if let Some(set) = cache.set.as_ref() {
-                if let Some(jwk) = set.find(kid) {
-                    return DecodingKey::from_jwk(jwk).map_err(|e| JwtError::Jwks(e.to_string()));
-                }
-            }
-            // Miss: only refetch if we haven't fetched within the throttle window.
-            if let Some(last) = cache.last_fetch {
-                if last.elapsed() < MIN_JWKS_REFETCH {
-                    return Err(JwtError::UnknownKid);
-                }
+            match cache.plan(kid) {
+                Plan::Use(jwk) => return from_jwk(jwk),
+                Plan::Reject => return Err(JwtError::UnknownKid),
+                Plan::Refetch => {}
             }
         }
-        // Refetch (identity may have rotated its signing key), then look up once more.
         let fetched = self.fetch_jwks().await;
         let mut cache = self.cache.lock_recover();
         // Stamp the attempt even on failure, so a down/slow JWKS endpoint is also rate-limited.
-        cache.last_fetch = Some(Instant::now());
-        let set = fetched?;
-        let key = match set.find(kid) {
-            Some(jwk) => DecodingKey::from_jwk(jwk).map_err(|e| JwtError::Jwks(e.to_string())),
-            None => Err(JwtError::UnknownKid),
-        };
-        cache.set = Some(set);
-        key
+        let now = Instant::now();
+        cache.last_fetch = Some(now);
+        match fetched {
+            Ok(set) => {
+                let key = set.find(kid).map_or(Err(JwtError::UnknownKid), from_jwk);
+                cache.set = Some(set);
+                cache.fetched_at = Some(now);
+                key
+            }
+            Err(e) => cache
+                .set
+                .as_ref()
+                .and_then(|s| s.find(kid))
+                .map_or(Err(e), from_jwk),
+        }
     }
 
     async fn fetch_jwks(&self) -> Result<JwkSet, JwtError> {
@@ -236,6 +271,10 @@ impl JwtVerifier {
             .map(str::to_owned)
             .ok_or_else(|| JwtError::Jwks("discovery document has no jwks_uri".into()))
     }
+}
+
+fn from_jwk(jwk: &Jwk) -> Result<DecodingKey, JwtError> {
+    DecodingKey::from_jwk(jwk).map_err(|e| JwtError::Jwks(e.to_string()))
 }
 
 #[cfg(test)]
@@ -379,5 +418,96 @@ mod tests {
             1,
             "second unknown-kid must be throttled, not a second JWKS fetch"
         );
+    }
+
+    /// RFC 7517 App. A.1 EC P-256 public key, as a JWK with `kid`.
+    fn ec_jwk(kid: &str) -> serde_json::Value {
+        serde_json::json!({"kty":"EC","crv":"P-256","kid":kid,
+            "x":"MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4",
+            "y":"4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM"})
+    }
+
+    /// A JWKS endpoint whose body (`Some`) or failure (`None` → 500) the test can switch.
+    async fn switchable_jwks(
+        initial: serde_json::Value,
+    ) -> (String, std::sync::Arc<Mutex<Option<serde_json::Value>>>) {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        use std::sync::Arc;
+
+        let body = Arc::new(Mutex::new(Some(initial)));
+        let app = axum::Router::new().route(
+            "/jwks",
+            get({
+                let body = body.clone();
+                move || {
+                    let cur = body.lock_recover().clone();
+                    async move {
+                        match cur {
+                            Some(v) => axum::Json(v).into_response(),
+                            None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/jwks"), body)
+    }
+
+    fn verifier(jwks_uri: String) -> JwtVerifier {
+        JwtVerifier::new(
+            "https://identity.eu.proximi.fi/".into(),
+            "vault".into(),
+            "eu".into(),
+            Some(jwks_uri),
+        )
+    }
+
+    /// Age the cache past [`JWKS_MAX_AGE`] and out of the refetch throttle window.
+    fn age_cache(v: &JwtVerifier) {
+        let past = Instant::now()
+            .checked_sub(JWKS_MAX_AGE + Duration::from_secs(1))
+            .unwrap();
+        let mut c = v.cache.lock_recover();
+        c.fetched_at = Some(past);
+        c.last_fetch = Some(past);
+    }
+
+    /// Rotation step 5 (retire): once the cached set is stale, a hit refetches and a kid identity
+    /// has removed from its JWKS stops verifying — it is not trusted until a restart.
+    #[tokio::test]
+    async fn retired_kid_is_dropped_after_max_age() {
+        let (uri, body) = switchable_jwks(serde_json::json!({"keys":[ec_jwk("old")]})).await;
+        let v = verifier(uri);
+        assert!(v.key_for("old").await.is_ok());
+        // Fresh cache: a hit does not refetch, even though identity already retired the key.
+        *body.lock_recover() = Some(serde_json::json!({"keys":[ec_jwk("new")]}));
+        assert!(v.key_for("old").await.is_ok());
+        age_cache(&v);
+        assert!(matches!(v.key_for("old").await, Err(JwtError::UnknownKid)));
+        assert!(v.key_for("new").await.is_ok());
+    }
+
+    /// Identity unreachable when the set goes stale: the cached key keeps working (no kms outage),
+    /// and the failed attempt is throttled like any other fetch.
+    #[tokio::test]
+    async fn stale_set_survives_jwks_outage() {
+        let (uri, body) = switchable_jwks(serde_json::json!({"keys":[ec_jwk("k1")]})).await;
+        let v = verifier(uri);
+        assert!(v.key_for("k1").await.is_ok());
+        *body.lock_recover() = None;
+        age_cache(&v);
+        assert!(v.key_for("k1").await.is_ok());
+        // Unknown kid right after the failed refetch → throttled reject, not a Jwks error.
+        assert!(matches!(
+            v.key_for("other").await,
+            Err(JwtError::UnknownKid)
+        ));
     }
 }

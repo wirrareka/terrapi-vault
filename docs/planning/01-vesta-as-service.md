@@ -402,7 +402,7 @@ with safe defaults — no deploy change required. Zero new crates (axum `Default
 The chain locked with identity (`coordination/conventions/secrets-broker.md §KMS root-of-trust`);
 vesta's three pieces shipped + tested (gated off until identity/infra enable their side):
 - **Option J — kms-cap JWT verify (`jwt.rs`):** per-call ES256 verify of identity-minted
-  workload creds against the issuer's JWKS (cached, refetched on a `kid` miss); enforces
+  workload creds against the issuer's JWKS (cached, refetched on a `kid` miss and after 600 s); enforces
   `iss`/`aud="vault"`/`exp`/`scope ⊇ kms`/`residency_group == instance`/`tenant_id == path`.
   Opt-in `VESTA_KMS_JWT_ISSUER`; unset ⇒ kms stays cap-based (aether unchanged).
 - **`kms.rewrap` (`POST …/kms/{key_id}/rewrap`):** server-side re-wrap onto the current KEK

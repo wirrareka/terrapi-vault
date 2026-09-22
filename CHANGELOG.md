@@ -5,6 +5,12 @@ secrets **broker** (Path A) plus the embedded at-rest SQLCipher library it grew 
 
 ## Unreleased — replication product integration
 
+- **JWKS cache now expires (broker `jwt.rs`, console `oidc.rs`).** A cached identity JWKS
+  older than `JWKS_MAX_AGE` (600 s) is refetched even on a `kid` hit (still throttled by
+  `MIN_JWKS_REFETCH`), so a signing key identity *retired* after a rotation stops verifying
+  instead of staying trusted until a restart. If that refetch fails (identity unreachable)
+  the cached key keeps working. Answers infra's signing-key rotation ask
+  (`inbox/vault/infra-identity-signing-key-rotation-coming.md`).
 - Added an experimental checkpoint-transition certificate verifier with external
   ES256 trust and separate issuance/historical result types, plus an encrypted
   decision journal with authenticated-policy hooks and exact decision retries.
