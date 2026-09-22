@@ -4642,6 +4642,7 @@ fn a_third_loss_extends_the_verified_cycle_chain() -> Result<()> {
 /// the point — the journal file and this node file are different trust domains.
 fn retire_directly(
     path: &Path,
+    trust: &transition::TrustStore,
     founding: &Installed,
     next: &transition::LossRequest,
 ) -> Result<()> {
@@ -4649,7 +4650,7 @@ fn retire_directly(
     db.with_connection(|c| {
         Ok((|| -> Result<()> {
             let tx = c.unchecked_transaction()?;
-            let outcome = retire_founding(&tx, founding, next);
+            let outcome = retire_founding(&tx, trust, founding, next);
             tx.rollback()?;
             outcome
         })())
@@ -4836,13 +4837,13 @@ fn second_loss_evidence_rejects_every_founding_mismatch() -> Result<()> {
             },
         ] {
             assert_err_contains(
-                retire_directly(&survivor, &founding, &next),
+                retire_directly(&survivor, &s.f.trust, &founding, &next),
                 "participant-loss identity reuse",
             );
         }
     }
     // The genuine retirement is accepted, and rolled back again.
-    retire_directly(&survivor, &founding, &s.loss)?;
+    retire_directly(&survivor, &s.f.trust, &founding, &s.loss)?;
     assert!(cycle_rows(&survivor)?.is_empty());
     assert!(completion_row(&survivor)?.is_some());
     assert_eq!(s.f.derive_role_at(&survivor, &s.loss)?, s.survivor_role);
@@ -5895,11 +5896,15 @@ fn abort_after_both_installs_is_superseded_for_a_lost_primary() -> Result<()> {
 /// Run the survivor's tombstone check alone, on a read-only connection: the
 /// deeper identity layer is only reachable across several attempts, so it is
 /// driven directly rather than through a third signed supersession.
-fn supersession_check(path: &Path, loss: &transition::LossRequest) -> Result<()> {
+fn supersession_check(
+    path: &Path,
+    trust: &transition::TrustStore,
+    loss: &transition::LossRequest,
+) -> Result<()> {
     let db = Vesta::open_read_only_with_passphrase(path, "fixture")?;
     db.with_connection(|c| {
         c.pragma_update(None, "query_only", true)?;
-        Ok(require_supersession(c, loss))
+        Ok(require_supersession(c, trust, loss))
     })?
 }
 
@@ -6076,7 +6081,7 @@ fn superseding_loss_evidence_rejects_every_mismatch() -> Result<()> {
     let mut deep = superseding(&a, [160; 32], [161; 32], [162; 32]);
     deep.replacement_member = a.f.loss.lost_member;
     assert_err_contains(
-        supersession_check(&survivor, &deep),
+        supersession_check(&survivor, &a.f.trust, &deep),
         "participant-loss identity reuse",
     );
     // And the genuine supersession still validates on this file.
@@ -6909,13 +6914,20 @@ fn interrupted(lost: Role, phase: InFlight) -> Result<Interrupted> {
     };
     loss.validate()?;
     let loss_token = sign_loss(&key, &loss, &trust, [59; 32])?;
-    let committed = journal.decide_loss(
-        loss.clone(),
-        &loss_token,
-        15,
-        &trust.as_trust(),
+    // L4: the three S11 hooks are answered by the PRODUCTION adapter, reading
+    // the real survivor file, not by the test gate. The gate is only wrapped
+    // for continuity and fencing, which is the authority's business.
+    let evidence = SurvivorEvidence::new(
+        &survivor_path,
+        identity.clone(),
+        "fixture",
+        StockSchema,
+        trust.clone(),
         gate.as_ref(),
     )?;
+    let committed =
+        journal.decide_loss(loss.clone(), &loss_token, 15, &trust.as_trust(), &evidence)?;
+    drop(evidence);
     let loss_certificate_id = committed.certificate_id();
     let loss_token_digest = committed.token_digest();
     Ok(Interrupted {
@@ -7019,6 +7031,20 @@ fn loss_during_maintenance(lost: Role, phase: InFlight) -> Result<()> {
     }
 
     // The ordinary loss flow now runs unchanged.
+    let (successor_journal, successor) = recover_after_termination(&it)?;
+    let _ = (&successor_journal, &successor);
+    recovered_pair_writes(&it)?;
+    drop(successor_journal);
+    drop(it);
+    Ok(())
+}
+
+/// The whole loss recovery after a termination: export, bootstrap, installs,
+/// completion and both local receipts.
+fn recover_after_termination(
+    it: &Interrupted,
+) -> Result<(transition::Journal, transition::LossSuccessorRequest)> {
+    let forward = it.phase == InFlight::Applied;
     let handle = it.handle()?;
     assert_eq!(handle.role, it.survivor_role);
     let mut replacement = it.replacement()?;
@@ -7101,18 +7127,32 @@ fn loss_during_maintenance(lost: Role, phase: InFlight) -> Result<()> {
     complete_successor(&handle, &replacement, &successor, &live)?;
     drop(replacement);
     drop(handle);
-    let survivor_node = it.open(&survivor, it.survivor_role)?;
+    let survivor_node = it.open(&it.survivor_path, it.survivor_role)?;
     let replacement_node = it.open(&it.replacement_path, it.lost_role)?;
     record_completion(&survivor_node)?;
     record_completion(&replacement_node)?;
-    assert!(survivor_node.checkpoint().is_ok());
-    assert!(replacement_node.checkpoint().is_ok());
+    ensure(survivor_node.checkpoint().is_ok(), "survivor not admitted")?;
+    ensure(
+        replacement_node.checkpoint().is_ok(),
+        "replacement not admitted",
+    )?;
     // The format-2 archive is still there and still accepted, now with the
     // loss record present as well.
     if forward {
-        assert_eq!(it.archive(&survivor)?.map(|a| a.0), Some(2));
+        ensure(
+            it.archive(&it.survivor_path)?.map(|a| a.0) == Some(2),
+            "format-2 archive lost",
+        )?;
     }
-    // First write of the recovered pair, continuing from the survivor cut.
+    drop(survivor_node);
+    drop(replacement_node);
+    Ok((successor_journal, successor))
+}
+
+/// First write of the pair the termination recovered.
+fn recovered_pair_writes(it: &Interrupted) -> Result<()> {
+    let survivor_node = it.open(&it.survivor_path, it.survivor_role)?;
+    let replacement_node = it.open(&it.replacement_path, it.lost_role)?;
     let before = it.survivor_receipts.len() as u64;
     let (mut primary, mut secondary) = match it.survivor_role {
         Role::Primary => (survivor_node, replacement_node),
@@ -7138,8 +7178,6 @@ fn loss_during_maintenance(lost: Role, phase: InFlight) -> Result<()> {
     assert!(stale.is_err() || stale?.checkpoint().is_err());
     drop(primary);
     drop(secondary);
-    drop(successor_journal);
-    drop(it);
     Ok(())
 }
 
@@ -7208,9 +7246,13 @@ fn a_loss_terminated_archive_is_refused_without_its_termination_trace() -> Resul
             serde_json::to_string(&rewritten)?.replace('\'', "''")
         ),
     )?;
-    // The trace still names this loss, so the loss path's own gate passes and
-    // the reviewed archive guard is what refuses it — on both paths.
-    assert_err_contains(it.handle(), "certified completion archive mismatch");
+    // L3: the trace is signature-anchored, so rewriting the certificate it
+    // names makes it unauthentic and therefore absent. The loss path refuses
+    // at its own gate, the ordinary path at the reviewed archive guard.
+    assert_err_contains(
+        it.handle(),
+        "loss survivor never abandoned that maintenance",
+    );
     assert_err_contains(
         it.open(&survivor, it.survivor_role),
         "certified completion archive mismatch",
@@ -7301,5 +7343,205 @@ fn a_rolled_back_maintenance_needs_its_trace_to_found_the_loss() -> Result<()> {
     )?;
     it.handle()?;
     drop(it);
+    Ok(())
+}
+
+/// L1 regression. The termination trace is consumed by the recovery it belongs
+/// to, so a later, *unrelated* loss on the same survivor is not wedged by it.
+/// Before the fix this failed at `open_existing`: `same_lineage` compared the
+/// spent trace's `abandoned_request` (`Some`) with the new loss's (`None`) and
+/// the survivor could not even export — the pair was lost.
+fn second_loss_after_a_terminated_maintenance(phase: InFlight) -> Result<()> {
+    let it = interrupted(Role::Primary, phase)?;
+    let survivor = it.survivor_path.clone();
+    let mut handle = it.pending()?;
+    pending::terminate_by_loss(&mut handle, &it.journal, &it.trust, it.gate.as_ref())?;
+    drop(handle);
+    assert!(it.trace(&survivor)?.is_some());
+    let (journal, successor) = recover_after_termination(&it)?;
+    recovered_pair_writes(&it)?;
+
+    // A wholly unrelated second loss on the recovered pair: no abandoned
+    // request, nothing to do with the terminated maintenance.
+    let proof = journal.fetch_loss_successor(&successor, &it.trust.as_trust(), it.gate.as_ref())?;
+    let first = FirstRecovery {
+        token: proof.token().to_owned(),
+        certificate: proof.certificate_id(),
+        journal,
+        successor,
+    };
+    let f = Fixture {
+        dir: it.dir,
+        identity: it.identity,
+        trust: it.trust,
+        journal: it.journal,
+        gate: it.gate,
+        live: it.live,
+        certificate: it.first,
+        certificate_token: it.first_token,
+        loss: it.loss,
+        loss_certificate_id: it.loss_certificate_id,
+        loss_token_digest: it.loss_token_digest,
+        signer: it.signer,
+        survivor_path: survivor.clone(),
+        lost_path: it.lost_path,
+        replacement_path: it.replacement_path.clone(),
+        survivor_checkpoint: it.survivor_checkpoint,
+        survivor_manifest: it.survivor_manifest,
+        survivor_view: String::new(),
+        survivor_receipts: it.survivor_receipts,
+        survivor_capacity: (0, 0),
+    };
+    let next_replacement = f.dir.path().join("replacement-after-termination");
+    let second = decide_next_loss(
+        f,
+        first,
+        Next {
+            survivor_path: survivor.clone(),
+            survivor_role: it.survivor_role,
+            lost_path: it.replacement_path,
+            replacement_path: next_replacement,
+            ids: SECOND_IDS,
+            tail: Some("between-termination-and-second-loss"),
+        },
+    )?;
+    assert_eq!(second.loss.abandoned_request, None);
+    // The spent trace is gone: the retirement consumed it into the cycle row.
+    recover_second(&second, "successor-journal-after-termination")?;
+    assert_eq!(
+        second.f.derive_role_at(&survivor, &second.loss)?,
+        it.survivor_role
+    );
+    let rows = cycle_rows(&survivor)?;
+    assert_eq!(rows.len(), 1);
+    let retired: RetiredLoss = serde_json::from_str(&rows[0].1)?;
+    assert!(
+        retired.terminated.is_some(),
+        "the termination trace was not carried into the retirement"
+    );
+    // And the singleton is gone, so nothing can meet it again.
+    let db = Vesta::open_read_only_with_passphrase(&survivor, "fixture")?;
+    assert!(!db.with_connection(|c| Ok(table_exists(c, "node_maintenance_terminated")))??);
+    drop(db);
+
+    // The twice-changed pair writes.
+    let before = second.survivor_receipts.len() as u64;
+    let survivor_node = second.open(&second.survivor_path, second.survivor_role)?;
+    let replacement_node = second.open(&second.replacement_path, second.lost_role)?;
+    let (mut primary, mut secondary) = match second.survivor_role {
+        Role::Primary => (survivor_node, replacement_node),
+        Role::Secondary => (replacement_node, survivor_node),
+    };
+    let mut batch = stock_entry().batch;
+    batch.operation_id = "after-termination-and-second-loss".into();
+    assert_eq!(
+        commit(&mut primary, &mut secondary, batch)?.sequence,
+        before + 1
+    );
+    assert_eq!(receipt_rows(&primary)?, receipt_rows(&secondary)?);
+    drop(primary);
+    drop(secondary);
+    drop(second);
+    Ok(())
+}
+
+#[test]
+fn a_rolled_back_survivor_can_still_take_a_later_unrelated_loss() -> Result<()> {
+    second_loss_after_a_terminated_maintenance(InFlight::Decided)
+}
+
+#[test]
+fn a_finished_forward_survivor_can_still_take_a_later_unrelated_loss() -> Result<()> {
+    second_loss_after_a_terminated_maintenance(InFlight::Applied)
+}
+
+/// L2 regression. After an abort, a *different* successor for the SAME loss
+/// that reuses the fenced replacement identity must be refused on both nodes,
+/// even when the journal file has been rolled back to before the abort.
+#[test]
+fn an_aborted_replacement_identity_cannot_return_under_a_new_successor() -> Result<()> {
+    let a = abort_fixture(Role::Secondary, Reached::BothInstalls)?;
+    let survivor = a.f.survivor_path.clone();
+    let handle = a.handle()?;
+    handle.abort_successor_install("fixture", &a.successor, &a.live(&a.journal))?;
+    drop(handle);
+    assert_eq!(tombstone_rows(&survivor)?.len(), 1);
+
+    // A second successor for the same loss: new id and certificate, but the
+    // same replacement member, generation and membership.
+    let reused = successor_for(
+        &a.f.loss,
+        a.f.loss_certificate_id,
+        a.f.loss_token_digest,
+        a.f.survivor_role(),
+        2,
+        [200; 32],
+    );
+    assert_eq!(
+        reused.replacement()?.member,
+        a.successor.replacement()?.member
+    );
+    // Roll the successor journal back to before the abort and decide it there.
+    let journal_path = a.f.dir.path().join("successor-journal");
+    swap_database(&a.before_abort, &journal_path)?;
+    let rolled_back = transition::Journal::open(
+        &journal_path,
+        "successor-fixture",
+        successor_scope(&a.f),
+        &a.f.trust.as_trust(),
+    )?;
+    // The rolled-back journal already holds the first successor, so a second
+    // decision there is refused by the journal itself; the node-side guard is
+    // what must hold when a whole journal file is substituted.
+    let handle = a.handle()?;
+    // Layered: the rolled-back journal still only knows the first successor,
+    // so it refuses this one before the node is asked at all.
+    assert!(handle
+        .install_successor("fixture", &reused, &a.live(&rolled_back))
+        .is_err());
+    assert_eq!(install_state(&survivor)?.0, None);
+    drop(handle);
+    let mut replacement = a.f.open_replacement(a.f.lost_role())?;
+    assert!(install_replacement(
+        &mut replacement,
+        &founding(&a.f),
+        &reused,
+        &a.live(&rolled_back),
+    )
+    .is_err());
+    drop(replacement);
+    // The node-side half is what must hold when a whole journal file is
+    // substituted, so it is driven directly: the fenced replacement identity
+    // is refused whatever successor id or certificate carries it.
+    let db = Vesta::open_read_only_with_passphrase(&survivor, "fixture")?;
+    let refusal = db.with_connection(|c| {
+        c.pragma_update(None, "query_only", true)?;
+        Ok(require_not_aborted(
+            c, &a.f.trust, &a.f.loss, &reused, [202; 32],
+        ))
+    })?;
+    assert_err_contains(refusal, "participant-loss identity reuse");
+    drop(db);
+    drop(rolled_back);
+    swap_database(
+        &a.f.dir.path().join("successor-journal-before-abort"),
+        &journal_path,
+    )?;
+
+    // The only legal continuation is a superseding loss with a fresh triple.
+    let fresh = successor_for(
+        &a.f.loss,
+        a.f.loss_certificate_id,
+        a.f.loss_token_digest,
+        a.f.survivor_role(),
+        2,
+        [201; 32],
+    );
+    let handle = a.handle()?;
+    assert!(handle
+        .install_successor("fixture", &fresh, &a.live(&a.journal))
+        .is_err());
+    drop(handle);
+    drop(a);
     Ok(())
 }

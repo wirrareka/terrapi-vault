@@ -139,6 +139,60 @@ pub(crate) fn peek_pending(
     })?
 }
 
+/// Connection-level read of the pending progress, for callers that already
+/// hold their own read-only connection and must not take the node lock.
+/// Returns `None` when this node has no pending certified maintenance.
+pub(super) fn progress_of(
+    c: &Connection,
+    identity: &Identity<SchemaId>,
+) -> Result<
+    Option<(
+        Role,
+        String,
+        crate::recovery::transition::Request,
+        Option<[u8; 32]>,
+    )>,
+> {
+    if !pending_present(c)? {
+        return Ok(None);
+    }
+    let marker: Marker = serde_json::from_str(&singleton_text(
+        c,
+        "node_pending_certified_maintenance",
+        "record",
+        64 * 1024,
+    )?)?;
+    let prepared: Prepared = serde_json::from_str(&singleton_text(
+        c,
+        "node_pending_certified_progress",
+        "record",
+        256 * 1024,
+    )?)?;
+    let owner: Vec<String> = c
+        .prepare("SELECT value FROM main.node_identity")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    ensure(
+        marker.format == 1
+            && marker.identity == *identity
+            && owner == [serde_json::to_string(&(identity, marker.role))?]
+            && marker.request_digest == digest(&prepared.request)?
+            && marker.plan_digest == digest(&prepared.plan)?
+            && matches!(marker.previous_runtime, 3 | 4),
+        "pending marker mismatch",
+    )?;
+    let runtime: u32 = c.query_row("SELECT format FROM main.node_runtime WHERE id=1", [], |r| {
+        r.get(0)
+    })?;
+    ensure(runtime == 5, "pending runtime mismatch")?;
+    Ok(Some((
+        marker.role,
+        prepared.phase.clone(),
+        prepared.request,
+        prepared.decision,
+    )))
+}
+
 fn singleton_text(c: &Connection, table: &str, column: &str, limit: usize) -> Result<String> {
     let rows: Vec<(u32, String)> = c
         .prepare(&format!("SELECT id,{column} FROM {table} ORDER BY id"))?
@@ -1393,6 +1447,11 @@ const TERMINATED: &str = "node_maintenance_terminated";
 const TERMINATED_DDL: &str = "CREATE TABLE IF NOT EXISTS main.node_maintenance_terminated(\
      id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL)";
 /// Branch A: nothing was applied and the transition was rolled back.
+/// The trace carries a whole `Request`, a whole `LossRequest` and the issued
+/// loss token, so the cap is the old 256 KiB plus room for a maximal token.
+const TERMINATED_LIMIT: usize = 384 * 1024;
+/// Mirror of the recovery crate's private `MAX_TOKEN`.
+const MAX_TOKEN: usize = 64 * 1024;
 const ROLLED_BACK: &str = "rolled_back";
 /// Branch B: the decided transition was applied and is finished forward.
 const FINISHED_FORWARD: &str = "finished_forward";
@@ -1408,10 +1467,14 @@ pub(super) struct Terminated {
     /// this file alone, with no journal and no authority.
     request: crate::recovery::transition::Request,
     request_digest: [u8; 32],
-    /// The loss decision that terminated it, and its certificate.
+    /// The loss decision that terminated it, its certificate, and the exact
+    /// token the authority issued for it. L3: the trace is an unsigned local
+    /// row, so the token is what actually authenticates it — every reader
+    /// re-verifies the signature before the trace is allowed to mean anything.
     loss: crate::recovery::transition::LossRequest,
     loss_certificate: [u8; 32],
     loss_token_digest: [u8; 32],
+    loss_token: String,
     /// Branch B only: the certificate APPLY durably stored for `request`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     certificate: Option<[u8; 32]>,
@@ -1480,6 +1543,23 @@ impl Terminated {
 
     /// Does this trace account for exactly the format-2 completion archive
     /// `(2, id, token_digest, loss_certificate)`?
+    /// Re-verify the loss token under `trust` and bind it to the record.
+    /// Returns `false` for a trace that is well-formed but not signed by the
+    /// authority this node trusts.
+    pub(super) fn authentic(&self, trust: &crate::recovery::transition::TrustStore) -> bool {
+        self.loss_token.len() <= MAX_TOKEN
+            && crate::recovery::transition::verify_loss_historical(
+                &self.loss_token,
+                &trust.as_trust(),
+                &self.loss,
+            )
+            .is_ok_and(|certificate| {
+                certificate == self.loss_certificate
+                    && <[u8; 32]>::from(Sha256::digest(self.loss_token.as_bytes()))
+                        == self.loss_token_digest
+            })
+    }
+
     pub(super) fn accounts_for(&self, id: [u8; 32], token: [u8; 32], loss: [u8; 32]) -> bool {
         self.kind == FINISHED_FORWARD
             && self.request.id == id
@@ -1489,8 +1569,14 @@ impl Terminated {
     }
 }
 
-/// The singleton termination trace, bounded and validated before use.
-pub(super) fn terminated(c: &Connection) -> Result<Option<Terminated>> {
+/// The singleton termination trace, bounded, structurally validated and
+/// signature-anchored before use. A row that does not verify under `trust` is
+/// treated as absent: it can then never authenticate a format-2 archive or
+/// found a loss, and every consumer of an absent trace fails closed.
+pub(super) fn terminated(
+    c: &Connection,
+    trust: &crate::recovery::transition::TrustStore,
+) -> Result<Option<Terminated>> {
     let present: bool = c.query_row(
         "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name=?1)",
         [TERMINATED],
@@ -1506,9 +1592,12 @@ pub(super) fn terminated(c: &Connection) -> Result<Option<Terminated>> {
         |r| r.get(0),
     )?;
     ensure(shadows == 0, "maintenance termination trace shadowed")?;
-    let json = singleton_text(c, TERMINATED, "record", 256 * 1024)?;
+    let json = singleton_text(c, TERMINATED, "record", TERMINATED_LIMIT)?;
     let record: Terminated = serde_json::from_str(&json)?;
     record.validate()?;
+    if !record.authentic(trust) {
+        return Ok(None);
+    }
     Ok(Some(record))
 }
 
@@ -1528,7 +1617,7 @@ pub(crate) fn terminate_by_loss<A: ReplicatedSchema, P: crate::recovery::transit
         let committed = journal.fetch_loss(&trust.as_trust(), policy)?;
         let durable = handle
             .db
-            .with_connection(|c| Ok(terminated(c)))??
+            .with_connection(|c| Ok(terminated(c, trust)))??
             .ok_or("maintenance termination trace missing")?;
         return ensure(
             durable.loss() == committed.request()
@@ -1569,6 +1658,13 @@ pub(crate) fn terminate_by_loss<A: ReplicatedSchema, P: crate::recovery::transit
                     && loss.lost_generation == request.participants[1 - local].generation,
                 "loss participants are not this maintenance pair",
             )?;
+            // L5: certified maintenance is closed on a loss-recovered pair, so
+            // a loss founded on a successor can never terminate one. Say that
+            // instead of offering a branch that does not apply.
+            ensure(
+                loss.kind() != crate::recovery::transition::SourceKind::LossSuccessor,
+                "certified maintenance cannot be pending on a loss-recovered pair",
+            )?;
             // The branch follows the durable phase. A loss that names the other
             // branch is refused with the step the operator actually owes.
             let (kind, certificate, token_digest) = match (phase.as_str(), loss.kind()) {
@@ -1582,7 +1678,7 @@ pub(crate) fn terminate_by_loss<A: ReplicatedSchema, P: crate::recovery::transit
                     // The certificate APPLY committed for this very request is
                     // the loss's signed provenance; it is re-verified here.
                     let json: String = tx.query_row(
-                        "SELECT record FROM node_compaction_certificates \
+                        "SELECT record FROM main.node_compaction_certificates \
                          ORDER BY sequence DESC LIMIT 1",
                         [],
                         |r| r.get(0),
@@ -1614,6 +1710,10 @@ pub(crate) fn terminate_by_loss<A: ReplicatedSchema, P: crate::recovery::transit
                 }
                 _ => return Err("invalid pending termination transition".into()),
             };
+            ensure(
+                !committed.token().is_empty() && committed.token().len() <= MAX_TOKEN,
+                "loss token limit",
+            )?;
             let trace = Terminated {
                 format: 2,
                 kind: kind.into(),
@@ -1622,13 +1722,18 @@ pub(crate) fn terminate_by_loss<A: ReplicatedSchema, P: crate::recovery::transit
                 loss: loss.clone(),
                 loss_certificate: committed.certificate_id(),
                 loss_token_digest: committed.token_digest(),
+                loss_token: committed.token().to_owned(),
                 certificate,
                 token_digest,
             };
             trace.validate()?;
+            ensure(
+                trace.authentic(trust),
+                "maintenance termination trace unsigned",
+            )?;
             let json = serde_json::to_string(&trace)?;
             ensure(
-                json.len() <= 256 * 1024,
+                json.len() <= TERMINATED_LIMIT,
                 "maintenance termination trace too large",
             )?;
             let marker_json = singleton_text(
@@ -1653,7 +1758,7 @@ pub(crate) fn terminate_by_loss<A: ReplicatedSchema, P: crate::recovery::transit
                 // completed and that a signed loss authenticates it instead. No
                 // acknowledgement and no completion id is ever fabricated.
                 tx.execute_batch(
-                    "CREATE TABLE IF NOT EXISTS node_compaction_completion(\
+                    "CREATE TABLE IF NOT EXISTS main.node_compaction_completion(\
                      id INTEGER PRIMARY KEY CHECK(id=1),record TEXT NOT NULL)",
                 )?;
                 // The archive is the archive *of the current certificate*, and
@@ -1662,7 +1767,7 @@ pub(crate) fn terminate_by_loss<A: ReplicatedSchema, P: crate::recovery::transit
                 // would supersede it.
                 ensure(
                     tx.execute(
-                        "INSERT INTO node_compaction_completion VALUES(1,?1)
+                        "INSERT INTO main.node_compaction_completion VALUES(1,?1)
                          ON CONFLICT(id) DO UPDATE SET record=excluded.record",
                         [serde_json::to_string(&(
                             2u32,
@@ -1695,7 +1800,7 @@ pub(crate) fn terminate_by_loss<A: ReplicatedSchema, P: crate::recovery::transit
                 matches!(runtime, 3 | 4)
                     && runtime == marker.previous_runtime
                     && !pending_present(&tx)?
-                    && terminated(&tx)?.as_ref() == Some(&trace),
+                    && terminated(&tx, trust)?.as_ref() == Some(&trace),
                 "pending termination post-state mismatch",
             )?;
             // The restored node must pass the ordinary owner-level validation

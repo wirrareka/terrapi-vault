@@ -114,15 +114,19 @@ pub(super) fn verify_certified(
             "certified completion archive mismatch",
         )?;
         if record.0 == 2 {
-            let trace = pending::terminated(c)?.ok_or("certified completion archive mismatch")?;
-            ensure(
-                trace.accounts_for(record.1, record.2, record.3)
-                    && trace.loss().source_certificate == verified.certificate_id(),
-                "certified completion archive mismatch",
-            )?;
+            // The trace may be the live singleton or, once a later loss has
+            // retired the recovery it belonged to, one carried in the cycle
+            // history. Exactly one of them has to account for this archive.
+            let trace = loss::termination_traces(c, trust)?
+                .into_iter()
+                .find(|t| {
+                    t.accounts_for(record.1, record.2, record.3)
+                        && t.loss().source_certificate == verified.certificate_id()
+                })
+                .ok_or("certified completion archive mismatch")?;
             // Once the loss recovery has installed — or has itself been retired
             // into the cycle history — that record must name the same loss.
-            loss::require_terminating_loss(c, trace.loss())?;
+            loss::require_terminating_loss(c, trust, trace.loss())?;
         }
     }
     Ok(())
@@ -137,7 +141,7 @@ pub(super) fn loss_terminated_archive(c: &Connection) -> Result<bool> {
     }
     let archived: Option<String> = c
         .query_row(
-            "SELECT record FROM node_compaction_completion WHERE id=1",
+            "SELECT record FROM main.node_compaction_completion WHERE id=1",
             [],
             |r| r.get(0),
         )

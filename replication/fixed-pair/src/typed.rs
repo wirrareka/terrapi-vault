@@ -251,7 +251,7 @@ impl<A: ReplicatedSchema> Node<A> {
         // never present its pre-loss certificate as a live head again: the
         // source authority reports it superseded. It is checked as history,
         // and a live authority is required whatever the maintenance format is.
-        if maintenance::loss::state(c)?.is_some() {
+        if maintenance::loss::state(c, self.transition_trust.as_ref())?.is_some() {
             return maintenance::loss::verify_certified_history(
                 c,
                 self.certified_authority.as_deref(),
@@ -305,6 +305,7 @@ impl<A: ReplicatedSchema> Node<A> {
             c,
             &self.identity,
             self.role,
+            self.transition_trust.as_ref(),
             self.certified_authority.as_deref(),
         )?;
         self.verify_owner(c)?;

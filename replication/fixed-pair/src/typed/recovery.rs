@@ -358,7 +358,7 @@ impl<A: ReplicatedSchema> Node<A> {
     /// admission and the full loss admission. Membership and peer identity are
     /// derived from it only once the recovery is genuinely complete.
     fn loss_admitted(&self, c: &Connection) -> Result<Option<maintenance::loss::Installed>> {
-        let Some(record) = maintenance::loss::state(c)? else {
+        let Some(record) = maintenance::loss::state(c, self.transition_trust.as_ref())? else {
             return Ok(None);
         };
         self.recovery_admission(c)?;
@@ -366,6 +366,7 @@ impl<A: ReplicatedSchema> Node<A> {
             c,
             &self.identity,
             self.role,
+            self.transition_trust.as_ref(),
             self.certified_authority.as_deref(),
         )?;
         Ok(Some(record))

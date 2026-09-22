@@ -391,7 +391,13 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
                 // S10 replay protection: a successor membership this node has
                 // already un-installed under a signed abort is never installed
                 // again, whatever a rolled-back journal file claims.
-                require_not_aborted(&tx, successor, record.successor_certificate)?;
+                require_not_aborted(
+                    &tx,
+                    trust,
+                    &self.request,
+                    successor,
+                    record.successor_certificate,
+                )?;
                 ensure(
                     checkpoint::generation(&tx)? == self.request.survivor.generation,
                     "loss install generation mismatch",
@@ -414,7 +420,7 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
                             && current.successor_token_digest == self.request.source_token_digest,
                         "loss install conflict",
                     )?;
-                    retire_founding(&tx, &current, &self.request)?;
+                    retire_founding(&tx, trust, &current, &self.request)?;
                 }
                 tx.execute_batch(INSTALL_DDL)?;
                 ensure(
@@ -648,7 +654,7 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
                 ensure(
                     after.role == self.role
                         && after.manifest == self.manifest
-                        && state(&tx)?.is_none()
+                        && state(&tx, Some(trust))?.is_none()
                         && !table_exists(&tx, COMPLETION_TABLE)?
                         && owner_row(&tx)? == owner_expected,
                     "participant-loss un-install post-state mismatch",
@@ -691,7 +697,7 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
                     trust,
                     &self.request,
                 )?;
-                Ok((evidence, state(c)?))
+                Ok((evidence, state(c, Some(trust))?))
             })())
         })??;
         ensure(
@@ -850,17 +856,29 @@ pub(crate) struct RetiredLoss {
     installed: Installed,
     completion: String,
     next: transition::LossRequest,
+    /// L1: the termination trace this recovery consumed, if the loss that
+    /// founded it also ended an in-flight certified maintenance. Moved here by
+    /// `retire_founding` so a survivor never carries more than one live trace.
+    /// Skipped when absent, so rows written before this existed keep their
+    /// bytes and their digests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminated: Option<super::pending::Terminated>,
 }
 
 /// Walk the append-only cycle chain, verifying the hash link and every stored
 /// receipt. Bounded before any row is decoded.
-fn visit_cycles(c: &Connection, mut visit: impl FnMut(&RetiredLoss) -> Result<()>) -> Result<()> {
+fn visit_cycles(
+    c: &Connection,
+    trust: Option<&transition::TrustStore>,
+    mut visit: impl FnMut(&RetiredLoss) -> Result<()>,
+) -> Result<()> {
     if !table_exists(c, CYCLES_TABLE)? {
         return Ok(());
     }
+    // L7: the digest column is inside the cap too, before anything is decoded.
     let (rows, longest): (u64, u64) = c.query_row(
-        "SELECT count(*),coalesce(max(length(CAST(record AS BLOB))),0) \
-         FROM main.recovery_loss_cycles",
+        "SELECT count(*),coalesce(max(length(CAST(record AS BLOB))\
+         +length(CAST(digest AS BLOB))),0) FROM main.recovery_loss_cycles",
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -910,6 +928,31 @@ fn visit_cycles(c: &Connection, mut visit: impl FnMut(&RetiredLoss) -> Result<()
                 && receipt.4 != [0; 32],
             "participant-loss retired completion mismatch",
         )?;
+        // L3: wherever a trust store is in scope the retired evidence is
+        // re-verified by signature, not merely by the digests the row states.
+        if let Some(trust) = trust {
+            let token = record
+                .installed
+                .successor_token
+                .as_deref()
+                .ok_or("participant-loss retired token missing")?;
+            ensure(
+                token.len() <= MAX_TOKEN
+                    && transition::verify_successor_historical(
+                        token,
+                        &trust.as_trust(),
+                        &record.installed.successor,
+                    )
+                    .is_ok_and(|id| id == record.installed.successor_certificate),
+                "participant-loss retired token mismatch",
+            )?;
+            ensure(
+                record.terminated.as_ref().is_none_or(|t| {
+                    t.authentic(trust) && same_attempt(t.loss(), &record.installed.loss)
+                }),
+                "participant-loss retired termination mismatch",
+            )?;
+        }
         visit(&record)?;
         parent = Some(stored);
         previous = Some(revision);
@@ -937,9 +980,12 @@ fn retired_of(record: &Installed) -> [[u8; 32]; 8] {
 /// Every member, generation and membership this node has already retired —
 /// through a completed recovery *or* through an aborted successor. A
 /// replacement may never reuse any of them, whatever the journal says.
-fn retired_identities(c: &Connection) -> Result<Vec<[u8; 32]>> {
+fn retired_identities(
+    c: &Connection,
+    trust: Option<&transition::TrustStore>,
+) -> Result<Vec<[u8; 32]>> {
     let mut retired = Vec::new();
-    visit_cycles(c, |record| {
+    visit_cycles(c, trust, |record| {
         retired.extend(retired_of(&record.installed));
         Ok(())
     })?;
@@ -990,9 +1036,10 @@ fn visit_aborted(
     if !table_exists(c, ABORTED_TABLE)? {
         return Ok(());
     }
+    // L7: the digest column is inside the cap too, before anything is decoded.
     let (rows, longest): (u64, u64) = c.query_row(
-        "SELECT count(*),coalesce(max(length(CAST(record AS BLOB))),0) \
-         FROM main.recovery_loss_aborted",
+        "SELECT count(*),coalesce(max(length(CAST(record AS BLOB))\
+         +length(CAST(digest AS BLOB))),0) FROM main.recovery_loss_aborted",
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -1046,22 +1093,106 @@ fn visit_aborted(
 /// pending tables are still there the operator is told which step it owes, and
 /// an `abandoned_request` on a node that never had that request is refused:
 /// the field can never be padding.
+/// Every termination trace this file still carries: the live singleton, plus
+/// the ones consumed into the retired cycle history. A format-2 completion
+/// archive outlives the recovery that wrote it, so after a later loss retires
+/// that recovery the trace that accounts for the archive lives in the row.
+pub(super) fn termination_traces(
+    c: &Connection,
+    trust: &transition::TrustStore,
+) -> Result<Vec<super::pending::Terminated>> {
+    let mut traces = Vec::new();
+    if let Some(trace) = super::pending::terminated(c, trust)? {
+        traces.push(trace);
+    }
+    visit_cycles(c, Some(trust), |row| {
+        if let Some(trace) = &row.terminated {
+            traces.push(trace.clone());
+        }
+        Ok(())
+    })?;
+    Ok(traces)
+}
+
+/// L1. A spent termination trace must never wedge a later, unrelated loss on
+/// the same survivor. A trace is acceptable when it belongs to the loss being
+/// validated, or to a loss this file already knows about — the active install
+/// record's loss, or any loss named by the retired cycle history. Anything
+/// else is a trace this node cannot account for and fails closed.
 #[cfg(any(test, feature = "experimental-recovery"))]
-fn require_maintenance_terminated(c: &Connection, loss: &transition::LossRequest) -> Result<()> {
+fn require_known_termination(
+    c: &Connection,
+    trust: &transition::TrustStore,
+    trace: Option<&super::pending::Terminated>,
+    loss: &transition::LossRequest,
+) -> Result<()> {
+    let Some(trace) = trace else {
+        return Ok(());
+    };
+    if same_attempt(trace.loss(), loss) {
+        return Ok(());
+    }
+    ensure(
+        matches_known_loss(c, trust, trace.loss())?,
+        "loss survivor has an unrelated terminated maintenance",
+    )
+}
+
+/// Is `loss` one this file already knows about — the active install record's
+/// loss, or one named by the retired cycle history? Where the predecessor's
+/// own certificate binding is on this file (every `Installed` carries it), a
+/// superseding claim must name it exactly (L8); a retired row's `next` has no
+/// such binding here, so it falls back to the lineage rule.
+#[cfg(any(test, feature = "experimental-recovery"))]
+fn matches_known_loss(
+    c: &Connection,
+    trust: &transition::TrustStore,
+    loss: &transition::LossRequest,
+) -> Result<bool> {
+    let mut known = false;
+    if let Some((_, record)) = read_install(c)? {
+        known |= supersedes_exactly(
+            &record.loss,
+            record.loss_certificate,
+            record.loss_token_digest,
+            loss,
+        );
+    }
+    visit_cycles(c, Some(trust), |row| {
+        known |= supersedes_exactly(
+            &row.installed.loss,
+            row.installed.loss_certificate,
+            row.installed.loss_token_digest,
+            loss,
+        ) || same_attempt(&row.next, loss);
+        Ok(())
+    })?;
+    Ok(known)
+}
+
+#[cfg(any(test, feature = "experimental-recovery"))]
+fn require_maintenance_terminated(
+    c: &Connection,
+    trust: &transition::TrustStore,
+    loss: &transition::LossRequest,
+) -> Result<()> {
     let pending = table_exists(c, "node_pending_certified_maintenance")?
         || table_exists(c, "node_pending_certified_progress")?;
-    let trace = super::pending::terminated(c)?;
+    let trace = super::pending::terminated(c, trust)?;
+    // L5: certified maintenance is closed on a loss-recovered pair
+    // (`prepare_pair` runs `require_no_loss_recovery`), so a loss founded on a
+    // successor can never meet pending maintenance. Say that, rather than
+    // offering a termination step that does not exist for it.
+    if pending && loss.kind() == transition::SourceKind::LossSuccessor {
+        return Err("certified maintenance cannot be pending on a loss-recovered pair".into());
+    }
     let Some(abandoned) = loss.abandoned_request else {
-        // No abandonment claimed: the old rule, unchanged. A node with pending
-        // maintenance is refused outright, and a stale trace from an earlier,
-        // unrelated termination may not stand in for this loss.
+        // No abandonment claimed. A node with pending maintenance is refused
+        // outright; a trace is acceptable only if it belongs to this loss or
+        // to one this file already knows about, which is exactly what stops an
+        // unrelated later loss from being wedged by a spent trace (L1).
         ensure(!pending, "loss survivor has pending certified maintenance")?;
-        return ensure(
-            trace
-                .as_ref()
-                .is_none_or(|t| same_attempt(t.loss(), loss) || t.loss() == loss),
-            "loss survivor has an unrelated terminated maintenance",
-        );
+        return require_known_termination(c, trust, trace.as_ref(), loss);
     };
     if pending {
         return Err(match loss.kind() {
@@ -1097,18 +1228,22 @@ fn require_maintenance_terminated(c: &Connection, loss: &transition::LossRequest
 /// export-only and ordinary admission is shut.
 pub(super) fn require_terminating_loss(
     c: &Connection,
+    trust: &transition::TrustStore,
     loss: &transition::LossRequest,
 ) -> Result<()> {
-    let mut known = Vec::new();
-    if let Some((_, record)) = read_install(c)? {
-        known.push(record.loss);
-    }
-    visit_cycles(c, |row| {
-        known.push(row.installed.loss.clone());
-        Ok(())
-    })?;
+    // L3: no `known.is_empty()` escape any more. The trace itself is
+    // signature-anchored, so the only remaining duty is that a loss record or
+    // a retired row, once either exists, names the same loss.
+    let present = read_install(c)?.is_some() || {
+        let mut any = false;
+        visit_cycles(c, Some(trust), |_| {
+            any = true;
+            Ok(())
+        })?;
+        any
+    };
     ensure(
-        known.is_empty() || known.iter().any(|l| same_attempt(loss, l)),
+        !present || matches_known_loss(c, trust, loss)?,
         "participant-loss termination record mismatch",
     )
 }
@@ -1138,8 +1273,30 @@ fn same_lineage(previous: &transition::LossRequest, next: &transition::LossReque
 }
 
 /// True when `next` is `previous` itself or a loss that supersedes it.
+/// True when `next` is `previous` itself or a loss that supersedes it.
+///
+/// L8: where the predecessor's own certificate binding is available on this
+/// file the supersession must name it, so "same lineage" can never be
+/// stretched across two unrelated attempts. `fencing_ref` is deliberately NOT
+/// part of `same_lineage`: a superseding loss fences a *new* replacement and
+/// legitimately carries a new fencing reference.
 fn same_attempt(previous: &transition::LossRequest, next: &transition::LossRequest) -> bool {
     previous == next || (next.supersedes.is_some() && same_lineage(previous, next))
+}
+
+/// The same relation, with the predecessor's certificate binding available.
+fn supersedes_exactly(
+    previous: &transition::LossRequest,
+    previous_certificate: [u8; 32],
+    previous_token_digest: [u8; 32],
+    next: &transition::LossRequest,
+) -> bool {
+    previous == next
+        || next.supersedes.as_ref().is_some_and(|s| {
+            s.loss_certificate == previous_certificate
+                && s.loss_token_digest == previous_token_digest
+                && same_lineage(previous, next)
+        })
 }
 
 /// A successor membership that was un-installed under a signed abort can never
@@ -1147,6 +1304,8 @@ fn same_attempt(previous: &transition::LossRequest, next: &transition::LossReque
 #[cfg(any(test, feature = "experimental-recovery"))]
 fn require_not_aborted(
     c: &Connection,
+    trust: &transition::TrustStore,
+    loss: &transition::LossRequest,
     successor: &transition::LossSuccessorRequest,
     certificate: [u8; 32],
 ) -> Result<()> {
@@ -1157,14 +1316,35 @@ fn require_not_aborted(
         conflict |= row.successor_id == successor.id || row.successor_certificate == certificate;
         Ok(())
     })?;
-    ensure(!conflict, "aborted loss successor cannot be installed")
+    ensure(!conflict, "aborted loss successor cannot be installed")?;
+    // L2. Naming a different successor is not enough to bring a fenced
+    // replacement back: every identity this file has burnt — through a
+    // completed recovery or through an abort — is refused here, on both nodes,
+    // whatever a rolled-back journal file claims.
+    let burnt = retired_identities(c, Some(trust))?;
+    let replacement = successor.replacement()?;
+    ensure(
+        ![
+            replacement.member,
+            replacement.generation,
+            loss.replacement_membership,
+            successor.membership,
+        ]
+        .iter()
+        .any(|id| burnt.contains(id)),
+        "participant-loss identity reuse",
+    )
 }
 
 /// The tombstone that authorises `loss` to supersede an earlier attempt, read
 /// from this node's own append-only history. The authority's journal ran the
 /// same rule set; this file is a different trust domain and runs it again.
 #[cfg(any(test, feature = "experimental-recovery"))]
-fn require_supersession(c: &Connection, loss: &transition::LossRequest) -> Result<()> {
+fn require_supersession(
+    c: &Connection,
+    trust: &transition::TrustStore,
+    loss: &transition::LossRequest,
+) -> Result<()> {
     let Some(supersedes) = loss.supersedes.as_ref() else {
         return Ok(());
     };
@@ -1193,7 +1373,7 @@ fn require_supersession(c: &Connection, loss: &transition::LossRequest) -> Resul
     )?;
     // No identity this node has already burnt — through a completed recovery
     // or through an abort — may ever come back as the new replacement.
-    let already = retired_identities(c)?;
+    let already = retired_identities(c, Some(trust))?;
     ensure(
         ![
             loss.replacement_member,
@@ -1526,7 +1706,7 @@ pub fn install_replacement<A: ReplicatedSchema, P: transition::LossPolicy>(
         // never installed again. A bootstrap replacement has no tombstones of
         // its own, so in practice the journal's own terminal state stops it
         // first; this is the local half of the same rule.
-        require_not_aborted(&tx, request, record.successor_certificate)?;
+        require_not_aborted(&tx, trust, parent, request, record.successor_certificate)?;
         capacity::verify_schema(&tx)?;
         capacity::verify_accounting(&tx)?;
         let base = checkpoint::base_for::<SchemaId>(&tx)?.ok_or("loss replacement base missing")?;
@@ -1755,13 +1935,14 @@ pub fn validate_successor_installation<A: ReplicatedSchema>(
 #[cfg(any(test, feature = "experimental-recovery"))]
 fn retire_founding(
     c: &Connection,
+    trust: &transition::TrustStore,
     founding: &Installed,
     next: &transition::LossRequest,
 ) -> Result<()> {
     let completion = read_completion(c)?.ok_or("loss founding recovery incomplete")?;
     let mut parent = None;
     let mut retired = Vec::new();
-    visit_cycles(c, |record| {
+    visit_cycles(c, Some(trust), |record| {
         parent = Some(hash(record)?);
         retired.push(record.installed.loss.revision);
         Ok(())
@@ -1776,7 +1957,7 @@ fn retire_founding(
     // they are not in the cycle table yet — every one of them has to be in the
     // set, or the very first retirement would let the member this pair just
     // lost walk back in as the replacement.
-    let mut already = retired_identities(c)?;
+    let mut already = retired_identities(c, Some(trust))?;
     already.extend(retired_of(founding));
     ensure(
         ![
@@ -1788,11 +1969,16 @@ fn retire_founding(
         .any(|id| already.contains(id)),
         "participant-loss identity reuse",
     )?;
+    // L1: the termination trace is consumed here. It moves into the row that
+    // records the recovery it belonged to and the singleton goes, so a later,
+    // unrelated loss never meets a trace it cannot account for.
+    let terminated = super::pending::terminated(c, trust)?;
     let record = RetiredLoss {
         parent,
         installed: founding.clone(),
         completion,
         next: next.clone(),
+        terminated,
     };
     let json = serde_json::to_string(&record)?;
     ensure(json.len() <= 256 * 1024, "participant-loss cycle limit")?;
@@ -1809,6 +1995,9 @@ fn retire_founding(
         "participant-loss retirement failed",
     )?;
     c.execute_batch("DROP TABLE main.recovery_loss_completion")?;
+    if record.terminated.is_some() {
+        c.execute_batch("DROP TABLE main.node_maintenance_terminated")?;
+    }
     Ok(())
 }
 
@@ -1912,7 +2101,7 @@ fn survivor_founding(
         (founding, receipt)
     } else {
         let mut last: Option<RetiredLoss> = None;
-        visit_cycles(c, |row| {
+        visit_cycles(c, Some(trust), |row| {
             last = Some(row.clone());
             Ok(())
         })?;
@@ -2006,7 +2195,7 @@ pub(super) fn validate<A: ReplicatedSchema>(
     // Ahead of everything else: a node still inside a certified maintenance is
     // in the pending runtime, which no shape below can even describe, and the
     // operator needs to be told which termination step it owes (S11).
-    require_maintenance_terminated(c, loss)?;
+    require_maintenance_terminated(c, trust, loss)?;
     let history = history_format(c, runtime[0].0)?;
     recovery::verify_history(c, history)?;
     verify_certified(c, Some(trust))?;
@@ -2024,7 +2213,7 @@ pub(super) fn validate<A: ReplicatedSchema>(
     // A superseding decision needs this node's own tombstone for the attempt
     // it replaces: the authority's journal cannot read this file, and this
     // file cannot read the abort's journal, so both check independently.
-    require_supersession(c, loss)?;
+    require_supersession(c, trust, loss)?;
     // I1. The survivor index — and therefore the local role — is derived only
     // from the signed loss decision and the document that founded this pair:
     // the certified compaction for an ordinary pair, or the completed loss
@@ -2078,6 +2267,10 @@ pub(super) fn validate<A: ReplicatedSchema>(
                 local.old_base == loss.survivor.old_base && local.target == loss.source_cut,
                 "loss survivor evidence mismatch",
             )?;
+            // Certified compaction is closed for good on a loss-recovered
+            // pair (`plan_compaction` runs `require_no_loss_recovery`), so the
+            // base can never legitimately move past the founding cut. It is
+            // still refused rather than assumed.
             ensure(
                 base.sequence <= loss.source_cut.sequence,
                 "loss survivor base past the founding cut",
@@ -2144,7 +2337,10 @@ fn read_completion(c: &Connection) -> Result<Option<String>> {
 /// The durable participant-loss state of a node, with the orphan check both
 /// ways. `None` means this is an ordinary node and every caller must behave
 /// exactly as it did before participant-loss recovery existed.
-pub(crate) fn state(c: &Connection) -> Result<Option<Installed>> {
+pub(crate) fn state(
+    c: &Connection,
+    trust: Option<&transition::TrustStore>,
+) -> Result<Option<Installed>> {
     // A view, trigger or index carrying a participant-loss table name is never
     // acceptable evidence, whatever it would return.
     let shadows: u64 = c.query_row(
@@ -2164,7 +2360,7 @@ pub(crate) fn state(c: &Connection) -> Result<Option<Installed>> {
     // Every loss this file has ever been installed by, collected in the single
     // verified walk of the cycle chain.
     let mut known: Vec<transition::LossRequest> = Vec::new();
-    visit_cycles(c, |row| {
+    visit_cycles(c, trust, |row| {
         retired += 1;
         last_next = Some(row.next.clone());
         known.push(row.installed.loss.clone());
@@ -2322,9 +2518,10 @@ pub(crate) fn admission(
     c: &Connection,
     identity: &Identity<SchemaId>,
     role: Role,
+    trust: Option<&transition::TrustStore>,
     authority: Option<&dyn crate::typed::CertifiedAuthority>,
 ) -> Result<()> {
-    let Some(record) = state(c)? else {
+    let Some(record) = state(c, trust)? else {
         return Ok(());
     };
     validate_installed(c, identity, role, &record)?;
@@ -2344,7 +2541,7 @@ pub(crate) fn admission(
 /// Closing gate for entry points this release does not support after a
 /// participant-loss recovery. It only ever refuses.
 pub(crate) fn require_no_loss_recovery(c: &Connection) -> Result<()> {
-    ensure(state(c)?.is_none(), RETIRED)
+    ensure(state(c, None)?.is_none(), RETIRED)
 }
 
 #[cfg(any(test, feature = "experimental-recovery"))]
@@ -2358,7 +2555,8 @@ pub fn record_completion<A: ReplicatedSchema>(node: &Node<A>) -> Result<()> {
     )?;
     node.connection(|c| {
         let tx = Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
-        let record = state(&tx)?.ok_or("participant-loss recovery is not installed")?;
+        let record = state(&tx, node.transition_trust.as_ref())?
+            .ok_or("participant-loss recovery is not installed")?;
         node.verify_owner_as(&tx, record.installed_role)?;
         ensure(
             node.role == record.installed_role,
@@ -2403,7 +2601,13 @@ pub fn record_completion<A: ReplicatedSchema>(node: &Node<A>) -> Result<()> {
         )?;
         // The receipt must actually open this node against the live authority,
         // inside the same transaction that wrote it.
-        admission(&tx, &node.identity, node.role, Some(authority))?;
+        admission(
+            &tx,
+            &node.identity,
+            node.role,
+            node.transition_trust.as_ref(),
+            Some(authority),
+        )?;
         tx.commit()?;
         Ok(())
     })
@@ -2421,7 +2625,8 @@ fn replacement_installed<A: ReplicatedSchema>(
         "participant-loss evidence requires transition trust",
     )?;
     node.connection(|c| {
-        let record = state(c)?.ok_or("participant-loss replacement install missing")?;
+        let record = state(c, node.transition_trust.as_ref())?
+            .ok_or("participant-loss replacement install missing")?;
         ensure(
             record.source_scope == *source_scope,
             "participant-loss source scope mismatch",
@@ -2481,7 +2686,8 @@ impl<A: ReplicatedSchema> LossSurvivorHandle<A> {
                     evidence.role == self.role && evidence.manifest == self.manifest,
                     "loss survivor evidence changed",
                 )?;
-                let record = state(c)?.ok_or("participant-loss survivor install missing")?;
+                let record =
+                    state(c, Some(trust))?.ok_or("participant-loss survivor install missing")?;
                 ensure(
                     record.source_scope == *source_scope,
                     "participant-loss source scope mismatch",
@@ -2638,4 +2844,257 @@ pub fn complete_successor<A: ReplicatedSchema, P: transition::LossPolicy>(
         completed.request() == successor && completed.completion() == completion,
         "participant-loss completion conflict",
     )
+}
+
+// ---------------------------------------------------------------------------
+// L4: production survivor evidence for the participant-loss policy hooks.
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "experimental-recovery"))]
+/// Live, read-only survivor evidence for the three hooks the authority's
+/// journal cannot check for itself: whether an in-flight certified maintenance
+/// may be rolled back, whether it may be finished forward, and whether the
+/// survivor really applied the decided transition a `Decided` loss claims.
+///
+/// **The node lock is deliberately NOT taken.** The authority decides the loss
+/// while the operator may still hold the survivor's own exclusive handle, so
+/// taking it here would refuse every legitimate decision; `peek_pending` takes
+/// it because it is an operator-facing inspection, not a hook. Each call opens
+/// the file read-only for its own duration and reads a consistent SQLite
+/// snapshot of durable state. That is point-in-time evidence, exactly like
+/// `Policy::applied` has always been; what binds irreversibly is the survivor's
+/// own transaction, which re-checks all of this on its own connection.
+///
+/// Every other decision is delegated to the wrapped external policy: proving
+/// authority continuity and fencing is not a node's job.
+pub struct SurvivorEvidence<'a, A: ReplicatedSchema, P: transition::LossPolicy> {
+    path: PathBuf,
+    identity: Identity<SchemaId>,
+    passphrase: String,
+    adapter: A,
+    /// Digest of the pristine adapter view, so the survivor's checkpoint can be
+    /// recomputed here exactly as the node itself recomputes it.
+    initial: String,
+    trust: transition::TrustStore,
+    policy: &'a P,
+}
+
+#[cfg(any(test, feature = "experimental-recovery"))]
+impl<'a, A: ReplicatedSchema, P: transition::LossPolicy> SurvivorEvidence<'a, A, P> {
+    pub fn new(
+        path: impl AsRef<Path>,
+        identity: Identity<SchemaId>,
+        passphrase: &str,
+        adapter: A,
+        trust: transition::TrustStore,
+        policy: &'a P,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let path = path
+            .parent()
+            .ok_or("missing parent")?
+            .canonicalize()?
+            .join(path.file_name().ok_or("missing filename")?);
+        ensure(path.is_file() && !path.is_symlink(), "loss survivor absent")?;
+        let scratch = Connection::open_in_memory()?;
+        schema::initialize(&scratch, &adapter)?;
+        let initial = hash(&adapter.view(&scratch)?)?;
+        Ok(Self {
+            path,
+            identity,
+            passphrase: passphrase.to_owned(),
+            adapter,
+            initial,
+            trust,
+            policy,
+        })
+    }
+
+    fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let db = Vesta::open_read_only_with_passphrase(&self.path, &self.passphrase)?;
+        db.with_connection(|c| {
+            Ok((|| -> Result<T> {
+                c.pragma_update(None, "query_only", true)?;
+                f(c)
+            })())
+        })?
+    }
+
+    /// The pending progress bound to exactly the abandoned request.
+    fn abandoned(
+        &self,
+        c: &Connection,
+        abandoned: &[u8; 32],
+    ) -> Result<(String, transition::Request)> {
+        let (_, phase, request, _) = super::pending::progress_of(c, &self.identity)?
+            .ok_or("survivor has no pending certified maintenance")?;
+        ensure(
+            id(&request)? == *abandoned,
+            "survivor pending request mismatch",
+        )?;
+        Ok((phase, request))
+    }
+
+    /// The certificate APPLY durably stored for `request`, verified.
+    fn applied_certificate(
+        &self,
+        c: &Connection,
+        request: &transition::Request,
+    ) -> Result<([u8; 32], [u8; 32])> {
+        let json: String = c.query_row(
+            "SELECT record FROM main.node_compaction_certificates ORDER BY sequence DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure(json.len() <= 256 * 1024, "certificate record limit")?;
+        let stored: certified::CertificateRecord = serde_json::from_str(&json)?;
+        ensure(stored.request == *request, "survivor certificate mismatch")?;
+        let verified =
+            transition::verify_historical(&stored.token, &self.trust.as_trust(), &stored.request)?;
+        Ok((verified.certificate_id(), verified.token_digest()))
+    }
+
+    /// Branch B's applied evidence, shared by both hooks that need it.
+    fn finish_forward_evidence(&self, loss: &transition::LossRequest) -> Result<()> {
+        let abandoned = loss
+            .abandoned_request
+            .ok_or("finish forward requires an abandoned request")?;
+        self.read(|c| {
+            let (phase, request) = self.abandoned(c, &abandoned)?;
+            ensure(phase == "applied", "survivor has not applied the decision")?;
+            let (certificate, token_digest) = self.applied_certificate(c, &request)?;
+            ensure(
+                certificate == loss.source_certificate
+                    && token_digest == loss.source_token_digest
+                    && loss.source_cut == request.participants[0].target,
+                "survivor certificate is not the loss source",
+            )?;
+            // APPLY also writes the lineage; without it nothing was applied.
+            certified::verify_metadata(c, 3, Some(&self.trust))?
+                .ok_or("survivor certified lineage missing")?;
+            Ok(())
+        })
+    }
+}
+
+#[cfg(any(test, feature = "experimental-recovery"))]
+impl<A: ReplicatedSchema, P: transition::LossPolicy> transition::LossPolicy
+    for SurvivorEvidence<'_, A, P>
+{
+    fn continuity_and_fencing(
+        &self,
+        scope: &transition::JournalScope,
+        request: &transition::LossRequest,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        self.policy.continuity_and_fencing(scope, request)
+    }
+    fn loss_successor_continuity(
+        &self,
+        scope: &transition::JournalScope,
+        request: &transition::LossSuccessorRequest,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        self.policy.loss_successor_continuity(scope, request)
+    }
+    fn loss_successor_applied(
+        &self,
+        source_scope: &transition::JournalScope,
+        loss: &transition::LossRequest,
+        successor: &transition::LossSuccessorRequest,
+        participant: &transition::Participant,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        self.policy
+            .loss_successor_applied(source_scope, loss, successor, participant)
+    }
+
+    /// Branch A: nothing may have been applied, and the survivor must really
+    /// be holding exactly the request the loss abandons.
+    fn maintenance_rollback_authorized(
+        &self,
+        _scope: &transition::JournalScope,
+        loss: &transition::LossRequest,
+        abandoned: &[u8; 32],
+    ) -> terrapi_vesta_recovery::Result<()> {
+        ensure(
+            loss.abandoned_request == Some(*abandoned),
+            "rollback evidence is not for this loss",
+        )?;
+        self.read(|c| {
+            let (phase, request) = self.abandoned(c, abandoned)?;
+            ensure(
+                matches!(phase.as_str(), "prepared" | "decided"),
+                "survivor has already applied the decision",
+            )?;
+            // Nothing APPLY writes may exist for this request yet.
+            let stored: Option<String> = c
+                .query_row(
+                    "SELECT record FROM main.node_compaction_certificates \
+                     ORDER BY sequence DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(json) = stored {
+                ensure(json.len() <= 256 * 1024, "certificate record limit")?;
+                let record: certified::CertificateRecord = serde_json::from_str(&json)?;
+                ensure(
+                    record.request != request,
+                    "survivor has already applied the decision",
+                )?;
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string().into())
+    }
+
+    /// Branch B: APPLY committed, and the certificate it stored is exactly the
+    /// one the loss carries as its provenance.
+    fn maintenance_finish_forward_authorized(
+        &self,
+        _scope: &transition::JournalScope,
+        loss: &transition::LossRequest,
+        abandoned: &[u8; 32],
+    ) -> terrapi_vesta_recovery::Result<()> {
+        ensure(
+            loss.abandoned_request == Some(*abandoned),
+            "finish forward evidence is not for this loss",
+        )?;
+        self.finish_forward_evidence(loss)
+            .map_err(|e| e.to_string().into())
+    }
+
+    /// Under `Decided` this hook carries branch B's whole weight: the decided
+    /// certificate is never completed and nothing else will ever check it.
+    fn survivor_prepared(
+        &self,
+        scope: &transition::JournalScope,
+        loss: &transition::LossRequest,
+    ) -> terrapi_vesta_recovery::Result<()> {
+        if loss.kind() != transition::SourceKind::Decided {
+            return self.policy.survivor_prepared(scope, loss);
+        }
+        self.finish_forward_evidence(loss)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+        // The survivor fields the loss states must be this file's own: its
+        // admission generation, its current cut and its frozen publication.
+        self.read(|c| {
+            let current =
+                checkpoint::current_for(c, &self.adapter, &self.identity, &self.initial, true)?.0;
+            let manifest_json: String = c.query_row(
+                "SELECT manifest FROM main.node_publication WHERE id=1",
+                [],
+                |r| r.get(0),
+            )?;
+            ensure(manifest_json.len() <= 8192, "loss manifest limit")?;
+            let manifest = snapshot::Manifest::decode(manifest_json.as_bytes())?;
+            ensure(
+                checkpoint::generation(c)? == loss.survivor.generation
+                    && current.sequence == loss.survivor_cut.sequence
+                    && id(&current)? == loss.survivor_cut.digest
+                    && current == manifest.checkpoint
+                    && id(&manifest)? == loss.survivor_publication,
+                "survivor state is not the one the loss states",
+            )
+        })
+        .map_err(|e| e.to_string().into())
+    }
 }
