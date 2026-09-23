@@ -2,3 +2,10 @@
 resolver = "2"
 members = ["recovery", "fixed-pair"]
 
+
+# Tests open encrypted nodes constantly (Argon2id KDF + SQLCipher crypto). Unoptimized
+# dependencies made the suite ~11x slower (one loss test: 38 s -> 3.3 s), and CI's
+# replication job hit its 45 min timeout. Workspace crates stay unoptimized (debug
+# assertions and overflow checks unchanged).
+[profile.dev.package."*"]
+opt-level = 2
