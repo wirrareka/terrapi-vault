@@ -212,6 +212,9 @@ jobs:
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
+      - uses: ./.github/actions/ui-kit
+        with:
+          ssh-key: ${{ secrets.UI_KIT_DEPLOY_KEY }}
       - name: Build the SPA (web/dist)
         run: |
           corepack enable
@@ -269,6 +272,9 @@ jobs:
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
+      - uses: ./.github/actions/ui-kit
+        with:
+          ssh-key: ${{ secrets.UI_KIT_DEPLOY_KEY }}
       - name: Build the SPA (web/dist) on the Linux side (the fbsd VM has no node)
         run: |
           corepack enable
@@ -287,6 +293,7 @@ jobs:
             --exclude '/services/target' \
             --exclude '/.git' \
             --exclude '/web/node_modules' \
+            --exclude '/.ui-kit' \
             -e ssh \
             ./ runner-fbsd:build/terrapi-vesta/
       - name: Build + package on the FreeBSD VM

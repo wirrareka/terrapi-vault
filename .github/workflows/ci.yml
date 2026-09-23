@@ -115,6 +115,9 @@ jobs:
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
+      - uses: ./.github/actions/ui-kit
+        with:
+          ssh-key: ${{ secrets.UI_KIT_DEPLOY_KEY }}
       - name: Install (pnpm pinned via web/package.json packageManager)
         run: |
           corepack enable

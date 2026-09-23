@@ -1,0 +1,29 @@
+name: Check out and build @terrapi/ui
+description: >
+  web/package.json depends on "@terrapi/ui": "file:../../terrapi-ui-web" — a sibling of
+  the repo root. Checks out the private kit repo (read-only deploy key) into the
+  workspace, links it to that sibling path and builds its dist/ (gitignored in the kit;
+  consumers import from dist/). Run after actions/setup-node, before `pnpm --dir web install`.
+inputs:
+  ssh-key:
+    description: Read-only deploy key for wirrareka/terrapi-ui-web (secret UI_KIT_DEPLOY_KEY).
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      with:
+        repository: wirrareka/terrapi-ui-web
+        ssh-key: ${{ inputs.ssh-key }}
+        persist-credentials: false
+        path: .ui-kit
+    - name: Link to ../terrapi-ui-web and build dist/
+      shell: bash
+      run: |
+        set -euo pipefail
+        kit="$(dirname "$GITHUB_WORKSPACE")/terrapi-ui-web"
+        # Self-hosted runners keep the parent dir between runs: replace any stale link/copy.
+        rm -rf "$kit"
+        ln -s "$GITHUB_WORKSPACE/.ui-kit" "$kit"
+        npm --prefix .ui-kit ci
+        npm --prefix .ui-kit run build

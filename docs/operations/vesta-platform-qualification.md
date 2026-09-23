@@ -45,8 +45,8 @@ Notes:
    dropping it, under heavy parallel load; it then passed 3/3 alone, single-threaded and
    5/5 full parallel runs. Unexplained; keep watching on the real FreeBSD CI host.
 
-**Open.** Run the same suites on the amd64 FreeBSD CI VM (`runner-fbsd`) with the pinned
-toolchain; two-server fault test (network isolation, hard crash, stale node return).
+**Open.** Run the same suites on the amd64 FreeBSD CI VM (`runner-fbsd`). It has pkg
+rustc 1.94.0 and no rustup, so `freebsd-build.yml` uses that toolchain, not a pinned one; two-server fault test (network isolation, hard crash, stale node return).
 
 ## Linux
 

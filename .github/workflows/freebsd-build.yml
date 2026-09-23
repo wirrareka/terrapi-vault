@@ -78,12 +78,25 @@ jobs:
             set -eu
             export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:"$HOME/.cargo/bin"
             cd "$HOME/build/terrapi-vesta/replication"
+            # rusqlite `session` (fixed-pair) runs bindgen, which needs libclang.so;
+            # base clang does not ship it — the VM needs an LLVM pkg (e.g. llvm19).
+            for d in /usr/local/llvm*/lib; do
+              if [ -e "$d/libclang.so" ]; then LIBCLANG_PATH="$d"; fi
+            done
+            if [ -z "${LIBCLANG_PATH:-}" ]; then
+              echo "no libclang.so under /usr/local/llvm*/lib: pkg install llvm19 on the VM" >&2
+              exit 1
+            fi
+            export LIBCLANG_PATH
             uname -a
-            rustc +1.89.0 -Vv
-            cargo +1.89.0 -V
-            cargo +1.89.0 test --locked -p terrapi-vesta-replication --test backup_restore_qualification
+            # The VM has rust from FreeBSD packages, not rustup, so no `+1.89.0`
+            # toolchain override (and rust-toolchain.toml is ignored). The pkg
+            # toolchain is >= the 1.89 MSRV, which the Linux ci job pins and enforces.
+            rustc -Vv
+            cargo -V
+            cargo test --locked -p terrapi-vesta-replication --test backup_restore_qualification
             # Supported default-feature workspace runtime suite. Feature-specific mTLS,
             # crash-process and experimental recovery suites remain in Linux CI until
             # the FreeBSD runner has an explicit qualification budget for them.
-            cargo +1.89.0 test --locked --workspace
+            cargo test --locked --workspace
           '
